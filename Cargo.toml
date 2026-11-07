@@ -1,0 +1,19 @@
+[package]
+name = "rusted"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "RustEd"
+path = "src/main.rs"
+
+[dependencies]
+eframe = "0.31"
+egui_extras = { version = "0.31", features = ["syntect"] }
+portable-pty = "0.8"
+vt100 = "0.15"
+
+# Optimize dependencies (egui text layout, syntect) even in debug builds;
+# they dominate edit latency on large files.
+[profile.dev.package."*"]
+opt-level = 3
