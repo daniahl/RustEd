@@ -2,14 +2,14 @@ use eframe::egui::{
     self,
     epaint::text::Galley,
     text_selection::{
-        visuals::{paint_text_cursor, paint_text_selection},
+        visuals::paint_text_cursor,
         CCursorRange, CursorRange, TextCursorState,
     },
     Color32, Event, Id, Key, Pos2, Rect, Response, Sense, TextBuffer, Ui, Vec2,
 };
 use std::sync::{Arc, Mutex};
 
-type Undoer = egui::util::undoer::Undoer<(CCursorRange, String)>;
+type Undoer = egui::util::undoer::Undoer<(CCursorRange, Arc<String>)>;
 
 #[derive(Clone, Default)]
 pub struct FastEditorState {
@@ -25,7 +25,8 @@ pub struct FastEditorState {
 /// Cached galley for a given text + layout parameters.
 pub struct LayoutCache {
     key: (u32, u32, bool, u64),
-    text: String,
+    text_revision: Option<u64>,
+    text: Arc<String>,
     galley: Arc<Galley>,
 }
 
@@ -36,6 +37,7 @@ pub struct EditorOutput {
     pub galley_pos: Pos2,
     pub text_clip_rect: Rect,
     pub cursor_range: Option<CursorRange>,
+    pub text_changed: bool,
 }
 
 pub struct FastEditor<'a> {
@@ -44,6 +46,7 @@ pub struct FastEditor<'a> {
     min_size: Vec2,
     layouter: &'a mut dyn FnMut(&Ui, &str, f32) -> Arc<Galley>,
     cache_salt: u64,
+    text_revision: Option<u64>,
 }
 
 impl<'a> FastEditor<'a> {
@@ -59,6 +62,7 @@ impl<'a> FastEditor<'a> {
             min_size,
             layouter,
             cache_salt: 0,
+            text_revision: None,
         }
     }
 
@@ -67,6 +71,14 @@ impl<'a> FastEditor<'a> {
     #[allow(dead_code)]
     pub fn cache_salt(mut self, salt: u64) -> Self {
         self.cache_salt = salt;
+        self
+    }
+
+    /// Optional monotonic revision number for `text`. When provided, layout cache
+    /// hits check the revision in O(1) instead of comparing the full text buffer.
+    #[allow(dead_code)]
+    pub fn text_revision(mut self, revision: u64) -> Self {
+        self.text_revision = Some(revision);
         self
     }
 
@@ -79,8 +91,9 @@ impl<'a> FastEditor<'a> {
             .data_mut(|d| d.get_temp::<FastEditorState>(self.id))
             .unwrap_or_default();
 
-        // Reuse the previous layout when nothing it depends on has changed. A plain string
-        // comparison (memcmp) is far cheaper than egui hashing the text + layout job each frame.
+        // Reuse the previous layout when nothing it depends on has changed.
+        // When `text_revision` is supplied, this is an O(1) integer comparison;
+        // otherwise it falls back to a string comparison.
         let cache_key = (
             wrap_width.to_bits(),
             ui.ctx().pixels_per_point().to_bits(),
@@ -89,7 +102,15 @@ impl<'a> FastEditor<'a> {
         );
         let mut layout_dirty = false;
         let mut galley = match &state.layout_cache {
-            Some(c) if c.key == cache_key && c.text == *self.text => Arc::clone(&c.galley),
+            Some(c)
+                if c.key == cache_key
+                    && match (self.text_revision, c.text_revision) {
+                        (Some(r1), Some(r2)) => r1 == r2 && c.text.len() == self.text.len(),
+                        _ => c.text.as_str() == self.text.as_str(),
+                    } =>
+            {
+                Arc::clone(&c.galley)
+            }
             _ => {
                 layout_dirty = true;
                 (self.layouter)(ui, self.text.as_str(), wrap_width)
@@ -160,22 +181,61 @@ impl<'a> FastEditor<'a> {
                 );
             });
 
-            let events = ui.input(|i| i.events.clone());
             let now = ui.input(|i| i.time);
 
-            // Feed state to undoer if in flux or initially empty so undo points can stabilize
+            // Feed state to undoer if in flux or initially empty so undo points can stabilize.
+            // Reuse the cached Arc<String> when available to avoid cloning the buffer on idle frames.
             {
                 let mut undoer = state.undoer.lock().unwrap();
                 if undoer.is_in_flux() {
-                    undoer.feed_state(
-                        now,
-                        &(cursor_range.as_ccursor_range(), self.text.clone()),
-                    );
+                    let text_arc = match &state.layout_cache {
+                        Some(c) if !layout_dirty => Arc::clone(&c.text),
+                        _ => Arc::new(self.text.clone()),
+                    };
+                    undoer.feed_state(now, &(cursor_range.as_ccursor_range(), text_arc));
                 }
             }
 
+            let events = ui.input(|i| {
+                if i.events.is_empty() {
+                    Vec::new()
+                } else {
+                    i.events.clone()
+                }
+            });
+            let mut pending_relayout = false;
+
             for event in &events {
                 let mut mutated: Option<CCursorRange> = None;
+
+                // If an earlier event in this same frame mutated the text and this event
+                // might depend on visual row layout, flush the pending relayout first.
+                if pending_relayout
+                    && matches!(
+                        event,
+                        Event::Key {
+                            key: Key::ArrowUp
+                                | Key::ArrowDown
+                                | Key::ArrowLeft
+                                | Key::ArrowRight
+                                | Key::Home
+                                | Key::End
+                                | Key::PageUp
+                                | Key::PageDown,
+                            pressed: true,
+                            ..
+                        }
+                    )
+                {
+                    let ccursor_range = cursor_range.as_ccursor_range();
+                    galley = (self.layouter)(ui, self.text.as_str(), wrap_width);
+                    layout_dirty = true;
+                    pending_relayout = false;
+                    cursor_range = CursorRange {
+                        primary: galley.from_ccursor(ccursor_range.primary),
+                        secondary: galley.from_ccursor(ccursor_range.secondary),
+                    };
+                }
 
                 // Navigation & selection events (arrows, home, end, ctrl+a, etc.)
                 if cursor_range.on_event(os, event, &galley, self.id) {
@@ -305,13 +365,14 @@ impl<'a> FastEditor<'a> {
                         modifiers,
                         ..
                     } if modifiers.command => {
+                        let current_arc = Arc::new(self.text.clone());
                         if let Some((undo_range, undo_txt)) = state
                             .undoer
                             .lock()
                             .unwrap()
-                            .undo(&(cursor_range.as_ccursor_range(), self.text.clone()))
+                            .undo(&(cursor_range.as_ccursor_range(), current_arc))
                         {
-                            *self.text = undo_txt.to_string();
+                            *self.text = (**undo_txt).clone();
                             mutated = Some(*undo_range);
                         }
                     }
@@ -321,13 +382,14 @@ impl<'a> FastEditor<'a> {
                         modifiers,
                         ..
                     } if modifiers.command => {
+                        let current_arc = Arc::new(self.text.clone());
                         if let Some((redo_range, redo_txt)) = state
                             .undoer
                             .lock()
                             .unwrap()
-                            .redo(&(cursor_range.as_ccursor_range(), self.text.clone()))
+                            .redo(&(cursor_range.as_ccursor_range(), current_arc))
                         {
-                            *self.text = redo_txt.to_string();
+                            *self.text = (**redo_txt).clone();
                             mutated = Some(*redo_range);
                         }
                     }
@@ -337,22 +399,39 @@ impl<'a> FastEditor<'a> {
                 if let Some(new_ccursor_range) = mutated {
                     text_changed = true;
                     state.last_interaction_time = now;
-                    galley = (self.layouter)(ui, self.text.as_str(), wrap_width);
-                    layout_dirty = true;
-                    cursor_range = CursorRange {
-                        primary: galley.from_ccursor(new_ccursor_range.primary),
-                        secondary: galley.from_ccursor(new_ccursor_range.secondary),
-                    };
+                    cursor_range.primary.ccursor = new_ccursor_range.primary;
+                    cursor_range.secondary.ccursor = new_ccursor_range.secondary;
+                    pending_relayout = true;
                 }
+            }
+
+            if pending_relayout {
+                let ccursor_range = cursor_range.as_ccursor_range();
+                galley = (self.layouter)(ui, self.text.as_str(), wrap_width);
+                layout_dirty = true;
+                cursor_range = CursorRange {
+                    primary: galley.from_ccursor(ccursor_range.primary),
+                    secondary: galley.from_ccursor(ccursor_range.secondary),
+                };
             }
         }
 
         state.cursor.set_range(Some(cursor_range));
+
+        // Allocate the updated text buffer once (shared between LayoutCache and Undoer).
+        let updated_text_arc = if layout_dirty || text_changed {
+            Some(Arc::new(self.text.clone()))
+        } else {
+            None
+        };
+
         if text_changed {
-            state.undoer.lock().unwrap().feed_state(
-                ui.input(|i| i.time),
-                &(cursor_range.as_ccursor_range(), self.text.clone()),
-            );
+            if let Some(ref text_arc) = updated_text_arc {
+                state.undoer.lock().unwrap().feed_state(
+                    ui.input(|i| i.time),
+                    &(cursor_range.as_ccursor_range(), Arc::clone(text_arc)),
+                );
+            }
         }
 
         let text_clip_rect = ui.clip_rect().intersect(rect);
@@ -373,9 +452,53 @@ impl<'a> FastEditor<'a> {
                 ui.scroll_to_rect(cursor_box, None);
             }
 
-            let mut galley_to_paint = Arc::clone(&galley);
-            paint_text_selection(&mut galley_to_paint, ui.visuals(), &cursor_range, None);
-            painter.galley(galley_pos, galley_to_paint, Color32::WHITE);
+            if !cursor_range.is_empty() {
+                // Paint selection rects directly for visible rows instead of calling
+                // `paint_text_selection` on `galley`, which would deep-clone the entire
+                // Galley via `Arc::make_mut` every frame.
+                let [min_cursor, max_cursor] = cursor_range.sorted_cursors();
+                let min_row = min_cursor.rcursor.row;
+                let max_row = max_cursor.rcursor.row.min(galley.rows.len().saturating_sub(1));
+                let top = text_clip_rect.min.y - galley_pos.y;
+                let first_vis = galley.rows.partition_point(|r| r.rect.max.y < top);
+                let start_row = min_row.max(first_vis);
+                let bg_fill = ui.visuals().selection.bg_fill;
+
+                if start_row <= max_row {
+                    for (row_idx, row) in galley.rows[start_row..=max_row]
+                        .iter()
+                        .enumerate()
+                        .map(|(i, r)| (start_row + i, r))
+                    {
+                        let row_top_y = galley_pos.y + row.rect.min.y;
+                        if row_top_y > text_clip_rect.max.y {
+                            break;
+                        }
+                        let left = if row_idx == min_row {
+                            row.x_offset(min_cursor.rcursor.column)
+                        } else {
+                            0.0
+                        };
+                        let right = if row_idx == max_cursor.rcursor.row {
+                            row.x_offset(max_cursor.rcursor.column)
+                        } else {
+                            let newline_extra = if row.ends_with_newline {
+                                row.rect.height() * 0.5
+                            } else {
+                                0.0
+                            };
+                            row.rect.width() + newline_extra
+                        };
+                        let sel_rect = Rect::from_min_max(
+                            galley_pos + Vec2::new(left, row.rect.min.y),
+                            galley_pos + Vec2::new(right, row.rect.max.y),
+                        );
+                        painter.rect_filled(sel_rect, 0.0, bg_fill);
+                    }
+                }
+            }
+
+            painter.galley(galley_pos, Arc::clone(&galley), Color32::WHITE);
 
             let now = ui.input(|i| i.time);
             let mut primary_cursor_rect = galley
@@ -395,7 +518,7 @@ impl<'a> FastEditor<'a> {
                 now - state.last_interaction_time,
             );
         } else {
-            painter.galley(galley_pos, galley.clone(), Color32::WHITE);
+            painter.galley(galley_pos, Arc::clone(&galley), Color32::WHITE);
         }
 
         // Accessibility (AccessKit) update
@@ -505,21 +628,35 @@ impl<'a> FastEditor<'a> {
                         character_positions.push(end_x);
                         character_widths.push(1.0);
 
-                        let total_chars = character_lengths.len() as u8;
+                        let mut remaining = character_lengths.len();
+                        let mut word_lengths = Vec::with_capacity((remaining / 255) + 1);
+                        while remaining > 0 {
+                            let chunk = remaining.min(u8::MAX as usize);
+                            word_lengths.push(chunk as u8);
+                            remaining -= chunk;
+                        }
                         builder.set_value(value);
                         builder.set_character_lengths(character_lengths);
                         builder.set_character_positions(character_positions);
                         builder.set_character_widths(character_widths);
-                        builder.set_word_lengths(vec![total_chars]);
+                        builder.set_word_lengths(word_lengths);
                     });
                 });
             }
         }
 
         if layout_dirty {
+            let text_arc =
+                updated_text_arc.unwrap_or_else(|| Arc::new(self.text.clone()));
+            let cached_rev = if text_changed {
+                self.text_revision.map(|r| r.wrapping_add(1))
+            } else {
+                self.text_revision
+            };
             state.layout_cache = Some(Arc::new(LayoutCache {
                 key: cache_key,
-                text: self.text.clone(),
+                text_revision: cached_rev,
+                text: text_arc,
                 galley: Arc::clone(&galley),
             }));
         }
@@ -531,6 +668,7 @@ impl<'a> FastEditor<'a> {
             galley_pos,
             text_clip_rect,
             cursor_range: Some(cursor_range),
+            text_changed,
         }
     }
 }

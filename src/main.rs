@@ -44,6 +44,8 @@ struct TerminalState {
 
 struct FileNode {
     name: String,
+    collapsed_label: String,
+    expanded_label: String,
     path: PathBuf,
     is_dir: bool,
     expanded: bool,
@@ -58,8 +60,12 @@ impl FileNode {
             .and_then(|n| n.to_str())
             .unwrap_or_else(|| path.to_str().unwrap_or("root"))
             .to_string();
+        let collapsed_label = format!("▸ {name}");
+        let expanded_label = format!("▾ {name}");
         let mut node = Self {
             name,
+            collapsed_label,
+            expanded_label,
             path,
             is_dir: true,
             expanded: true,
@@ -78,8 +84,15 @@ impl FileNode {
                 let path = entry.path();
                 let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
                 let name = entry.file_name().to_string_lossy().into_owned();
+                let (collapsed_label, expanded_label) = if is_dir {
+                    (format!("▸ {name}"), format!("▾ {name}"))
+                } else {
+                    (String::new(), String::new())
+                };
                 self.children.push(Self {
                     name,
+                    collapsed_label,
+                    expanded_label,
                     path,
                     is_dir,
                     expanded: false,
@@ -87,11 +100,15 @@ impl FileNode {
                     children: Vec::new(),
                 });
             }
-            // Folders first, then files sorted case-insensitively
+            // Folders first, then files sorted case-insensitively without per-comparison heap allocations
             self.children.sort_by(|a, b| {
-                b.is_dir
-                    .cmp(&a.is_dir)
-                    .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+                b.is_dir.cmp(&a.is_dir).then_with(|| {
+                    a.name
+                        .bytes()
+                        .map(|c| c.to_ascii_lowercase())
+                        .cmp(b.name.bytes().map(|c| c.to_ascii_lowercase()))
+                        .then_with(|| a.name.cmp(&b.name))
+                })
             });
         }
     }
@@ -106,10 +123,14 @@ fn render_file_node(
 ) {
     let indent = depth as f32 * 14.0;
     if node.is_dir {
-        let arrow = if node.expanded { "▾" } else { "▸" };
         ui.horizontal(|ui| {
             ui.add_space(indent);
-            let resp = ui.selectable_label(false, format!("{} {}", arrow, node.name));
+            let label = if node.expanded {
+                node.expanded_label.as_str()
+            } else {
+                node.collapsed_label.as_str()
+            };
+            let resp = ui.selectable_label(false, label);
             if resp.clicked() {
                 node.expanded = !node.expanded;
                 if node.expanded && !node.children_loaded {
@@ -134,13 +155,41 @@ fn render_file_node(
     }
 }
 
+fn hash_language_salt(lang: &str) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    std::hash::Hash::hash(lang, &mut hasher);
+    std::hash::Hasher::finish(&hasher)
+}
+
+fn format_u32_stack(mut n: u32, buf: &mut [u8; 16]) -> &str {
+    if n == 0 {
+        buf[15] = b'0';
+        return std::str::from_utf8(&buf[15..]).unwrap();
+    }
+    let mut idx = 16;
+    while n > 0 {
+        idx -= 1;
+        buf[idx] = b'0' + (n % 10) as u8;
+        n /= 10;
+    }
+    std::str::from_utf8(&buf[idx..]).unwrap()
+}
+
 struct TextEditor {
     tab: Tab,
     path: String,
     text: String,
+    text_revision: u64,
+    file_name: String,
+    language_ext: String,
+    language_name: &'static str,
+    language_salt: u64,
+    line_ending: &'static str,
     folder_path: String,
     tree_root: Option<FileNode>,
     term: Arc<Mutex<TerminalState>>,
+    term_screen_text: String,
+    term_cursor_idx: usize,
     pty_writer: Option<Box<dyn Write + Send>>,
     _pty_master: Option<Box<dyn portable_pty::MasterPty + Send>>,
     _pty_child: Option<Box<dyn portable_pty::Child + Send + Sync>>,
@@ -227,9 +276,17 @@ impl TextEditor {
             tab: Tab::Editor,
             path: String::new(),
             text: String::new(),
+            text_revision: 0,
+            file_name: "Untitled".to_string(),
+            language_ext: "rs".to_string(),
+            language_name: "Plain Text",
+            language_salt: hash_language_salt("rs"),
+            line_ending: "LF",
             folder_path: initial_folder,
             tree_root,
             term,
+            term_screen_text: String::new(),
+            term_cursor_idx: 0,
             pty_writer,
             _pty_master: pty_master,
             _pty_child: pty_child,
@@ -241,6 +298,39 @@ impl TextEditor {
             cursor_col: 1,
             selected_chars: 0,
         }
+    }
+
+    fn refresh_line_ending(&mut self) {
+        let check_len = self.text.len().min(4096);
+        self.line_ending = if self.text.as_bytes()[..check_len]
+            .windows(2)
+            .any(|w| w == b"\r\n")
+        {
+            "CRLF"
+        } else {
+            "LF"
+        };
+    }
+
+    fn refresh_file_metadata(&mut self) {
+        if self.path.is_empty() {
+            self.file_name = "Untitled".to_string();
+            self.language_ext = "rs".to_string();
+        } else {
+            let p = Path::new(&self.path);
+            self.file_name = p
+                .file_name()
+                .map(|f| f.to_string_lossy().into_owned())
+                .unwrap_or_else(|| self.path.clone());
+            self.language_ext = p
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .unwrap_or("rs")
+                .to_string();
+        }
+        self.language_name = detect_language_name(&self.path);
+        self.language_salt = hash_language_salt(&self.language_ext);
+        self.refresh_line_ending();
     }
 
     fn write_to_pty(&mut self, bytes: &[u8]) {
@@ -351,7 +441,7 @@ fn render_vt100_screen(screen: &vt100::Screen) -> (String, usize) {
     let (rows, cols) = screen.size();
     let (cur_row, cur_col) = screen.cursor_position();
 
-    let mut full_text = String::new();
+    let mut full_text = String::with_capacity((rows as usize) * (cols as usize + 1));
     let mut cursor_char_idx = 0;
     let mut total_chars = 0;
 
@@ -465,12 +555,18 @@ fn fix_accesskit_caret(ctx: &egui::Context, output: &egui::text_edit::TextEditOu
         character_positions.push(end_x);
         character_widths.push(1.0);
 
-        let total_chars = character_lengths.len() as u8;
+        let mut remaining = character_lengths.len();
+        let mut word_lengths = Vec::with_capacity((remaining / 255) + 1);
+        while remaining > 0 {
+            let chunk = remaining.min(u8::MAX as usize);
+            word_lengths.push(chunk as u8);
+            remaining -= chunk;
+        }
         builder.set_value(value);
         builder.set_character_lengths(character_lengths);
         builder.set_character_positions(character_positions);
         builder.set_character_widths(character_widths);
-        builder.set_word_lengths(vec![total_chars]);
+        builder.set_word_lengths(word_lengths);
     });
 
     ctx.accesskit_node_builder(widget_id, |builder| {
@@ -590,14 +686,7 @@ impl eframe::App for TextEditor {
                 ui.horizontal_centered(|ui| {
                     match self.tab {
                         Tab::Editor => {
-                            let file_name = if self.path.is_empty() {
-                                "Untitled".to_string()
-                            } else {
-                                Path::new(&self.path)
-                                    .file_name()
-                                    .map(|f| f.to_string_lossy().into_owned())
-                                    .unwrap_or_else(|| self.path.clone())
-                            };
+                            let file_name = &self.file_name;
                             let line_count = self.line_count.max(1);
                             let bytes = self.text.len();
                             let size_str = if bytes >= 1024 * 1024 {
@@ -613,18 +702,12 @@ impl eframe::App for TextEditor {
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
-                                    let lang = detect_language_name(&self.path);
-                                    ui.label(lang).on_hover_text("Language Mode");
+                                    ui.label(self.language_name)
+                                        .on_hover_text("Language Mode");
 
                                     ui.separator();
-                                    let line_ending = if self.text[..self.text.len().min(4096)]
-                                        .contains("\r\n")
-                                    {
-                                        "CRLF"
-                                    } else {
-                                        "LF"
-                                    };
-                                    ui.label(line_ending).on_hover_text("End of Line Sequence");
+                                    ui.label(self.line_ending)
+                                        .on_hover_text("End of Line Sequence");
 
                                     ui.separator();
                                     ui.label("UTF-8").on_hover_text("Encoding");
@@ -673,7 +756,7 @@ impl eframe::App for TextEditor {
                     .min_width(140.0)
                     .show(ctx, |ui| {
                         let mut file_to_open: Option<PathBuf> = None;
-                        let current_path = PathBuf::from(&self.path);
+                        let current_path = Path::new(&self.path);
 
                         egui::ScrollArea::vertical()
                             .auto_shrink([false, false])
@@ -683,7 +766,7 @@ impl eframe::App for TextEditor {
                                         render_file_node(
                                             ui,
                                             child,
-                                            &current_path,
+                                            current_path,
                                             0,
                                             &mut file_to_open,
                                         );
@@ -695,6 +778,8 @@ impl eframe::App for TextEditor {
                             if let Ok(content) = fs::read_to_string(&chosen) {
                                 self.text = content;
                                 self.path = chosen.to_string_lossy().into_owned();
+                                self.text_revision = self.text_revision.wrapping_add(1);
+                                self.refresh_file_metadata();
                                 self.cursor_line = 1;
                                 self.cursor_col = 1;
                                 self.selected_chars = 0;
@@ -717,11 +802,11 @@ impl eframe::App for TextEditor {
                         }
                     });
 
-                let language = Path::new(&self.path)
-                    .extension()
-                    .and_then(|ext| ext.to_str())
-                    .unwrap_or("rs");
+                let language = self.language_ext.as_str();
+                let language_salt = self.language_salt;
+                let text_revision = self.text_revision;
 
+                let mut editor_text_changed = false;
                 egui::CentralPanel::default().frame(panel_frame).show(ctx, |ui| {
                     let theme = CodeTheme::from_memory(ui.ctx(), ui.style());
                     let font_id = egui::TextStyle::Monospace.resolve(ui.style());
@@ -773,16 +858,16 @@ impl eframe::App for TextEditor {
                                     available_size.y,
                                 );
 
-                                let mut salt_hasher = std::collections::hash_map::DefaultHasher::new();
-                                std::hash::Hash::hash(language, &mut salt_hasher);
                                 let editor = FastEditor::new(
                                     egui::Id::new("code_editor"),
                                     &mut self.text,
                                     editor_min_size,
                                     &mut layouter,
                                 )
-                                .cache_salt(std::hash::Hasher::finish(&salt_hasher));
+                                .cache_salt(language_salt)
+                                .text_revision(text_revision);
                                 let output = editor.show(ui);
+                                editor_text_changed = output.text_changed;
 
                                 // Rebuild the row -> line-number table only when the galley changed.
                                 let stale = match &self.gutter_cache {
@@ -813,13 +898,18 @@ impl eframe::App for TextEditor {
                                 if let Some(cursor_range) = output.cursor_range {
                                     let focus = cursor_range.primary.rcursor;
                                     self.cursor_line = if let Some((_, nums)) = &self.gutter_cache {
-                                        let mut l = focus.row + 1;
-                                        for &n in &nums[..=focus.row.min(nums.len().saturating_sub(1))] {
-                                            if n > 0 {
-                                                l = n as usize;
-                                            }
+                                        if nums.is_empty() {
+                                            1
+                                        } else {
+                                            let end = focus.row.min(nums.len() - 1);
+                                            nums[..=end]
+                                                .iter()
+                                                .rev()
+                                                .copied()
+                                                .find(|&n| n > 0)
+                                                .map(|n| n as usize)
+                                                .unwrap_or(1)
                                         }
-                                        l
                                     } else {
                                         focus.row + 1
                                     };
@@ -844,6 +934,7 @@ impl eframe::App for TextEditor {
                                     // Binary-search the first visible row; draw only visible rows.
                                     let top = clip_rect.min.y - output.galley_pos.y;
                                     let first = rows.partition_point(|r| r.rect.max.y < top);
+                                    let mut num_buf = [0u8; 16];
                                     for row_idx in first..rows.len() {
                                         let row = &rows[row_idx];
                                         let y = output.galley_pos.y + row.rect.min.y;
@@ -859,10 +950,11 @@ impl eframe::App for TextEditor {
                                         } else {
                                             ui.visuals().weak_text_color()
                                         };
+                                        let label_str = format_u32_stack(n, &mut num_buf);
                                         painter.text(
                                             egui::pos2(gutter_rect.max.x - 10.0, y),
                                             egui::Align2::RIGHT_TOP,
-                                            n.to_string(),
+                                            label_str,
                                             font_id.clone(),
                                             color,
                                         );
@@ -881,6 +973,11 @@ impl eframe::App for TextEditor {
                             });
                         });
                 });
+
+                if editor_text_changed {
+                    self.text_revision = self.text_revision.wrapping_add(1);
+                    self.refresh_line_ending();
+                }
             }
             Tab::Terminal => {
                 let term_id = egui::Id::new("conpty_terminal");
@@ -888,12 +985,16 @@ impl eframe::App for TextEditor {
 
                 self.handle_terminal_input(ctx, term_focused);
 
-                let (mut screen_text, vt_cursor_idx, pty_updated) = {
+                let pty_updated = {
                     let mut lock = self.term.lock().unwrap();
-                    let updated = lock.pty_updated;
-                    lock.pty_updated = false;
-                    let (text, idx) = render_vt100_screen(lock.parser.screen());
-                    (text, idx, updated)
+                    let updated = lock.pty_updated || self.term_screen_text.is_empty();
+                    if updated {
+                        lock.pty_updated = false;
+                        let (text, idx) = render_vt100_screen(lock.parser.screen());
+                        self.term_screen_text = text;
+                        self.term_cursor_idx = idx;
+                    }
+                    updated
                 };
 
                 if pty_updated {
@@ -903,12 +1004,15 @@ impl eframe::App for TextEditor {
                 if !self.selecting_in_terminal {
                     let mut state =
                         egui::text_edit::TextEditState::load(ctx, term_id).unwrap_or_default();
-                    let ccursor = egui::text::CCursor::new(vt_cursor_idx);
+                    let ccursor = egui::text::CCursor::new(self.term_cursor_idx);
                     state
                         .cursor
                         .set_char_range(Some(egui::text::CCursorRange::one(ccursor)));
                     state.store(ctx, term_id);
                 }
+
+                let screen_text = &mut self.term_screen_text;
+                let focus_terminal = &mut self.focus_terminal;
 
                 egui::CentralPanel::default().frame(panel_frame).show(ctx, |ui| {
                     let available_size = ui.available_size();
@@ -916,7 +1020,7 @@ impl eframe::App for TextEditor {
                         .auto_shrink([false, false])
                         .animated(false)
                         .show(ui, |ui| {
-                            let output = egui::TextEdit::multiline(&mut screen_text)
+                            let output = egui::TextEdit::multiline(screen_text)
                                 .id(term_id)
                                 .code_editor()
                                 .frame(false)
@@ -925,9 +1029,9 @@ impl eframe::App for TextEditor {
                                 .lock_focus(true)
                                 .show(ui);
 
-                            if self.focus_terminal {
+                            if *focus_terminal {
                                 output.response.request_focus();
-                                self.focus_terminal = false;
+                                *focus_terminal = false;
                             }
 
                             fix_accesskit_caret(ctx, &output);

@@ -276,3 +276,84 @@ fn test_paste_scrolls_to_caret() {
     assert_eq!(text, big);
     assert!(caret_visible, "caret should be scrolled into view after a big paste");
 }
+
+#[test]
+fn test_coalesced_relayout_and_long_line_accesskit() {
+    let ctx = egui::Context::default();
+    ctx.enable_accesskit();
+
+    let mut text = String::new();
+    let mut rev = 1u64;
+    let id = Id::new("test_editor_perf");
+    let font_id = egui::TextStyle::Monospace.resolve(&ctx.style());
+    let layout_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+    let run_frame = |ctx: &egui::Context,
+                     text: &mut String,
+                     rev: &mut u64,
+                     events: Vec<Event>| {
+        let mut input = egui::RawInput::default();
+        input.events = events;
+        let font_id = font_id.clone();
+        let layout_calls = std::sync::Arc::clone(&layout_calls);
+        ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let mut layouter = |ui: &Ui, text: &str, wrap_width: f32| {
+                    layout_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let job = LayoutJob::simple(
+                        text.to_owned(),
+                        font_id.clone(),
+                        Color32::WHITE,
+                        wrap_width,
+                    );
+                    ui.fonts(|f| f.layout_job(job))
+                };
+                let output = FastEditor::new(id, text, Vec2::new(400.0, 200.0), &mut layouter)
+                    .text_revision(*rev)
+                    .show(ui);
+                output.response.request_focus();
+                if output.text_changed {
+                    *rev += 1;
+                }
+            });
+        })
+    };
+
+    // Frame 1: Initial layout + focus
+    let _ = run_frame(&ctx, &mut text, &mut rev, vec![]);
+    assert_eq!(layout_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    // Frame 2: Idle frame with same revision -> 0 new layout calls
+    let _ = run_frame(&ctx, &mut text, &mut rev, vec![]);
+    assert_eq!(layout_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    // Frame 3: Multiple text events in a single frame -> coalesced into 1 layout call
+    let long_chunk = "a".repeat(150);
+    let out = run_frame(
+        &ctx,
+        &mut text,
+        &mut rev,
+        vec![
+            Event::Text(long_chunk.clone()),
+            Event::Text(long_chunk.clone()),
+            Event::Text("!".to_string()),
+        ],
+    );
+    assert_eq!(text.len(), 301);
+    assert_eq!(
+        layout_calls.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "Multiple edits in one frame should coalesce into a single relayout"
+    );
+
+    // Verify AccessKit word_lengths do not overflow u8 on >255 char line
+    let u = out.platform_output.accesskit_update.unwrap();
+    let text_run = u
+        .nodes
+        .iter()
+        .find(|(_, n)| n.role() == egui::accesskit::Role::TextRun)
+        .map(|(_, n)| n)
+        .expect("Expected active TextRun node");
+    let total_word_len: usize = text_run.word_lengths().iter().map(|&w| w as usize).sum();
+    assert_eq!(total_word_len, text_run.character_lengths().len());
+}
