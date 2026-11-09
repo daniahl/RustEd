@@ -77,6 +77,83 @@ enum TreeAction {
         current_name: String,
         is_dir: bool,
     },
+    DeleteNode {
+        path: PathBuf,
+        is_dir: bool,
+    },
+}
+
+#[cfg(target_os = "windows")]
+fn move_to_trash(path: &Path) -> bool {
+    use std::os::windows::ffi::OsStrExt;
+
+    #[cfg_attr(target_arch = "x86", repr(C, packed))]
+    #[cfg_attr(not(target_arch = "x86"), repr(C))]
+    struct SHFILEOPSTRUCTW {
+        hwnd: *mut std::ffi::c_void,
+        w_func: u32,
+        p_from: *const u16,
+        p_to: *const u16,
+        f_flags: u16,
+        f_any_operations_aborted: i32,
+        h_name_mappings: *mut std::ffi::c_void,
+        lpsz_progress_title: *const u16,
+    }
+
+    #[link(name = "shell32")]
+    extern "system" {
+        fn SHFileOperationW(lp_file_op: *mut SHFILEOPSTRUCTW) -> i32;
+    }
+
+    const FO_DELETE: u32 = 0x0003;
+    const FOF_SILENT: u16 = 0x0004;
+    const FOF_NOCONFIRMATION: u16 = 0x0010;
+    const FOF_ALLOWUNDO: u16 = 0x0040;
+    const FOF_NOERRORUI: u16 = 0x0400;
+
+    let abs_path = if path.is_absolute() {
+        path.to_path_buf()
+    } else if let Ok(cwd) = std::env::current_dir() {
+        cwd.join(path)
+    } else {
+        return false;
+    };
+
+    let mut path_str = abs_path.to_string_lossy().into_owned();
+    if let Some(stripped) = path_str.strip_prefix(r"\\?\") {
+        path_str = stripped.to_string();
+    }
+    while path_str.len() > 3 && (path_str.ends_with('\\') || path_str.ends_with('/')) {
+        path_str.pop();
+    }
+
+    let mut wide: Vec<u16> = std::ffi::OsStr::new(&path_str)
+        .encode_wide()
+        .chain([0, 0])
+        .collect();
+
+    let mut file_op = SHFILEOPSTRUCTW {
+        hwnd: std::ptr::null_mut(),
+        w_func: FO_DELETE,
+        p_from: wide.as_mut_ptr(),
+        p_to: std::ptr::null(),
+        f_flags: FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_SILENT,
+        f_any_operations_aborted: 0,
+        h_name_mappings: std::ptr::null_mut(),
+        lpsz_progress_title: std::ptr::null(),
+    };
+
+    let ret = unsafe { SHFileOperationW(&mut file_op) };
+    ret == 0 && file_op.f_any_operations_aborted == 0
+}
+
+#[cfg(not(target_os = "windows"))]
+fn move_to_trash(path: &Path) -> bool {
+    if path.is_dir() {
+        fs::remove_dir_all(path).is_ok()
+    } else {
+        fs::remove_file(path).is_ok()
+    }
 }
 
 enum TreeEditOutcome {
@@ -291,6 +368,13 @@ fn render_file_node(
                         });
                         ui.close_menu();
                     }
+                    if ui.button("Delete").clicked() {
+                        *tree_action = Some(TreeAction::DeleteNode {
+                            path: node.path.clone(),
+                            is_dir: true,
+                        });
+                        ui.close_menu();
+                    }
                 });
             });
         }
@@ -366,6 +450,13 @@ fn render_file_node(
                     *tree_action = Some(TreeAction::StartRename {
                         path: node.path.clone(),
                         current_name: node.name.clone(),
+                        is_dir: false,
+                    });
+                    ui.close_menu();
+                }
+                if ui.button("Delete").clicked() {
+                    *tree_action = Some(TreeAction::DeleteNode {
+                        path: node.path.clone(),
                         is_dir: false,
                     });
                     ui.close_menu();
@@ -649,7 +740,7 @@ impl TextEditor {
         });
     }
 
-    fn handle_tree_action(&mut self, action: TreeAction) {
+    fn handle_tree_action(&mut self, ctx: &egui::Context, action: TreeAction) {
         match action {
             TreeAction::StartNewFolder(parent_path) => {
                 if let Some(root) = &mut self.tree_root {
@@ -696,7 +787,75 @@ impl TextEditor {
                     had_focus: false,
                 });
             }
+            TreeAction::DeleteNode { path, is_dir } => {
+                let _ = self.delete_node(ctx, &path, is_dir);
+            }
         }
+    }
+
+    fn delete_node(&mut self, ctx: &egui::Context, path: &Path, is_dir: bool) -> bool {
+        if !move_to_trash(path) {
+            return false;
+        }
+
+        if let Some((ref sel_path, _)) = self.selected_node {
+            if sel_path == path || (is_dir && sel_path.starts_with(path)) {
+                self.selected_node = None;
+            }
+        }
+
+        if let Some(ref edit) = self.pending_tree_edit {
+            let matches_deleted = match &edit.kind {
+                TreeEditKind::NewFolder { parent_path }
+                | TreeEditKind::NewFile { parent_path } => {
+                    parent_path == path || (is_dir && parent_path.starts_with(path))
+                }
+                TreeEditKind::Rename { target_path, .. } => {
+                    target_path == path || (is_dir && target_path.starts_with(path))
+                }
+            };
+            if matches_deleted {
+                self.pending_tree_edit = None;
+            }
+        }
+
+        if is_dir {
+            self.unsaved_files.retain(|k, _| !k.starts_with(path));
+        } else {
+            self.unsaved_files.remove(path);
+        }
+
+        if !self.path.is_empty() {
+            let cur = Path::new(&self.path);
+            if cur == path || (is_dir && cur.starts_with(path)) {
+                self.path.clear();
+                self.text.clear();
+                self.saved_text.clear();
+                self.is_current_dirty = false;
+                self.text_revision = self.text_revision.wrapping_add(1);
+                self.gutter_cache = None;
+                self.line_count = 1;
+                self.cursor_line = 1;
+                self.cursor_col = 1;
+                self.selected_chars = 0;
+                self.refresh_file_metadata();
+
+                let editor_id = egui::Id::new("code_editor");
+                ctx.data_mut(|d| {
+                    d.insert_temp(editor_id, editor::FastEditorState::default());
+                });
+            }
+        }
+
+        if let Some(parent) = path.parent() {
+            if let Some(root) = &mut self.tree_root {
+                if let Some(parent_node) = root.find_mut(parent) {
+                    parent_node.load_children();
+                }
+            }
+        }
+
+        true
     }
 
     fn create_folder_in(&mut self, parent_path: &Path, name: &str) -> Option<PathBuf> {
@@ -1348,7 +1507,7 @@ impl TextEditor {
                         }
 
                         if let Some(action) = tree_action {
-                            self.handle_tree_action(action);
+                            self.handle_tree_action(ctx, action);
                             ctx.request_repaint();
                         }
 
@@ -1731,7 +1890,7 @@ mod tests {
         let mut app = new_test_app(&temp_dir);
 
         // 1. Create a subfolder inside `src_dir` via New Folder action
-        app.handle_tree_action(TreeAction::StartNewFolder(sub_dir.clone()));
+        app.handle_tree_action(&ctx, TreeAction::StartNewFolder(sub_dir.clone()));
         if let Some(ref mut edit) = app.pending_tree_edit {
             edit.input_text = "nested".to_string();
         }
@@ -1743,7 +1902,7 @@ mod tests {
         assert_eq!(app.selected_node, Some((nested_dir.clone(), true)));
 
         // 2. Create a new file inside `nested` via New File action
-        app.handle_tree_action(TreeAction::StartNewFile(nested_dir.clone()));
+        app.handle_tree_action(&ctx, TreeAction::StartNewFile(nested_dir.clone()));
         if let Some(ref mut edit) = app.pending_tree_edit {
             edit.input_text = "main.rs".to_string();
         }
@@ -1821,6 +1980,21 @@ mod tests {
             moved_file.as_path(),
             "Active file path should update when an ancestor folder is renamed"
         );
+
+        // 5. Delete the folder via DeleteNode action (moves to Recycle Bin / Trash)
+        app.handle_tree_action(
+            &ctx,
+            TreeAction::DeleteNode {
+                path: renamed_dir.clone(),
+                is_dir: true,
+            },
+        );
+        assert!(!renamed_dir.exists(), "Deleted folder should be moved to trash");
+        assert!(
+            app.path.is_empty(),
+            "Active editor path should be cleared when its folder is deleted"
+        );
+        assert!(!app.can_save());
 
         let _ = fs::remove_dir_all(&temp_dir);
     }
