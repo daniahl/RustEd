@@ -1,3 +1,8 @@
+//! High-performance text editor widget (`FastEditor`).
+//!
+//! Custom multiline text editing component optimized for large files, with syntax layout caching,
+//! undo/redo history, scroll management, and screen-magnifier/screen-reader accessibility (AccessKit).
+
 use eframe::egui::{
     self,
     epaint::text::Galley,

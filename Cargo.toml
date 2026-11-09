@@ -3,6 +3,10 @@ name = "rusted"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+name = "rusted"
+path = "src/lib.rs"
+
 [[bin]]
 name = "RustEd"
 path = "src/main.rs"

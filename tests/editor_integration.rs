@@ -1,9 +1,12 @@
+//! Integration tests for the `FastEditor` widget.
+//!
+//! Validates text editing lifecycle, AccessKit node hierarchy, cursor navigation,
+//! clipboard paste scrolling, and layout caching.
+
 use eframe::egui;
 use egui::{epaint::text::LayoutJob, Color32, Event, Id, Key, Modifiers, Ui, Vec2};
 
-#[path = "../src/editor.rs"]
-mod editor;
-use editor::FastEditor;
+use rusted::editor::FastEditor;
 
 #[test]
 fn test_editor_full_lifecycle() {
