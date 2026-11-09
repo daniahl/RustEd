@@ -1,3 +1,5 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod editor;
 
 use editor::FastEditor;
@@ -53,6 +55,35 @@ struct UnsavedFileState {
     selected_chars: usize,
 }
 
+#[derive(Clone, PartialEq, Eq)]
+enum TreeEditKind {
+    NewFolder { parent_path: PathBuf },
+    NewFile { parent_path: PathBuf },
+    Rename { target_path: PathBuf, is_dir: bool },
+}
+
+#[derive(Clone)]
+struct PendingTreeEdit {
+    kind: TreeEditKind,
+    input_text: String,
+    had_focus: bool,
+}
+
+enum TreeAction {
+    StartNewFolder(PathBuf),
+    StartNewFile(PathBuf),
+    StartRename {
+        path: PathBuf,
+        current_name: String,
+        is_dir: bool,
+    },
+}
+
+enum TreeEditOutcome {
+    Commit,
+    Cancel,
+}
+
 struct FileNode {
     name: String,
     dirty_label: String,
@@ -89,9 +120,27 @@ impl FileNode {
         node
     }
 
+    fn find_mut(&mut self, target: &Path) -> Option<&mut FileNode> {
+        if self.path == target {
+            return Some(self);
+        }
+        for child in &mut self.children {
+            if let Some(found) = child.find_mut(target) {
+                return Some(found);
+            }
+        }
+        None
+    }
+
     fn load_children(&mut self) {
         self.children_loaded = true;
-        self.children.clear();
+        let mut old_dirs: HashMap<PathBuf, (bool, bool, Vec<FileNode>)> = self
+            .children
+            .drain(..)
+            .filter(|c| c.is_dir && (c.expanded || c.children_loaded))
+            .map(|c| (c.path, (c.expanded, c.children_loaded, c.children)))
+            .collect();
+
         if let Ok(entries) = fs::read_dir(&self.path) {
             for entry in entries.flatten() {
                 let path = entry.path();
@@ -102,6 +151,13 @@ impl FileNode {
                 } else {
                     (format!("{name} *"), String::new(), String::new())
                 };
+                let (expanded, children_loaded, children) = if is_dir {
+                    old_dirs
+                        .remove(&path)
+                        .unwrap_or((false, false, Vec::new()))
+                } else {
+                    (false, false, Vec::new())
+                };
                 self.children.push(Self {
                     name,
                     dirty_label,
@@ -109,9 +165,9 @@ impl FileNode {
                     expanded_label,
                     path,
                     is_dir,
-                    expanded: false,
-                    children_loaded: false,
-                    children: Vec::new(),
+                    expanded,
+                    children_loaded,
+                    children,
                 });
             }
             // Folders first, then files sorted case-insensitively without per-comparison heap allocations
@@ -128,33 +184,137 @@ impl FileNode {
     }
 }
 
+fn render_inline_tree_edit(
+    ui: &mut egui::Ui,
+    edit: &mut PendingTreeEdit,
+    edit_outcome: &mut Option<TreeEditOutcome>,
+) {
+    let edit_id = egui::Id::new("tree_inline_editor");
+    if !edit.had_focus {
+        ui.memory_mut(|m| m.request_focus(edit_id));
+        let mut state = egui::text_edit::TextEditState::load(ui.ctx(), edit_id).unwrap_or_default();
+        let char_len = edit.input_text.chars().count();
+        state.cursor.set_char_range(Some(egui::text::CCursorRange::two(
+            egui::text::CCursor::new(0),
+            egui::text::CCursor::new(char_len),
+        )));
+        state.store(ui.ctx(), edit_id);
+    }
+
+    let resp = egui::TextEdit::singleline(&mut edit.input_text)
+        .id(edit_id)
+        .desired_width((ui.available_width() - 4.0).max(80.0))
+        .show(ui)
+        .response;
+
+    let enter_pressed = ui.input(|i| i.key_pressed(egui::Key::Enter));
+    let escape_pressed = ui.input(|i| i.key_pressed(egui::Key::Escape));
+
+    if escape_pressed {
+        *edit_outcome = Some(TreeEditOutcome::Cancel);
+    } else if enter_pressed || (edit.had_focus && resp.lost_focus()) {
+        *edit_outcome = Some(TreeEditOutcome::Commit);
+    }
+
+    if resp.has_focus() {
+        edit.had_focus = true;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn render_file_node(
     ui: &mut egui::Ui,
     node: &mut FileNode,
     current_path: &Path,
     is_current_dirty: bool,
     unsaved_files: &HashMap<PathBuf, UnsavedFileState>,
+    selected_node: &mut Option<(PathBuf, bool)>,
+    pending_edit: &mut Option<PendingTreeEdit>,
+    tree_action: &mut Option<TreeAction>,
+    edit_outcome: &mut Option<TreeEditOutcome>,
     depth: usize,
     file_to_open: &mut Option<PathBuf>,
 ) {
     let indent = depth as f32 * 14.0;
+    let is_renaming_self = matches!(
+        pending_edit,
+        Some(e) if matches!(&e.kind, TreeEditKind::Rename { target_path, .. } if target_path == &node.path)
+    );
+
     if node.is_dir {
-        ui.horizontal(|ui| {
-            ui.add_space(indent);
-            let label = if node.expanded {
-                node.expanded_label.as_str()
-            } else {
-                node.collapsed_label.as_str()
-            };
-            let resp = ui.selectable_label(false, label);
-            if resp.clicked() {
-                node.expanded = !node.expanded;
-                if node.expanded && !node.children_loaded {
-                    node.load_children();
+        if is_renaming_self {
+            ui.horizontal(|ui| {
+                ui.add_space(indent);
+                ui.label(if node.expanded { "▾" } else { "▸" });
+                if let Some(edit) = pending_edit.as_mut() {
+                    render_inline_tree_edit(ui, edit, edit_outcome);
+                }
+            });
+        } else {
+            let is_selected = selected_node
+                .as_ref()
+                .map(|(p, _)| p == &node.path)
+                .unwrap_or(false);
+            ui.horizontal(|ui| {
+                ui.add_space(indent);
+                let label = if node.expanded {
+                    node.expanded_label.as_str()
+                } else {
+                    node.collapsed_label.as_str()
+                };
+                let resp = ui.selectable_label(is_selected, label);
+                if resp.clicked() {
+                    *selected_node = Some((node.path.clone(), true));
+                    node.expanded = !node.expanded;
+                    if node.expanded && !node.children_loaded {
+                        node.load_children();
+                    }
+                }
+                if resp.secondary_clicked() {
+                    *selected_node = Some((node.path.clone(), true));
+                }
+                resp.context_menu(|ui| {
+                    *selected_node = Some((node.path.clone(), true));
+                    if ui.button("New Folder").clicked() {
+                        *tree_action = Some(TreeAction::StartNewFolder(node.path.clone()));
+                        ui.close_menu();
+                    }
+                    if ui.button("New File").clicked() {
+                        *tree_action = Some(TreeAction::StartNewFile(node.path.clone()));
+                        ui.close_menu();
+                    }
+                    if ui.button("Rename").clicked() {
+                        *tree_action = Some(TreeAction::StartRename {
+                            path: node.path.clone(),
+                            current_name: node.name.clone(),
+                            is_dir: true,
+                        });
+                        ui.close_menu();
+                    }
+                });
+            });
+        }
+
+        if node.expanded {
+            if let Some(edit) = pending_edit.as_mut() {
+                match &edit.kind {
+                    TreeEditKind::NewFolder { parent_path } if parent_path == &node.path => {
+                        ui.horizontal(|ui| {
+                            ui.add_space((depth + 1) as f32 * 14.0);
+                            ui.label("▸");
+                            render_inline_tree_edit(ui, edit, edit_outcome);
+                        });
+                    }
+                    TreeEditKind::NewFile { parent_path } if parent_path == &node.path => {
+                        ui.horizontal(|ui| {
+                            ui.add_space((depth + 1) as f32 * 14.0 + 14.0);
+                            render_inline_tree_edit(ui, edit, edit_outcome);
+                        });
+                    }
+                    _ => {}
                 }
             }
-        });
-        if node.expanded {
+
             for child in &mut node.children {
                 render_file_node(
                     ui,
@@ -162,14 +322,28 @@ fn render_file_node(
                     current_path,
                     is_current_dirty,
                     unsaved_files,
+                    selected_node,
+                    pending_edit,
+                    tree_action,
+                    edit_outcome,
                     depth + 1,
                     file_to_open,
                 );
             }
         }
+    } else if is_renaming_self {
+        ui.horizontal(|ui| {
+            ui.add_space(indent + 14.0);
+            if let Some(edit) = pending_edit.as_mut() {
+                render_inline_tree_edit(ui, edit, edit_outcome);
+            }
+        });
     } else {
-        let is_selected = current_path == node.path;
-        let is_dirty = (is_selected && is_current_dirty)
+        let is_selected = match selected_node.as_ref() {
+            Some((sel_path, _)) => sel_path == &node.path,
+            None => current_path == node.path,
+        };
+        let is_dirty = (current_path == node.path && is_current_dirty)
             || (!unsaved_files.is_empty() && unsaved_files.contains_key(&node.path));
         let label = if is_dirty {
             node.dirty_label.as_str()
@@ -180,8 +354,23 @@ fn render_file_node(
             ui.add_space(indent + 14.0);
             let resp = ui.selectable_label(is_selected, label);
             if resp.clicked() {
+                *selected_node = Some((node.path.clone(), false));
                 *file_to_open = Some(node.path.clone());
             }
+            if resp.secondary_clicked() {
+                *selected_node = Some((node.path.clone(), false));
+            }
+            resp.context_menu(|ui| {
+                *selected_node = Some((node.path.clone(), false));
+                if ui.button("Rename").clicked() {
+                    *tree_action = Some(TreeAction::StartRename {
+                        path: node.path.clone(),
+                        current_name: node.name.clone(),
+                        is_dir: false,
+                    });
+                    ui.close_menu();
+                }
+            });
         });
     }
 }
@@ -221,6 +410,8 @@ struct TextEditor {
     line_ending: &'static str,
     folder_path: String,
     tree_root: Option<FileNode>,
+    selected_node: Option<(PathBuf, bool)>,
+    pending_tree_edit: Option<PendingTreeEdit>,
     term: Arc<Mutex<TerminalState>>,
     term_screen_text: String,
     term_cursor_idx: usize,
@@ -321,6 +512,8 @@ impl TextEditor {
             line_ending: "LF",
             folder_path: initial_folder,
             tree_root,
+            selected_node: None,
+            pending_tree_edit: None,
             term,
             term_screen_text: String::new(),
             term_cursor_idx: 0,
@@ -358,6 +551,7 @@ impl TextEditor {
     }
 
     fn open_file(&mut self, ctx: &egui::Context, chosen: PathBuf) {
+        self.selected_node = Some((chosen.clone(), false));
         if !self.path.is_empty() && Path::new(&self.path) == chosen {
             return;
         }
@@ -434,6 +628,210 @@ impl TextEditor {
                     st.scroll_to_cursor = true;
                     d.insert_temp(editor_id, st);
                 });
+            }
+        }
+    }
+
+    fn start_rename_selected(&mut self) {
+        let Some((ref path, is_dir)) = self.selected_node else {
+            return;
+        };
+        let Some(name) = path.file_name().map(|n| n.to_string_lossy().into_owned()) else {
+            return;
+        };
+        self.pending_tree_edit = Some(PendingTreeEdit {
+            kind: TreeEditKind::Rename {
+                target_path: path.clone(),
+                is_dir,
+            },
+            input_text: name,
+            had_focus: false,
+        });
+    }
+
+    fn handle_tree_action(&mut self, action: TreeAction) {
+        match action {
+            TreeAction::StartNewFolder(parent_path) => {
+                if let Some(root) = &mut self.tree_root {
+                    if let Some(folder_node) = root.find_mut(&parent_path) {
+                        if !folder_node.children_loaded {
+                            folder_node.load_children();
+                        }
+                        folder_node.expanded = true;
+                    }
+                }
+                self.pending_tree_edit = Some(PendingTreeEdit {
+                    kind: TreeEditKind::NewFolder { parent_path },
+                    input_text: String::new(),
+                    had_focus: false,
+                });
+            }
+            TreeAction::StartNewFile(parent_path) => {
+                if let Some(root) = &mut self.tree_root {
+                    if let Some(folder_node) = root.find_mut(&parent_path) {
+                        if !folder_node.children_loaded {
+                            folder_node.load_children();
+                        }
+                        folder_node.expanded = true;
+                    }
+                }
+                self.pending_tree_edit = Some(PendingTreeEdit {
+                    kind: TreeEditKind::NewFile { parent_path },
+                    input_text: String::new(),
+                    had_focus: false,
+                });
+            }
+            TreeAction::StartRename {
+                path,
+                current_name,
+                is_dir,
+            } => {
+                self.selected_node = Some((path.clone(), is_dir));
+                self.pending_tree_edit = Some(PendingTreeEdit {
+                    kind: TreeEditKind::Rename {
+                        target_path: path,
+                        is_dir,
+                    },
+                    input_text: current_name,
+                    had_focus: false,
+                });
+            }
+        }
+    }
+
+    fn create_folder_in(&mut self, parent_path: &Path, name: &str) -> Option<PathBuf> {
+        let name = name.trim();
+        if name.is_empty() || name.contains(['/', '\\']) {
+            return None;
+        }
+        let new_path = parent_path.join(name);
+        if new_path.exists() {
+            return None;
+        }
+        fs::create_dir(&new_path).ok()?;
+        if let Some(root) = &mut self.tree_root {
+            if let Some(parent_node) = root.find_mut(parent_path) {
+                parent_node.expanded = true;
+                parent_node.load_children();
+            }
+        }
+        self.selected_node = Some((new_path.clone(), true));
+        Some(new_path)
+    }
+
+    fn create_file_in(
+        &mut self,
+        ctx: &egui::Context,
+        parent_path: &Path,
+        name: &str,
+    ) -> Option<PathBuf> {
+        let name = name.trim();
+        if name.is_empty() || name.contains(['/', '\\']) {
+            return None;
+        }
+        let new_path = parent_path.join(name);
+        if new_path.exists() {
+            return None;
+        }
+        fs::write(&new_path, "").ok()?;
+        if let Some(root) = &mut self.tree_root {
+            if let Some(parent_node) = root.find_mut(parent_path) {
+                parent_node.expanded = true;
+                parent_node.load_children();
+            }
+        }
+        self.open_file(ctx, new_path.clone());
+        Some(new_path)
+    }
+
+    fn rename_node(&mut self, old_path: &Path, new_name: &str, is_dir: bool) -> Option<PathBuf> {
+        let new_name = new_name.trim();
+        if new_name.is_empty() || new_name.contains(['/', '\\']) {
+            return None;
+        }
+        let parent = old_path.parent()?;
+        let new_path = parent.join(new_name);
+        if new_path == old_path || new_path.exists() {
+            return None;
+        }
+        fs::rename(old_path, &new_path).ok()?;
+
+        if let Some((ref mut sel_path, _)) = self.selected_node {
+            if sel_path == old_path {
+                *sel_path = new_path.clone();
+            } else if is_dir {
+                if let Ok(rel) = sel_path.strip_prefix(old_path) {
+                    *sel_path = new_path.join(rel);
+                }
+            }
+        }
+
+        if !self.path.is_empty() {
+            let cur = Path::new(&self.path);
+            if cur == old_path {
+                self.path = new_path.to_string_lossy().into_owned();
+                self.refresh_file_metadata();
+            } else if is_dir {
+                if let Ok(rel) = cur.strip_prefix(old_path) {
+                    self.path = new_path.join(rel).to_string_lossy().into_owned();
+                    self.refresh_file_metadata();
+                }
+            }
+        }
+
+        if !self.unsaved_files.is_empty() {
+            if is_dir {
+                let affected: Vec<PathBuf> = self
+                    .unsaved_files
+                    .keys()
+                    .filter(|k| k.starts_with(old_path))
+                    .cloned()
+                    .collect();
+                for k in affected {
+                    if let (Ok(rel), Some(state)) =
+                        (k.strip_prefix(old_path), self.unsaved_files.remove(&k))
+                    {
+                        self.unsaved_files.insert(new_path.join(rel), state);
+                    }
+                }
+            } else if let Some(state) = self.unsaved_files.remove(old_path) {
+                self.unsaved_files.insert(new_path.clone(), state);
+            }
+        }
+
+        if let Some(root) = &mut self.tree_root {
+            let was_expanded = is_dir
+                && root
+                    .find_mut(old_path)
+                    .map(|n| n.expanded)
+                    .unwrap_or(false);
+            if let Some(parent_node) = root.find_mut(parent) {
+                parent_node.load_children();
+            }
+            if was_expanded {
+                if let Some(renamed_node) = root.find_mut(&new_path) {
+                    renamed_node.expanded = true;
+                    renamed_node.load_children();
+                }
+            }
+        }
+
+        Some(new_path)
+    }
+
+    fn commit_tree_edit(&mut self, ctx: &egui::Context, edit: PendingTreeEdit) {
+        match edit.kind {
+            TreeEditKind::NewFolder { parent_path } => {
+                let _ = self.create_folder_in(&parent_path, &edit.input_text);
+            }
+            TreeEditKind::NewFile { parent_path } => {
+                let _ = self.create_file_in(ctx, &parent_path, &edit.input_text);
+            }
+            TreeEditKind::Rename {
+                target_path,
+                is_dir,
+            } => {
+                let _ = self.rename_node(&target_path, &edit.input_text, is_dir);
             }
         }
     }
@@ -790,6 +1188,8 @@ impl TextEditor {
                         resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
 
                     if ui.button("Open").clicked() || enter_pressed {
+                        self.pending_tree_edit = None;
+                        self.selected_node = None;
                         self.tree_root =
                             Some(FileNode::new_root(PathBuf::from(&self.folder_path)));
                     }
@@ -798,6 +1198,8 @@ impl TextEditor {
                         let p = PathBuf::from(&self.folder_path);
                         if let Some(parent) = p.parent() {
                             if !parent.as_os_str().is_empty() {
+                                self.pending_tree_edit = None;
+                                self.selected_node = None;
                                 self.folder_path = parent.to_string_lossy().into_owned();
                                 self.tree_root =
                                     Some(FileNode::new_root(parent.to_path_buf()));
@@ -899,10 +1301,20 @@ impl TextEditor {
                     .default_width(220.0)
                     .min_width(140.0)
                     .show(ctx, |ui| {
+                        if self.pending_tree_edit.is_none()
+                            && ui.input(|i| i.key_pressed(egui::Key::F2))
+                        {
+                            self.start_rename_selected();
+                        }
+
                         let mut file_to_open: Option<PathBuf> = None;
+                        let mut tree_action: Option<TreeAction> = None;
+                        let mut edit_outcome: Option<TreeEditOutcome> = None;
                         let current_path = Path::new(&self.path);
                         let is_current_dirty = self.is_current_dirty;
                         let unsaved_files = &self.unsaved_files;
+                        let selected_node = &mut self.selected_node;
+                        let pending_edit = &mut self.pending_tree_edit;
 
                         egui::ScrollArea::vertical()
                             .auto_shrink([false, false])
@@ -915,12 +1327,30 @@ impl TextEditor {
                                             current_path,
                                             is_current_dirty,
                                             unsaved_files,
+                                            selected_node,
+                                            pending_edit,
+                                            &mut tree_action,
+                                            &mut edit_outcome,
                                             0,
                                             &mut file_to_open,
                                         );
                                     }
                                 }
                             });
+
+                        if let Some(outcome) = edit_outcome {
+                            if let Some(edit) = self.pending_tree_edit.take() {
+                                if matches!(outcome, TreeEditOutcome::Commit) {
+                                    self.commit_tree_edit(ctx, edit);
+                                }
+                            }
+                            ctx.request_repaint();
+                        }
+
+                        if let Some(action) = tree_action {
+                            self.handle_tree_action(action);
+                            ctx.request_repaint();
+                        }
 
                         if let Some(chosen) = file_to_open {
                             self.open_file(ctx, chosen);
@@ -1193,6 +1623,8 @@ mod tests {
             line_ending: "LF",
             folder_path: folder_str,
             tree_root: Some(FileNode::new_root(folder.to_path_buf())),
+            selected_node: None,
+            pending_tree_edit: None,
             term: Arc::new(Mutex::new(TerminalState {
                 parser: vt100::Parser::new(TERM_ROWS, TERM_COLS, 0),
                 pty_updated: false,
@@ -1279,6 +1711,116 @@ mod tests {
         assert!(!app.can_save(), "Save should be disabled immediately after saving");
         assert!(!app.is_file_dirty(&file_a), "file_a should no longer be dirty after saving");
         assert_eq!(fs::read_to_string(&file_a).unwrap(), "// edited\nfn a() {}\n");
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_tree_new_folder_new_file_rename_and_f2() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("rusted_tree_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp_dir);
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let sub_dir = temp_dir.join("src_dir");
+        fs::create_dir_all(&sub_dir).unwrap();
+        let initial_file = temp_dir.join("hello.txt");
+        fs::write(&initial_file, "hello").unwrap();
+
+        let ctx = egui::Context::default();
+        let mut app = new_test_app(&temp_dir);
+
+        // 1. Create a subfolder inside `src_dir` via New Folder action
+        app.handle_tree_action(TreeAction::StartNewFolder(sub_dir.clone()));
+        if let Some(ref mut edit) = app.pending_tree_edit {
+            edit.input_text = "nested".to_string();
+        }
+        let edit = app.pending_tree_edit.take().unwrap();
+        app.commit_tree_edit(&ctx, edit);
+
+        let nested_dir = sub_dir.join("nested");
+        assert!(nested_dir.is_dir(), "New subfolder should exist on disk");
+        assert_eq!(app.selected_node, Some((nested_dir.clone(), true)));
+
+        // 2. Create a new file inside `nested` via New File action
+        app.handle_tree_action(TreeAction::StartNewFile(nested_dir.clone()));
+        if let Some(ref mut edit) = app.pending_tree_edit {
+            edit.input_text = "main.rs".to_string();
+        }
+        let edit = app.pending_tree_edit.take().unwrap();
+        app.commit_tree_edit(&ctx, edit);
+
+        let new_file = nested_dir.join("main.rs");
+        assert!(new_file.is_file(), "New file should exist on disk");
+        assert_eq!(Path::new(&app.path), new_file.as_path());
+        assert_eq!(app.selected_node, Some((new_file.clone(), false)));
+
+        // 3. Edit the open file (so it has unsaved state) and press F2 to rename it
+        app.text = "fn main() {}".to_string();
+        app.is_current_dirty = true;
+
+        let mut f2_input = egui::RawInput::default();
+        f2_input.events.push(egui::Event::Key {
+            key: egui::Key::F2,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        let _ = ctx.run(f2_input, |ctx| {
+            app.update_ui(ctx);
+        });
+
+        assert!(
+            app.pending_tree_edit.is_some(),
+            "Pressing F2 should start renaming the selected node"
+        );
+        assert_eq!(
+            app.pending_tree_edit.as_ref().unwrap().input_text,
+            "main.rs"
+        );
+
+        // Type new name and press Enter to commit rename
+        if let Some(ref mut edit) = app.pending_tree_edit {
+            edit.input_text = "lib.rs".to_string();
+        }
+        let mut enter_input = egui::RawInput::default();
+        enter_input.events.push(egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        let _ = ctx.run(enter_input, |ctx| {
+            app.update_ui(ctx);
+        });
+
+        let renamed_file = nested_dir.join("lib.rs");
+        assert!(!new_file.exists());
+        assert!(renamed_file.is_file());
+        assert_eq!(Path::new(&app.path), renamed_file.as_path());
+        assert_eq!(app.file_name, "lib.rs");
+        assert!(app.is_file_dirty(&renamed_file));
+
+        // 4. Select the parent folder `src_dir`, press F2, and rename it to `app_dir`
+        app.selected_node = Some((sub_dir.clone(), true));
+        app.start_rename_selected();
+        if let Some(ref mut edit) = app.pending_tree_edit {
+            edit.input_text = "app_dir".to_string();
+        }
+        let edit = app.pending_tree_edit.take().unwrap();
+        app.commit_tree_edit(&ctx, edit);
+
+        let renamed_dir = temp_dir.join("app_dir");
+        let moved_file = renamed_dir.join("nested").join("lib.rs");
+        assert!(renamed_dir.is_dir());
+        assert!(moved_file.is_file());
+        assert_eq!(
+            Path::new(&app.path),
+            moved_file.as_path(),
+            "Active file path should update when an ancestor folder is renamed"
+        );
 
         let _ = fs::remove_dir_all(&temp_dir);
     }
