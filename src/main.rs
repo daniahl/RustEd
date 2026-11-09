@@ -5,6 +5,7 @@ use eframe::egui;
 use egui_extras::syntax_highlighting::{self, CodeTheme};
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use std::{
+    collections::HashMap,
     fs,
     io::{Read, Write},
     path::{Path, PathBuf},
@@ -42,8 +43,19 @@ struct TerminalState {
     pty_updated: bool,
 }
 
+struct UnsavedFileState {
+    text: String,
+    saved_text: String,
+    editor_state: Option<editor::FastEditorState>,
+    line_count: usize,
+    cursor_line: usize,
+    cursor_col: usize,
+    selected_chars: usize,
+}
+
 struct FileNode {
     name: String,
+    dirty_label: String,
     collapsed_label: String,
     expanded_label: String,
     path: PathBuf,
@@ -64,6 +76,7 @@ impl FileNode {
         let expanded_label = format!("▾ {name}");
         let mut node = Self {
             name,
+            dirty_label: String::new(),
             collapsed_label,
             expanded_label,
             path,
@@ -84,13 +97,14 @@ impl FileNode {
                 let path = entry.path();
                 let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
                 let name = entry.file_name().to_string_lossy().into_owned();
-                let (collapsed_label, expanded_label) = if is_dir {
-                    (format!("▸ {name}"), format!("▾ {name}"))
+                let (dirty_label, collapsed_label, expanded_label) = if is_dir {
+                    (String::new(), format!("▸ {name}"), format!("▾ {name}"))
                 } else {
-                    (String::new(), String::new())
+                    (format!("{name} *"), String::new(), String::new())
                 };
                 self.children.push(Self {
                     name,
+                    dirty_label,
                     collapsed_label,
                     expanded_label,
                     path,
@@ -118,6 +132,8 @@ fn render_file_node(
     ui: &mut egui::Ui,
     node: &mut FileNode,
     current_path: &Path,
+    is_current_dirty: bool,
+    unsaved_files: &HashMap<PathBuf, UnsavedFileState>,
     depth: usize,
     file_to_open: &mut Option<PathBuf>,
 ) {
@@ -140,14 +156,29 @@ fn render_file_node(
         });
         if node.expanded {
             for child in &mut node.children {
-                render_file_node(ui, child, current_path, depth + 1, file_to_open);
+                render_file_node(
+                    ui,
+                    child,
+                    current_path,
+                    is_current_dirty,
+                    unsaved_files,
+                    depth + 1,
+                    file_to_open,
+                );
             }
         }
     } else {
         let is_selected = current_path == node.path;
+        let is_dirty = (is_selected && is_current_dirty)
+            || (!unsaved_files.is_empty() && unsaved_files.contains_key(&node.path));
+        let label = if is_dirty {
+            node.dirty_label.as_str()
+        } else {
+            node.name.as_str()
+        };
         ui.horizontal(|ui| {
             ui.add_space(indent + 14.0);
-            let resp = ui.selectable_label(is_selected, &node.name);
+            let resp = ui.selectable_label(is_selected, label);
             if resp.clicked() {
                 *file_to_open = Some(node.path.clone());
             }
@@ -179,6 +210,9 @@ struct TextEditor {
     tab: Tab,
     path: String,
     text: String,
+    saved_text: String,
+    is_current_dirty: bool,
+    unsaved_files: HashMap<PathBuf, UnsavedFileState>,
     text_revision: u64,
     file_name: String,
     language_ext: String,
@@ -276,6 +310,9 @@ impl TextEditor {
             tab: Tab::Editor,
             path: String::new(),
             text: String::new(),
+            saved_text: String::new(),
+            is_current_dirty: false,
+            unsaved_files: HashMap::new(),
             text_revision: 0,
             file_name: "Untitled".to_string(),
             language_ext: "rs".to_string(),
@@ -297,6 +334,107 @@ impl TextEditor {
             cursor_line: 1,
             cursor_col: 1,
             selected_chars: 0,
+        }
+    }
+
+    fn can_save(&self) -> bool {
+        !self.path.is_empty() && self.is_current_dirty
+    }
+
+    #[allow(dead_code)]
+    fn is_file_dirty(&self, path: &Path) -> bool {
+        (self.is_current_dirty && Path::new(&self.path) == path)
+            || (!self.unsaved_files.is_empty() && self.unsaved_files.contains_key(path))
+    }
+
+    fn save_current_file(&mut self) {
+        if !self.path.is_empty() && self.is_current_dirty {
+            if fs::write(&self.path, &self.text).is_ok() {
+                self.saved_text.clone_from(&self.text);
+                self.is_current_dirty = false;
+                self.unsaved_files.remove(Path::new(&self.path));
+            }
+        }
+    }
+
+    fn open_file(&mut self, ctx: &egui::Context, chosen: PathBuf) {
+        if !self.path.is_empty() && Path::new(&self.path) == chosen {
+            return;
+        }
+
+        enum IncomingFile {
+            Unsaved(UnsavedFileState),
+            FromDisk(String),
+        }
+
+        let incoming = if let Some(unsaved) = self.unsaved_files.remove(&chosen) {
+            IncomingFile::Unsaved(unsaved)
+        } else if let Ok(content) = fs::read_to_string(&chosen) {
+            IncomingFile::FromDisk(content)
+        } else {
+            return;
+        };
+
+        let editor_id = egui::Id::new("code_editor");
+        if !self.path.is_empty() && self.is_current_dirty {
+            let mut prev_state = ctx.data_mut(|d| d.get_temp::<editor::FastEditorState>(editor_id));
+            if let Some(ref mut st) = prev_state {
+                st.layout_cache = None;
+            }
+            self.unsaved_files.insert(
+                PathBuf::from(&self.path),
+                UnsavedFileState {
+                    text: std::mem::take(&mut self.text),
+                    saved_text: std::mem::take(&mut self.saved_text),
+                    editor_state: prev_state,
+                    line_count: self.line_count,
+                    cursor_line: self.cursor_line,
+                    cursor_col: self.cursor_col,
+                    selected_chars: self.selected_chars,
+                },
+            );
+        }
+
+        self.path = chosen.to_string_lossy().into_owned();
+        self.text_revision = self.text_revision.wrapping_add(1);
+        self.gutter_cache = None;
+
+        match incoming {
+            IncomingFile::Unsaved(unsaved) => {
+                self.text = unsaved.text;
+                self.saved_text = unsaved.saved_text;
+                self.is_current_dirty = self.text != self.saved_text;
+                self.line_count = unsaved.line_count;
+                self.cursor_line = unsaved.cursor_line;
+                self.cursor_col = unsaved.cursor_col;
+                self.selected_chars = unsaved.selected_chars;
+                self.refresh_file_metadata();
+
+                ctx.data_mut(|d| {
+                    let mut st = unsaved.editor_state.unwrap_or_default();
+                    st.scroll_to_cursor = true;
+                    d.insert_temp(editor_id, st);
+                });
+            }
+            IncomingFile::FromDisk(content) => {
+                self.line_count = content.bytes().filter(|&b| b == b'\n').count() + 1;
+                self.saved_text = content.clone();
+                self.text = content;
+                self.is_current_dirty = false;
+                self.cursor_line = 1;
+                self.cursor_col = 1;
+                self.selected_chars = 0;
+                self.refresh_file_metadata();
+
+                ctx.data_mut(|d| {
+                    let mut st = editor::FastEditorState::default();
+                    st.cursor.set_char_range(Some(egui::text::CCursorRange::one(
+                        egui::text::CCursor::new(0),
+                    )));
+                    st.scroll_to_cursor = true;
+                    d.insert_temp(editor_id, st);
+                });
+            }
         }
     }
 
@@ -629,6 +767,12 @@ fn detect_language_name(path: &str) -> &'static str {
 
 impl eframe::App for TextEditor {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.update_ui(ctx);
+    }
+}
+
+impl TextEditor {
+    fn update_ui(&mut self, ctx: &egui::Context) {
         egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 let prev_tab = self.tab;
@@ -661,8 +805,8 @@ impl eframe::App for TextEditor {
                         }
                     }
 
-                    if !self.path.is_empty() && ui.button("Save").clicked() {
-                        let _ = fs::write(&self.path, &self.text);
+                    if ui.add_enabled(self.can_save(), egui::Button::new("Save")).clicked() {
+                        self.save_current_file();
                     }
                 } else if self.tab == Tab::Terminal {
                     ui.separator();
@@ -757,6 +901,8 @@ impl eframe::App for TextEditor {
                     .show(ctx, |ui| {
                         let mut file_to_open: Option<PathBuf> = None;
                         let current_path = Path::new(&self.path);
+                        let is_current_dirty = self.is_current_dirty;
+                        let unsaved_files = &self.unsaved_files;
 
                         egui::ScrollArea::vertical()
                             .auto_shrink([false, false])
@@ -767,6 +913,8 @@ impl eframe::App for TextEditor {
                                             ui,
                                             child,
                                             current_path,
+                                            is_current_dirty,
+                                            unsaved_files,
                                             0,
                                             &mut file_to_open,
                                         );
@@ -775,30 +923,7 @@ impl eframe::App for TextEditor {
                             });
 
                         if let Some(chosen) = file_to_open {
-                            if let Ok(content) = fs::read_to_string(&chosen) {
-                                self.text = content;
-                                self.path = chosen.to_string_lossy().into_owned();
-                                self.text_revision = self.text_revision.wrapping_add(1);
-                                self.refresh_file_metadata();
-                                self.cursor_line = 1;
-                                self.cursor_col = 1;
-                                self.selected_chars = 0;
-                                // Reset cursor to the start of the newly opened file
-                                let editor_id = egui::Id::new("code_editor");
-                                ctx.data_mut(|d| {
-                                    if let Some(mut st) =
-                                        d.get_temp::<editor::FastEditorState>(editor_id)
-                                    {
-                                        st.cursor.set_char_range(Some(
-                                            egui::text::CCursorRange::one(
-                                                egui::text::CCursor::new(0),
-                                            ),
-                                        ));
-                                        st.scroll_to_cursor = true;
-                                        d.insert_temp(editor_id, st);
-                                    }
-                                });
-                            }
+                            self.open_file(ctx, chosen);
                         }
                     });
 
@@ -977,6 +1102,11 @@ impl eframe::App for TextEditor {
                 if editor_text_changed {
                     self.text_revision = self.text_revision.wrapping_add(1);
                     self.refresh_line_ending();
+                    let was_dirty = self.is_current_dirty;
+                    self.is_current_dirty = !self.path.is_empty() && self.text != self.saved_text;
+                    if was_dirty != self.is_current_dirty {
+                        ctx.request_repaint();
+                    }
                 }
             }
             Tab::Terminal => {
@@ -1039,5 +1169,117 @@ impl eframe::App for TextEditor {
                 });
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn new_test_app(folder: &Path) -> TextEditor {
+        let folder_str = folder.to_string_lossy().into_owned();
+        TextEditor {
+            tab: Tab::Editor,
+            path: String::new(),
+            text: String::new(),
+            saved_text: String::new(),
+            is_current_dirty: false,
+            unsaved_files: HashMap::new(),
+            text_revision: 0,
+            file_name: "Untitled".to_string(),
+            language_ext: "rs".to_string(),
+            language_name: "Plain Text",
+            language_salt: hash_language_salt("rs"),
+            line_ending: "LF",
+            folder_path: folder_str,
+            tree_root: Some(FileNode::new_root(folder.to_path_buf())),
+            term: Arc::new(Mutex::new(TerminalState {
+                parser: vt100::Parser::new(TERM_ROWS, TERM_COLS, 0),
+                pty_updated: false,
+            })),
+            term_screen_text: String::new(),
+            term_cursor_idx: 0,
+            pty_writer: None,
+            _pty_master: None,
+            _pty_child: None,
+            focus_terminal: false,
+            selecting_in_terminal: false,
+            gutter_cache: None,
+            line_count: 1,
+            cursor_line: 1,
+            cursor_col: 1,
+            selected_chars: 0,
+        }
+    }
+
+    #[test]
+    fn test_unsaved_state_asterisk_and_file_switching() {
+        let temp_dir = std::env::temp_dir().join(format!("rusted_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp_dir);
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let file_a = temp_dir.join("a.rs");
+        let file_b = temp_dir.join("b.rs");
+        fs::write(&file_a, "fn a() {}\n").unwrap();
+        fs::write(&file_b, "fn b() {}\n").unwrap();
+
+        let ctx = egui::Context::default();
+        let mut app = new_test_app(&temp_dir);
+
+        // 1. Initially no file is open -> Save button cannot save
+        assert!(!app.can_save());
+
+        // 2. Open file_a -> clean, Save button disabled
+        app.open_file(&ctx, file_a.clone());
+        assert_eq!(app.text, "fn a() {}\n");
+        assert!(!app.can_save());
+        assert!(!app.is_file_dirty(&file_a));
+
+        // Focus editor in frame 1
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            app.update_ui(ctx);
+            ctx.memory_mut(|m| m.request_focus(egui::Id::new("code_editor")));
+        });
+
+        // 3. Edit file_a in frame 2
+        let mut input = egui::RawInput::default();
+        input.events.push(egui::Event::Text("// edited\n".to_string()));
+        let _ = ctx.run(input, |ctx| {
+            app.update_ui(ctx);
+        });
+
+        assert_eq!(app.text, "// edited\nfn a() {}\n");
+        assert!(app.can_save(), "Save should be enabled after editing");
+        assert!(app.is_file_dirty(&file_a), "file_a should be marked dirty");
+        assert!(!app.is_file_dirty(&file_b), "file_b should still be clean");
+
+        // Verify FileNode has the asterisk dirty label
+        let root = app.tree_root.as_ref().unwrap();
+        let node_a = root.children.iter().find(|n| n.path == file_a).unwrap();
+        assert_eq!(node_a.dirty_label, "a.rs *");
+
+        // 4. Switch to file_b without saving file_a
+        app.open_file(&ctx, file_b.clone());
+        assert_eq!(app.text, "fn b() {}\n");
+        assert!(!app.can_save(), "Save should be disabled on unmodified file_b");
+        assert!(
+            app.is_file_dirty(&file_a),
+            "file_a should remain dirty in state after switching to file_b"
+        );
+        assert!(!app.is_file_dirty(&file_b));
+
+        // 5. Switch back to file_a -> unsaved content is restored and Save is enabled
+        app.open_file(&ctx, file_a.clone());
+        assert_eq!(app.text, "// edited\nfn a() {}\n");
+        assert!(app.can_save(), "Save should be enabled when returning to unsaved file_a");
+        assert!(app.is_file_dirty(&file_a));
+
+        // 6. Save file_a -> written to disk, dirty cleared, Save disabled
+        app.save_current_file();
+        assert!(!app.can_save(), "Save should be disabled immediately after saving");
+        assert!(!app.is_file_dirty(&file_a), "file_a should no longer be dirty after saving");
+        assert_eq!(fs::read_to_string(&file_a).unwrap(), "// edited\nfn a() {}\n");
+
+        let _ = fs::remove_dir_all(&temp_dir);
     }
 }
