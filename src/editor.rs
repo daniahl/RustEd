@@ -144,18 +144,7 @@ impl<'a> FastEditor<'a> {
                     is_being_dragged,
                 );
                 if did_interact || response.clicked() {
-                    ui.memory_mut(|mem| {
-                        mem.request_focus(self.id);
-                        mem.set_focus_lock_filter(
-                            self.id,
-                            egui::EventFilter {
-                                horizontal_arrows: true,
-                                vertical_arrows: true,
-                                tab: true,
-                                ..Default::default()
-                            },
-                        );
-                    });
+                    response.request_focus();
                     state.last_interaction_time = ui.input(|i| i.time);
                     if let Some(r) = state.cursor.range(&galley) {
                         cursor_range = r;
@@ -168,19 +157,18 @@ impl<'a> FastEditor<'a> {
         let os = ui.ctx().os();
         let mut text_changed = false;
 
-        if has_focus {
-            ui.memory_mut(|mem| {
-                mem.set_focus_lock_filter(
-                    self.id,
-                    egui::EventFilter {
-                        horizontal_arrows: true,
-                        vertical_arrows: true,
-                        tab: true,
-                        ..Default::default()
-                    },
-                );
-            });
+        if has_focus
+            || (!ui.memory(|m| m.any_popup_open())
+                && ui.input(|i| i.key_pressed(Key::Escape)))
+        {
+            // Keep editor focus if Escape was pressed while editor had focus on the previous frame
+            if ui.memory(|m| m.had_focus_last_frame(self.id) && m.focused().is_none()) {
+                response.request_focus();
+            }
+        }
 
+        let has_focus = response.has_focus();
+        if has_focus {
             let now = ui.input(|i| i.time);
 
             // Feed state to undoer if in flux or initially empty so undo points can stabilize.
@@ -438,68 +426,68 @@ impl<'a> FastEditor<'a> {
         let painter = ui.painter_at(rect);
 
         // Selection & cursor rendering
-        if has_focus {
-            let cursor_box = galley
-                .pos_from_cursor(&cursor_range.primary)
-                .translate(galley_pos.to_vec2());
-            let cursor_moved = state.cursor.char_range() != prev_cursor_range;
+        let cursor_box = galley
+            .pos_from_cursor(&cursor_range.primary)
+            .translate(galley_pos.to_vec2());
+        let cursor_moved = state.cursor.char_range() != prev_cursor_range;
 
-            if text_changed || cursor_moved {
-                state.scroll_to_cursor = true;
-            }
+        if has_focus && (text_changed || cursor_moved) {
+            state.scroll_to_cursor = true;
+        }
 
-            if state.scroll_to_cursor || !cursor_range.is_empty() {
-                ui.scroll_to_rect(cursor_box, None);
-            }
+        if state.scroll_to_cursor || (has_focus && !cursor_range.is_empty()) {
+            ui.scroll_to_rect(cursor_box, None);
+        }
 
-            if !cursor_range.is_empty() {
-                // Paint selection rects directly for visible rows instead of calling
-                // `paint_text_selection` on `galley`, which would deep-clone the entire
-                // Galley via `Arc::make_mut` every frame.
-                let [min_cursor, max_cursor] = cursor_range.sorted_cursors();
-                let min_row = min_cursor.rcursor.row;
-                let max_row = max_cursor.rcursor.row.min(galley.rows.len().saturating_sub(1));
-                let top = text_clip_rect.min.y - galley_pos.y;
-                let first_vis = galley.rows.partition_point(|r| r.rect.max.y < top);
-                let start_row = min_row.max(first_vis);
-                let bg_fill = ui.visuals().selection.bg_fill;
+        if !cursor_range.is_empty() {
+            // Paint selection rects directly for visible rows instead of calling
+            // `paint_text_selection` on `galley`, which would deep-clone the entire
+            // Galley via `Arc::make_mut` every frame.
+            let [min_cursor, max_cursor] = cursor_range.sorted_cursors();
+            let min_row = min_cursor.rcursor.row;
+            let max_row = max_cursor.rcursor.row.min(galley.rows.len().saturating_sub(1));
+            let top = text_clip_rect.min.y - galley_pos.y;
+            let first_vis = galley.rows.partition_point(|r| r.rect.max.y < top);
+            let start_row = min_row.max(first_vis);
+            let bg_fill = ui.visuals().selection.bg_fill;
 
-                if start_row <= max_row {
-                    for (row_idx, row) in galley.rows[start_row..=max_row]
-                        .iter()
-                        .enumerate()
-                        .map(|(i, r)| (start_row + i, r))
-                    {
-                        let row_top_y = galley_pos.y + row.rect.min.y;
-                        if row_top_y > text_clip_rect.max.y {
-                            break;
-                        }
-                        let left = if row_idx == min_row {
-                            row.x_offset(min_cursor.rcursor.column)
+            if start_row <= max_row {
+                for (row_idx, row) in galley.rows[start_row..=max_row]
+                    .iter()
+                    .enumerate()
+                    .map(|(i, r)| (start_row + i, r))
+                {
+                    let row_top_y = galley_pos.y + row.rect.min.y;
+                    if row_top_y > text_clip_rect.max.y {
+                        break;
+                    }
+                    let left = if row_idx == min_row {
+                        row.x_offset(min_cursor.rcursor.column)
+                    } else {
+                        0.0
+                    };
+                    let right = if row_idx == max_cursor.rcursor.row {
+                        row.x_offset(max_cursor.rcursor.column)
+                    } else {
+                        let newline_extra = if row.ends_with_newline {
+                            row.rect.height() * 0.5
                         } else {
                             0.0
                         };
-                        let right = if row_idx == max_cursor.rcursor.row {
-                            row.x_offset(max_cursor.rcursor.column)
-                        } else {
-                            let newline_extra = if row.ends_with_newline {
-                                row.rect.height() * 0.5
-                            } else {
-                                0.0
-                            };
-                            row.rect.width() + newline_extra
-                        };
-                        let sel_rect = Rect::from_min_max(
-                            galley_pos + Vec2::new(left, row.rect.min.y),
-                            galley_pos + Vec2::new(right, row.rect.max.y),
-                        );
-                        painter.rect_filled(sel_rect, 0.0, bg_fill);
-                    }
+                        row.rect.width() + newline_extra
+                    };
+                    let sel_rect = Rect::from_min_max(
+                        galley_pos + Vec2::new(left, row.rect.min.y),
+                        galley_pos + Vec2::new(right, row.rect.max.y),
+                    );
+                    painter.rect_filled(sel_rect, 0.0, bg_fill);
                 }
             }
+        }
 
-            painter.galley(galley_pos, Arc::clone(&galley), Color32::WHITE);
+        painter.galley(galley_pos, Arc::clone(&galley), Color32::WHITE);
 
+        if has_focus {
             let now = ui.input(|i| i.time);
             let mut primary_cursor_rect = galley
                 .pos_from_cursor(&cursor_range.primary)
@@ -517,8 +505,13 @@ impl<'a> FastEditor<'a> {
                 primary_cursor_rect,
                 now - state.last_interaction_time,
             );
-        } else {
-            painter.galley(galley_pos, Arc::clone(&galley), Color32::WHITE);
+        } else if text_clip_rect.contains(cursor_box.center()) {
+            state.scroll_to_cursor = false;
+        } else if state.scroll_to_cursor {
+            if !ui.ctx().will_discard() {
+                ui.ctx().request_discard("scroll to cursor");
+            }
+            ui.ctx().request_repaint();
         }
 
         // Accessibility (AccessKit) update
@@ -661,6 +654,18 @@ impl<'a> FastEditor<'a> {
             }));
         }
         ui.ctx().data_mut(|d| d.insert_temp(self.id, state));
+
+        let focus_filter = egui::EventFilter {
+            horizontal_arrows: true,
+            vertical_arrows: true,
+            tab: true,
+            escape: true,
+        };
+        if has_focus {
+            ui.memory_mut(|mem| {
+                mem.set_focus_lock_filter(self.id, focus_filter);
+            });
+        }
 
         EditorOutput {
             response,

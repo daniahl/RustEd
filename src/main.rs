@@ -519,6 +519,9 @@ struct TextEditor {
     cursor_line: usize,
     cursor_col: usize,
     selected_chars: usize,
+    find_open: bool,
+    find_query: String,
+    focus_find_input: bool,
 }
 
 impl TextEditor {
@@ -618,7 +621,89 @@ impl TextEditor {
             cursor_line: 1,
             cursor_col: 1,
             selected_chars: 0,
+            find_open: false,
+            find_query: String::new(),
+            focus_find_input: false,
         }
+    }
+
+    fn open_find_dialog(&mut self, ctx: &egui::Context) {
+        let editor_id = egui::Id::new("code_editor");
+        if let Some(state) = ctx.data_mut(|d| d.get_temp::<editor::FastEditorState>(editor_id)) {
+            if let Some(range) = state.cursor.char_range() {
+                if range.primary != range.secondary {
+                    let [min_c, max_c] = range.sorted();
+                    let selected: String = self
+                        .text
+                        .chars()
+                        .skip(min_c.index)
+                        .take(max_c.index - min_c.index)
+                        .collect();
+                    if !selected.is_empty() && !selected.contains('\n') && !selected.contains('\r')
+                    {
+                        self.find_query = selected;
+                    }
+                }
+            }
+        }
+        self.find_open = true;
+        self.focus_find_input = true;
+    }
+
+    fn find_next(&mut self, ctx: &egui::Context) -> bool {
+        if self.find_query.is_empty() || self.text.is_empty() {
+            return false;
+        }
+        let editor_id = egui::Id::new("code_editor");
+        let mut state = ctx
+            .data_mut(|d| d.get_temp::<editor::FastEditorState>(editor_id))
+            .unwrap_or_default();
+
+        let start_char_idx = state
+            .cursor
+            .char_range()
+            .map(|r| r.primary.index.max(r.secondary.index))
+            .unwrap_or(0);
+
+        let start_byte = self
+            .text
+            .char_indices()
+            .nth(start_char_idx)
+            .map(|(b, _)| b)
+            .unwrap_or(self.text.len());
+
+        let found_byte = self.text[start_byte..]
+            .find(&self.find_query)
+            .map(|rel| start_byte + rel)
+            .or_else(|| self.text.find(&self.find_query));
+
+        let Some(match_byte) = found_byte else {
+            return false;
+        };
+
+        let match_start_char = self.text[..match_byte].chars().count();
+        let match_end_char = match_start_char + self.find_query.chars().count();
+
+        state.cursor.set_char_range(Some(egui::text::CCursorRange::two(
+            egui::text::CCursor::new(match_start_char),
+            egui::text::CCursor::new(match_end_char),
+        )));
+        state.scroll_to_cursor = true;
+        ctx.data_mut(|d| d.insert_temp(editor_id, state));
+        ctx.memory_mut(|m| {
+            m.request_focus(editor_id);
+            m.set_focus_lock_filter(
+                editor_id,
+                egui::EventFilter {
+                    horizontal_arrows: true,
+                    vertical_arrows: true,
+                    tab: true,
+                    escape: true,
+                },
+            );
+        });
+        ctx.request_repaint();
+        true
     }
 
     fn can_save(&self) -> bool {
@@ -1330,6 +1415,25 @@ impl eframe::App for TextEditor {
 
 impl TextEditor {
     fn update_ui(&mut self, ctx: &egui::Context) {
+        if self.tab == Tab::Editor {
+            let (ctrl_f, f3) = ctx.input_mut(|i| {
+                let ctrl_f = i.consume_key(egui::Modifiers::COMMAND, egui::Key::F)
+                    || i.consume_key(egui::Modifiers::CTRL, egui::Key::F);
+                let f3 = i.consume_key(egui::Modifiers::NONE, egui::Key::F3);
+                (ctrl_f, f3)
+            });
+            if ctrl_f {
+                self.open_find_dialog(ctx);
+            }
+            if f3 {
+                if self.find_query.is_empty() {
+                    self.open_find_dialog(ctx);
+                } else {
+                    self.find_next(ctx);
+                }
+            }
+        }
+
         egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 let prev_tab = self.tab;
@@ -1368,6 +1472,10 @@ impl TextEditor {
 
                     if ui.add_enabled(self.can_save(), egui::Button::new("Save")).clicked() {
                         self.save_current_file();
+                    }
+
+                    if ui.button("Find").on_hover_text("Find (Ctrl+F)").clicked() {
+                        self.open_find_dialog(ctx);
                     }
                 } else if self.tab == Tab::Terminal {
                     ui.separator();
@@ -1515,6 +1623,125 @@ impl TextEditor {
                             self.open_file(ctx, chosen);
                         }
                     });
+
+                if self.find_open {
+                    let mut open = self.find_open;
+                    let mut trigger_find_next = false;
+                    let mut close_dialog = false;
+
+                    egui::Window::new("Find")
+                        .open(&mut open)
+                        .collapsible(false)
+                        .resizable(false)
+                        .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-16.0, 36.0))
+                        .show(ctx, |ui| {
+                            ui.horizontal(|ui| {
+                                let find_id = egui::Id::new("find_query_input");
+                                if self.focus_find_input {
+                                    ui.memory_mut(|m| m.request_focus(find_id));
+                                    let mut st =
+                                        egui::text_edit::TextEditState::load(ui.ctx(), find_id)
+                                            .unwrap_or_default();
+                                    let len = self.find_query.chars().count();
+                                    st.cursor.set_char_range(Some(
+                                        egui::text::CCursorRange::two(
+                                            egui::text::CCursor::new(0),
+                                            egui::text::CCursor::new(len),
+                                        ),
+                                    ));
+                                    st.store(ui.ctx(), find_id);
+                                }
+
+                                let resp = egui::TextEdit::singleline(&mut self.find_query)
+                                    .id(find_id)
+                                    .hint_text("Search text...")
+                                    .desired_width(180.0)
+                                    .show(ui)
+                                    .response;
+
+                                if self.focus_find_input {
+                                    resp.request_focus();
+                                    let mut st =
+                                        egui::text_edit::TextEditState::load(ui.ctx(), find_id)
+                                            .unwrap_or_default();
+                                    let len = self.find_query.chars().count();
+                                    st.cursor.set_char_range(Some(
+                                        egui::text::CCursorRange::two(
+                                            egui::text::CCursor::new(0),
+                                            egui::text::CCursor::new(len),
+                                        ),
+                                    ));
+                                    st.store(ui.ctx(), find_id);
+                                    self.focus_find_input = false;
+                                }
+
+                                let enter_pressed =
+                                    ui.input(|i| i.key_pressed(egui::Key::Enter));
+                                let escape_pressed =
+                                    ui.input(|i| i.key_pressed(egui::Key::Escape));
+                                if enter_pressed {
+                                    ui.input_mut(|i| {
+                                        i.consume_key(egui::Modifiers::NONE, egui::Key::Enter);
+                                    });
+                                }
+                                if escape_pressed {
+                                    ui.input_mut(|i| {
+                                        i.consume_key(egui::Modifiers::NONE, egui::Key::Escape);
+                                    });
+                                }
+
+                                if ui
+                                    .add_enabled(
+                                        !self.find_query.is_empty(),
+                                        egui::Button::new("Find"),
+                                    )
+                                    .on_hover_text("Find (Enter)")
+                                    .clicked()
+                                    || enter_pressed
+                                {
+                                    trigger_find_next = true;
+                                    close_dialog = true;
+                                }
+
+                                if escape_pressed {
+                                    close_dialog = true;
+                                }
+                            });
+                        });
+
+                    if close_dialog {
+                        open = false;
+                        let editor_id = egui::Id::new("code_editor");
+                        ctx.memory_mut(|m| {
+                            m.request_focus(editor_id);
+                            m.set_focus_lock_filter(
+                                editor_id,
+                                egui::EventFilter {
+                                    horizontal_arrows: true,
+                                    vertical_arrows: true,
+                                    tab: true,
+                                    escape: true,
+                                },
+                            );
+                        });
+                        ctx.input_mut(|i| {
+                            i.events.retain(|e| {
+                                !matches!(
+                                    e,
+                                    egui::Event::Text(_)
+                                        | egui::Event::Paste(_)
+                                        | egui::Event::Cut
+                                        | egui::Event::Copy
+                                )
+                            });
+                        });
+                    }
+                    self.find_open = open;
+
+                    if trigger_find_next {
+                        self.find_next(ctx);
+                    }
+                }
 
                 let language = self.language_ext.as_str();
                 let language_salt = self.language_salt;
@@ -1800,7 +2027,138 @@ mod tests {
             cursor_line: 1,
             cursor_col: 1,
             selected_chars: 0,
+            find_open: false,
+            find_query: String::new(),
+            focus_find_input: false,
         }
+    }
+
+    #[test]
+    fn test_find_dialog_ctrl_f_and_f3_find_next() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("rusted_find_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp_dir);
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let ctx = egui::Context::default();
+        ctx.options_mut(|o| {
+            o.max_passes = std::num::NonZeroUsize::new(4).unwrap();
+        });
+        let mut app = new_test_app(&temp_dir);
+        app.text = "alpha beta alpha gamma alpha".to_string();
+        app.text_revision = 1;
+
+        // Render initial frame
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            app.update_ui(ctx);
+        });
+        assert!(!app.find_open);
+
+        // Press Ctrl+F for the very first time in the session to open Find dialog
+        let mut ctrl_f_input = egui::RawInput::default();
+        ctrl_f_input.events.push(egui::Event::Key {
+            key: egui::Key::F,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::CTRL,
+        });
+        let _ = ctx.run(ctrl_f_input, |ctx| {
+            app.update_ui(ctx);
+        });
+        assert!(app.find_open, "Ctrl+F should open the Find dialog");
+        assert!(
+            ctx.memory(|m| m.has_focus(egui::Id::new("find_query_input"))),
+            "Find input should have focus immediately on the first Ctrl+F"
+        );
+
+        // Type search query "alpha" and press Enter in the Find dialog
+        let mut type_and_enter = egui::RawInput::default();
+        type_and_enter
+            .events
+            .push(egui::Event::Text("alpha".to_string()));
+        type_and_enter.events.push(egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        let _ = ctx.run(type_and_enter, |ctx| {
+            app.update_ui(ctx);
+        });
+        assert!(!app.find_open, "Pressing Enter in Find dialog should close it");
+        assert_eq!(
+            app.text, "alpha beta alpha gamma alpha",
+            "Pressing Enter in Find dialog should not insert a newline into the editor"
+        );
+
+        let editor_id = egui::Id::new("code_editor");
+        assert!(
+            ctx.memory(|m| m.has_focus(editor_id)),
+            "Editor should have focus after Find"
+        );
+        let get_sel = |ctx: &egui::Context| -> Option<(usize, usize)> {
+            let st = ctx.data_mut(|d| d.get_temp::<editor::FastEditorState>(editor_id))?;
+            let r = st.cursor.char_range()?;
+            let [min_c, max_c] = r.sorted();
+            Some((min_c.index, max_c.index))
+        };
+
+        assert_eq!(get_sel(&ctx), Some((0, 5)), "Find should select first 'alpha'");
+
+        // Press Escape in the editor -> focus and selection should remain intact
+        let mut esc_input = egui::RawInput::default();
+        esc_input.events.push(egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        let _ = ctx.run(esc_input, |ctx| {
+            app.update_ui(ctx);
+        });
+        let focused_after_esc = ctx.memory(|m| m.focused());
+        assert_eq!(
+            focused_after_esc,
+            Some(editor_id),
+            "Pressing Escape in the editor should not drop editor focus"
+        );
+        assert_eq!(
+            get_sel(&ctx),
+            Some((0, 5)),
+            "Pressing Escape in the editor should keep the selection"
+        );
+
+        let mut f3_input = egui::RawInput::default();
+        f3_input.events.push(egui::Event::Key {
+            key: egui::Key::F3,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+
+        // Press F3 -> second occurrence at char index 11..16
+        let _ = ctx.run(f3_input.clone(), |ctx| {
+            app.update_ui(ctx);
+        });
+        assert_eq!(get_sel(&ctx), Some((11, 16)), "Second F3 should select second 'alpha'");
+
+        // Press F3 again -> third occurrence at char index 23..28
+        let _ = ctx.run(f3_input.clone(), |ctx| {
+            app.update_ui(ctx);
+        });
+        assert_eq!(get_sel(&ctx), Some((23, 28)), "Third F3 should select third 'alpha'");
+
+        // Press F3 again -> wraps around to first occurrence at 0..5
+        let _ = ctx.run(f3_input, |ctx| {
+            app.update_ui(ctx);
+        });
+        assert_eq!(get_sel(&ctx), Some((0, 5)), "Fourth F3 should wrap around to first 'alpha'");
+
+        let _ = fs::remove_dir_all(&temp_dir);
     }
 
     #[test]

@@ -18,6 +18,8 @@ RustEd is built from the ground up with assistive technologies—especially **Wi
 - **Revision-Cached Text Layout:** Reuses `Galley` layouts in $O(1)$ across unchanged frames and coalesces multiple input events within a single frame into one layout pass.
 - **Viewport-Culled Selection & Gutter Rendering:** Binary-searches visible rows (`partition_point`) for both text selection highlights and line-number gutter rendering without cloning the underlying `Galley` or allocating per-line strings.
 - **Syntax Highlighting:** Automatic language detection and syntax highlighting via `egui_extras` + `syntect` for files up to 16 KB, seamlessly falling back to plain monospace layout on larger files to keep typing latency minimal.
+- **Find & Find Next (`Ctrl+F` / `F3`):** Open the floating **Find** dialog via the top-bar **Find** button or `Ctrl+F` (pre-populated with the current single-line selection). Press `Enter` or click **Find** to close the dialog, jump to, and select the match in the editor. Press `F3` at any time to cycle through subsequent matches (wrapping around the document).
+- **Multi-File Unsaved State Tracking:** Switch freely between files in the project tree without losing unsaved edits, cursor positions, selections, or undo/redo history. Modified files are marked with an asterisk (`*`) in the file tree, and the **Save** button dynamically enables only when the active file has unsaved changes.
 - **Undo / Redo & Clipboard Support:** Full `Ctrl+Z` / `Ctrl+Y` history backed by shared `Arc<String>` snapshots, plus `Ctrl+C`, `Ctrl+X`, `Ctrl+V`, word-wise deletion (`Ctrl+Backspace`, `Ctrl+Delete`), and `PageUp` / `PageDown` navigation.
 
 ### Integrated ConPTY Terminal for AI CLI Workflows
@@ -26,6 +28,7 @@ RustEd is built from the ground up with assistive technologies—especially **Wi
 
 ### Workspace File Explorer & Status Bar
 - **Lazy Directory Tree:** Expandable sidebar folder tree sorted case-insensitively with directories first and quick parent-folder (`..`) navigation.
+- **Context Menu & Inline File Management:** Right-click folders or files in the explorer tree to **Create New Folder**, **Create New File**, **Rename** (also triggered with `F2`), or **Delete** (moves items to the Windows Recycle Bin). Creating or renaming uses an inline text input right inside the tree (`Enter` to commit, `Escape` to cancel) and automatically updates open and unsaved file paths when files or parent folders are renamed.
 - **Live Status Bar:** Displays active file name, line count, byte size, cursor line/column, character selection count, indentation mode, encoding (`UTF-8`), line-ending sequence (`LF` / `CRLF`), and detected language.
 
 ---
