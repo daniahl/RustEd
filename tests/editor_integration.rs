@@ -37,7 +37,7 @@ fn test_editor_full_lifecycle() {
     // Frame 1: Empty text, focus
     let out = run_frame(&ctx, &mut text, Default::default());
     let u = out.platform_output.accesskit_update.unwrap();
-    assert_eq!(u.nodes.len(), 2); // Window and MultilineTextInput (self.id)
+    assert_eq!(u.nodes.len(), 3); // Window, MultilineTextInput (self.id), and active TextRun child
 
     // Frame 2: Type "First Line"
     let mut input = egui::RawInput::default();

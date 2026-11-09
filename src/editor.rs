@@ -20,6 +20,12 @@ pub struct FastEditorState {
     pub scroll_to_cursor: bool,
     /// Last layout result, reused on frames where text, width and theme are unchanged.
     pub layout_cache: Option<Arc<LayoutCache>>,
+    /// Tracks whether the editor had focus on the previous frame so we can force a
+    /// `UIA_Text_TextSelectionChangedEventId` transition on the frame after focus is gained.
+    pub had_focus_prev_frame: bool,
+    /// Set when the editor just gained focus; causes one repaint where the selection is updated
+    /// while `old.is_text_pattern_supported()` is already true.
+    pub pending_accesskit_selection_sync: bool,
 }
 
 /// Cached galley for a given text + layout parameters.
@@ -526,116 +532,148 @@ impl<'a> FastEditor<'a> {
             });
         });
 
-        // 2. When focused, set the text selection and build the active row node
-        // inside `with_accessibility_parent(self.id, ...)` so that the row is a child of self.id ONLY.
-        if has_focus {
-            let focus = cursor_range.primary.rcursor;
-            let cursor_rect = galley
-                .pos_from_cursor(&cursor_range.primary)
-                .translate(galley_pos.to_vec2());
+        // 2. Always build the active row node inside `with_accessibility_parent(self.id, ...)`
+        // so `self.id` always has a `TextRun` child (`old.is_text_pattern_supported() == true`),
+        // ensuring `accesskit_windows` fires `UIA_Text_TextSelectionChangedEventId` immediately
+        // even on the exact frame the editor regains focus (e.g. when closing the Find dialog).
+        let focus = cursor_range.primary.rcursor;
+        let cursor_rect = galley
+            .pos_from_cursor(&cursor_range.primary)
+            .translate(galley_pos.to_vec2());
 
-            if text_clip_rect.contains(cursor_rect.center()) {
-                state.scroll_to_cursor = false;
-            }
+        if text_clip_rect.contains(cursor_rect.center()) {
+            state.scroll_to_cursor = false;
+        }
 
-            if !text_clip_rect.contains(cursor_rect.center()) {
-                // Only redo the pass when we've just asked the ScrollArea to scroll to the
-                // caret (edit / caret move). If the user simply scrolled the caret out of view,
-                // discarding every frame would re-run layout continuously.
-                if state.scroll_to_cursor {
-                    if !ui.ctx().will_discard() {
-                        ui.ctx().request_discard("scroll to cursor");
-                    }
-                    // If the pass limit is hit, keep scrolling on the next frame.
-                    ui.ctx().request_repaint();
+        if has_focus && !text_clip_rect.contains(cursor_rect.center()) {
+            // Only redo the pass when we've just asked the ScrollArea to scroll to the
+            // caret (edit / caret move). If the user simply scrolled the caret out of view,
+            // discarding every frame would re-run layout continuously.
+            if state.scroll_to_cursor {
+                if !ui.ctx().will_discard() {
+                    ui.ctx().request_discard("scroll to cursor");
                 }
+                // If the pass limit is hit, keep scrolling on the next frame.
+                ui.ctx().request_repaint();
+            }
+            ui.ctx().accesskit_node_builder(self.id, |builder| {
+                builder.clear_text_selection();
+            });
+        } else if let Some(row) = galley.rows.get(focus.row) {
+            let row_id = self.id.with(focus.row);
+            let row_accesskit_id: egui::accesskit::NodeId = row_id.value().into();
+
+            if has_focus {
+                if !state.had_focus_prev_frame && !ui.ctx().will_discard() {
+                    // On the frame focus returns to the editor (e.g. after Find dialog closes),
+                    // schedule one immediate follow-up frame so UIA clients that first process
+                    // `UIA_AutomationFocusChangedEventId` also receive a fresh
+                    // `UIA_Text_TextSelectionChangedEventId` once focus has settled.
+                    state.pending_accesskit_selection_sync = true;
+                    ui.ctx().request_repaint();
+                    ui.ctx().accesskit_node_builder(self.id, |builder| {
+                        let pos = egui::accesskit::TextPosition {
+                            node: row_accesskit_id,
+                            character_index: 0,
+                        };
+                        builder.set_text_selection(egui::accesskit::TextSelection {
+                            anchor: pos,
+                            focus: pos,
+                        });
+                    });
+                } else {
+                    if !ui.ctx().will_discard() {
+                        state.pending_accesskit_selection_sync = false;
+                    }
+                    // Set selection on self.id
+                    ui.ctx().accesskit_node_builder(self.id, |builder| {
+                        let target_idx = (focus.column + 1).min(row.glyphs.len() + 1);
+                        let focus_pos = egui::accesskit::TextPosition {
+                            node: row_accesskit_id,
+                            character_index: target_idx,
+                        };
+                        // Always report a collapsed caret at the moving (primary) end so
+                        // Magnifier follows the caret even while a selection is extended.
+                        builder.set_text_selection(egui::accesskit::TextSelection {
+                            anchor: focus_pos,
+                            focus: focus_pos,
+                        });
+                    });
+                }
+            } else {
                 ui.ctx().accesskit_node_builder(self.id, |builder| {
                     builder.clear_text_selection();
                 });
-            } else if let Some(row) = galley.rows.get(focus.row) {
-                let row_id = self.id.with(focus.row);
-                let row_accesskit_id: egui::accesskit::NodeId = row_id.value().into();
-
-                // Set selection on self.id
-                ui.ctx().accesskit_node_builder(self.id, |builder| {
-                    let target_idx = (focus.column + 1).min(row.glyphs.len() + 1);
-                    let focus_pos = egui::accesskit::TextPosition {
-                        node: row_accesskit_id,
-                        character_index: target_idx,
-                    };
-                    // Always report a collapsed caret at the moving (primary) end so
-                    // Magnifier follows the caret even while a selection is extended.
-                    builder.set_text_selection(egui::accesskit::TextSelection {
-                        anchor: focus_pos,
-                        focus: focus_pos,
-                    });
-                });
-
-                // Build active row inside with_accessibility_parent so self.id is its parent:
-                ui.ctx().with_accessibility_parent(self.id, || {
-                    ui.ctx().accesskit_node_builder(row_id, |builder| {
-                        builder.set_role(egui::accesskit::Role::TextRun);
-                        builder.set_text_direction(egui::accesskit::TextDirection::LeftToRight);
-                        let mut row_min = galley_pos + row.rect.min.to_vec2();
-                        let mut row_max = galley_pos + row.rect.max.to_vec2();
-
-                        // Hard-clamp row bounds to visible text area so coordinates never escape beyond the window
-                        row_min.y = row_min.y.clamp(text_clip_rect.min.y, text_clip_rect.max.y);
-                        row_max.y = row_max.y.clamp(row_min.y, text_clip_rect.max.y);
-                        row_min.x = row_min.x.clamp(text_clip_rect.min.x, text_clip_rect.max.x);
-                        row_max.x = row_max.x.clamp(row_min.x, text_clip_rect.max.x);
-                        if row_max.x - row_min.x < 2.0 {
-                            row_max.x = row_min.x + 2.0;
-                        }
-                        builder.set_bounds(egui::accesskit::Rect {
-                            x0: row_min.x.into(),
-                            y0: row_min.y.into(),
-                            x1: row_max.x.into(),
-                            y1: row_max.y.into(),
-                        });
-
-                        let glyph_count = row.glyphs.len();
-                        let mut value = String::with_capacity(glyph_count + 2);
-                        let mut character_lengths = Vec::<u8>::with_capacity(glyph_count + 2);
-                        let mut character_positions = Vec::<f32>::with_capacity(glyph_count + 2);
-                        let mut character_widths = Vec::<f32>::with_capacity(glyph_count + 2);
-
-                        // Index 0: leading anchor at x = 0.0 on this row
-                        value.push(' ');
-                        character_lengths.push(1);
-                        character_positions.push(0.0);
-                        character_widths.push(1.0);
-
-                        for glyph in &row.glyphs {
-                            let old_len = value.len();
-                            value.push(glyph.chr);
-                            character_lengths.push((value.len() - old_len) as u8);
-                            character_positions.push(glyph.pos.x - row.rect.min.x);
-                            character_widths.push(glyph.advance_width.max(1.0));
-                        }
-
-                        // Index N+1: trailing anchor at the right end of this row
-                        let end_x = row.rect.width();
-                        value.push(if row.ends_with_newline { '\n' } else { ' ' });
-                        character_lengths.push(1);
-                        character_positions.push(end_x);
-                        character_widths.push(1.0);
-
-                        let mut remaining = character_lengths.len();
-                        let mut word_lengths = Vec::with_capacity((remaining / 255) + 1);
-                        while remaining > 0 {
-                            let chunk = remaining.min(u8::MAX as usize);
-                            word_lengths.push(chunk as u8);
-                            remaining -= chunk;
-                        }
-                        builder.set_value(value);
-                        builder.set_character_lengths(character_lengths);
-                        builder.set_character_positions(character_positions);
-                        builder.set_character_widths(character_widths);
-                        builder.set_word_lengths(word_lengths);
-                    });
-                });
             }
+
+            // Build active row inside with_accessibility_parent so self.id is its parent:
+            ui.ctx().with_accessibility_parent(self.id, || {
+                ui.ctx().accesskit_node_builder(row_id, |builder| {
+                    builder.set_role(egui::accesskit::Role::TextRun);
+                    builder.set_text_direction(egui::accesskit::TextDirection::LeftToRight);
+                    let mut row_min = galley_pos + row.rect.min.to_vec2();
+                    let mut row_max = galley_pos + row.rect.max.to_vec2();
+
+                    // Hard-clamp row bounds to visible text area so coordinates never escape beyond the window
+                    row_min.y = row_min.y.clamp(text_clip_rect.min.y, text_clip_rect.max.y);
+                    row_max.y = row_max.y.clamp(row_min.y, text_clip_rect.max.y);
+                    row_min.x = row_min.x.clamp(text_clip_rect.min.x, text_clip_rect.max.x);
+                    row_max.x = row_max.x.clamp(row_min.x, text_clip_rect.max.x);
+                    if row_max.x - row_min.x < 2.0 {
+                        row_max.x = row_min.x + 2.0;
+                    }
+                    builder.set_bounds(egui::accesskit::Rect {
+                        x0: row_min.x.into(),
+                        y0: row_min.y.into(),
+                        x1: row_max.x.into(),
+                        y1: row_max.y.into(),
+                    });
+
+                    let glyph_count = row.glyphs.len();
+                    let mut value = String::with_capacity(glyph_count + 2);
+                    let mut character_lengths = Vec::<u8>::with_capacity(glyph_count + 2);
+                    let mut character_positions = Vec::<f32>::with_capacity(glyph_count + 2);
+                    let mut character_widths = Vec::<f32>::with_capacity(glyph_count + 2);
+
+                    // Index 0: leading anchor at x = 0.0 on this row
+                    value.push(' ');
+                    character_lengths.push(1);
+                    character_positions.push(0.0);
+                    character_widths.push(1.0);
+
+                    for glyph in &row.glyphs {
+                        let old_len = value.len();
+                        value.push(glyph.chr);
+                        character_lengths.push((value.len() - old_len) as u8);
+                        character_positions.push(glyph.pos.x - row.rect.min.x);
+                        character_widths.push(glyph.advance_width.max(1.0));
+                    }
+
+                    // Index N+1: trailing anchor at the right end of this row
+                    let end_x = row.rect.width();
+                    value.push(if row.ends_with_newline { '\n' } else { ' ' });
+                    character_lengths.push(1);
+                    character_positions.push(end_x);
+                    character_widths.push(1.0);
+
+                    let mut remaining = character_lengths.len();
+                    let mut word_lengths = Vec::with_capacity((remaining / 255) + 1);
+                    while remaining > 0 {
+                        let chunk = remaining.min(u8::MAX as usize);
+                        word_lengths.push(chunk as u8);
+                        remaining -= chunk;
+                    }
+                    builder.set_value(value);
+                    builder.set_character_lengths(character_lengths);
+                    builder.set_character_positions(character_positions);
+                    builder.set_character_widths(character_widths);
+                    builder.set_word_lengths(word_lengths);
+                });
+            });
+        }
+
+        if !ui.ctx().will_discard() {
+            state.had_focus_prev_frame = has_focus;
         }
 
         if layout_dirty {

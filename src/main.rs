@@ -1445,7 +1445,7 @@ impl TextEditor {
 
                 if self.tab == Tab::Editor {
                     ui.separator();
-                    ui.label("Folder:");
+                    ui.label("Project folder:");
                     let resp = ui.text_edit_singleline(&mut self.folder_path);
                     let enter_pressed =
                         resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
@@ -2041,6 +2041,7 @@ mod tests {
         fs::create_dir_all(&temp_dir).unwrap();
 
         let ctx = egui::Context::default();
+        ctx.enable_accesskit();
         ctx.options_mut(|o| {
             o.max_passes = std::num::NonZeroUsize::new(4).unwrap();
         });
@@ -2084,7 +2085,7 @@ mod tests {
             repeat: false,
             modifiers: egui::Modifiers::NONE,
         });
-        let _ = ctx.run(type_and_enter, |ctx| {
+        let out_enter = ctx.run(type_and_enter, |ctx| {
             app.update_ui(ctx);
         });
         assert!(!app.find_open, "Pressing Enter in Find dialog should close it");
@@ -2098,6 +2099,26 @@ mod tests {
             ctx.memory(|m| m.has_focus(editor_id)),
             "Editor should have focus after Find"
         );
+        // Run the immediate follow-up repaint frame that synchronizes the AccessKit text selection
+        let out_sync = ctx.run(egui::RawInput::default(), |ctx| {
+            app.update_ui(ctx);
+        });
+        let editor_ak_id: egui::accesskit::NodeId = editor_id.value().into();
+        let ak_enter = out_enter.platform_output.accesskit_update.unwrap();
+        let ak_sync = out_sync.platform_output.accesskit_update.unwrap();
+        assert_eq!(ak_enter.focus, editor_ak_id);
+        assert_eq!(ak_sync.focus, editor_ak_id);
+        let editor_node_sync = ak_sync
+            .nodes
+            .iter()
+            .find(|(id, _)| *id == editor_ak_id)
+            .map(|(_, n)| n)
+            .expect("Editor node should be in AccessKit update");
+        let sel_sync = editor_node_sync
+            .text_selection()
+            .expect("Editor should report AccessKit text selection after Find");
+        // "alpha" ends at column 5, +1 for leading anchor = character_index 6
+        assert_eq!(sel_sync.focus.character_index, 6);
         let get_sel = |ctx: &egui::Context| -> Option<(usize, usize)> {
             let st = ctx.data_mut(|d| d.get_temp::<editor::FastEditorState>(editor_id))?;
             let r = st.cursor.char_range()?;
