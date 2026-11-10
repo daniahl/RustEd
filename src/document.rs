@@ -3,7 +3,10 @@
 //! Handles open and unsaved file buffers, automatic language detection, line ending sequence,
 //! gutter line numbers, and the interactive Find / Find-Next dialog.
 
-use crate::editor::{self, FastEditor};
+use crate::{
+    editor::{self, FastEditor},
+    piece_table::PieceTable,
+};
 use eframe::egui;
 use egui_extras::syntax_highlighting::{self, CodeTheme};
 use std::{
@@ -16,7 +19,7 @@ use std::{
 pub const MAX_HIGHLIGHT_BYTES: usize = 16_384;
 
 pub struct UnsavedFileState {
-    pub text: String,
+    pub text: PieceTable,
     pub saved_text: String,
     pub editor_state: Option<editor::FastEditorState>,
     pub line_count: usize,
@@ -27,7 +30,7 @@ pub struct UnsavedFileState {
 
 pub struct Document {
     pub path: String,
-    pub text: String,
+    pub text: PieceTable,
     pub saved_text: String,
     pub is_current_dirty: bool,
     pub unsaved_files: HashMap<PathBuf, UnsavedFileState>,
@@ -45,6 +48,8 @@ pub struct Document {
     pub cursor_line: usize,
     pub cursor_col: usize,
     pub selected_chars: usize,
+    pub status_file_cache: Option<(usize, usize, String)>,
+    pub status_pos_cache: Option<((usize, usize, usize), String)>,
     pub find_open: bool,
     pub find_query: String,
     pub focus_find_input: bool,
@@ -60,7 +65,7 @@ impl Document {
     pub fn new() -> Self {
         Self {
             path: String::new(),
-            text: String::new(),
+            text: PieceTable::new(),
             saved_text: String::new(),
             is_current_dirty: false,
             unsaved_files: HashMap::new(),
@@ -75,10 +80,20 @@ impl Document {
             cursor_line: 1,
             cursor_col: 1,
             selected_chars: 0,
+            status_file_cache: None,
+            status_pos_cache: None,
             find_open: false,
             find_query: String::new(),
             focus_find_input: false,
         }
+    }
+
+    pub fn set_text(&mut self, text: impl Into<PieceTable>) {
+        self.text = text.into();
+        self.text_revision = self.text_revision.wrapping_add(1);
+        self.gutter_cache = None;
+        self.line_count = self.text.line_count();
+        self.refresh_line_ending();
     }
 
     pub fn can_save(&self) -> bool {
@@ -92,8 +107,8 @@ impl Document {
 
     pub fn save_current_file(&mut self) {
         if !self.path.is_empty() && self.is_current_dirty {
-            if fs::write(&self.path, &self.text).is_ok() {
-                self.saved_text.clone_from(&self.text);
+            if fs::write(&self.path, self.text.as_str()).is_ok() {
+                self.saved_text = self.text.to_string();
                 self.is_current_dirty = false;
                 self.unsaved_files.remove(Path::new(&self.path));
             }
@@ -123,6 +138,7 @@ impl Document {
             let mut prev_state = ctx.data_mut(|d| d.get_temp::<editor::FastEditorState>(editor_id));
             if let Some(ref mut st) = prev_state {
                 st.layout_cache = None;
+                st.accesskit_row_cache = None;
             }
             self.unsaved_files.insert(
                 PathBuf::from(&self.path),
@@ -146,7 +162,7 @@ impl Document {
             IncomingFile::Unsaved(unsaved) => {
                 self.text = unsaved.text;
                 self.saved_text = unsaved.saved_text;
-                self.is_current_dirty = self.text != self.saved_text;
+                self.is_current_dirty = self.text.as_str() != self.saved_text;
                 self.line_count = unsaved.line_count;
                 self.cursor_line = unsaved.cursor_line;
                 self.cursor_col = unsaved.cursor_col;
@@ -162,7 +178,7 @@ impl Document {
             IncomingFile::FromDisk(content) => {
                 self.line_count = content.bytes().filter(|&b| b == b'\n').count() + 1;
                 self.saved_text = content.clone();
-                self.text = content;
+                self.text = PieceTable::from_string(content);
                 self.is_current_dirty = false;
                 self.cursor_line = 1;
                 self.cursor_col = 1;
@@ -276,7 +292,74 @@ impl Document {
         }
         self.language_name = detect_language_name(&self.path);
         self.language_salt = hash_language_salt(&self.language_ext);
+        self.status_file_cache = None;
         self.refresh_line_ending();
+    }
+
+    pub fn status_file_label(&mut self) -> &str {
+        let line_count = self.line_count.max(1);
+        let bytes = self.text.len();
+        let needs_update = match &self.status_file_cache {
+            Some((cached_lines, cached_bytes, _)) => {
+                *cached_lines != line_count || *cached_bytes != bytes
+            }
+            None => true,
+        };
+        if needs_update {
+            use std::fmt::Write;
+            let mut s = self
+                .status_file_cache
+                .take()
+                .map(|(_, _, s)| s)
+                .unwrap_or_else(|| String::with_capacity(64));
+            s.clear();
+            let file_name = &self.file_name;
+            if bytes >= 1024 * 1024 {
+                let _ = write!(
+                    s,
+                    "{file_name} — {line_count} lines ({:.1} MB)",
+                    bytes as f64 / (1024.0 * 1024.0)
+                );
+            } else if bytes >= 1024 {
+                let _ = write!(
+                    s,
+                    "{file_name} — {line_count} lines ({:.1} KB)",
+                    bytes as f64 / 1024.0
+                );
+            } else {
+                let _ = write!(s, "{file_name} — {line_count} lines ({bytes} B)");
+            }
+            self.status_file_cache = Some((line_count, bytes, s));
+        }
+        &self.status_file_cache.as_ref().unwrap().2
+    }
+
+    pub fn status_pos_label(&mut self) -> &str {
+        let key = (self.cursor_line, self.cursor_col, self.selected_chars);
+        let needs_update = match &self.status_pos_cache {
+            Some((cached_key, _)) => *cached_key != key,
+            None => true,
+        };
+        if needs_update {
+            use std::fmt::Write;
+            let mut s = self
+                .status_pos_cache
+                .take()
+                .map(|(_, s)| s)
+                .unwrap_or_else(|| String::with_capacity(48));
+            s.clear();
+            if self.selected_chars > 0 {
+                let _ = write!(
+                    s,
+                    "Ln {}, Col {} ({} selected)",
+                    self.cursor_line, self.cursor_col, self.selected_chars
+                );
+            } else {
+                let _ = write!(s, "Ln {}, Col {}", self.cursor_line, self.cursor_col);
+            }
+            self.status_pos_cache = Some((key, s));
+        }
+        &self.status_pos_cache.as_ref().unwrap().1
     }
 
     pub fn open_find_dialog(&mut self, ctx: &egui::Context) {
@@ -285,15 +368,31 @@ impl Document {
             if let Some(range) = state.cursor.char_range() {
                 if range.primary != range.secondary {
                     let [min_c, max_c] = range.sorted();
-                    let selected: String = self
-                        .text
-                        .chars()
-                        .skip(min_c.index)
-                        .take(max_c.index - min_c.index)
-                        .collect();
-                    if !selected.is_empty() && !selected.contains('\n') && !selected.contains('\r')
-                    {
-                        self.find_query = selected;
+                    let count = max_c.index - min_c.index;
+                    let mut char_iter = self.text.char_indices();
+                    let start_byte = if min_c.index == 0 {
+                        Some(0)
+                    } else {
+                        char_iter.nth(min_c.index).map(|(b, _)| b)
+                    };
+                    if let Some(sb) = start_byte {
+                        let end_byte = if count == 0 {
+                            Some(sb)
+                        } else {
+                            char_iter
+                                .nth(count - 1)
+                                .map(|(b, c)| b + c.len_utf8())
+                                .or(Some(self.text.len()))
+                        };
+                        if let Some(eb) = end_byte {
+                            let selected = &self.text[sb..eb];
+                            if !selected.is_empty()
+                                && !selected.contains('\n')
+                                && !selected.contains('\r')
+                            {
+                                self.find_query = selected.to_string();
+                            }
+                        }
                     }
                 }
             }
@@ -317,23 +416,28 @@ impl Document {
             .map(|r| r.primary.index.max(r.secondary.index))
             .unwrap_or(0);
 
-        let start_byte = self
-            .text
-            .char_indices()
-            .nth(start_char_idx)
-            .map(|(b, _)| b)
-            .unwrap_or(self.text.len());
-
-        let found_byte = self.text[start_byte..]
-            .find(&self.find_query)
-            .map(|rel| start_byte + rel)
-            .or_else(|| self.text.find(&self.find_query));
-
-        let Some(match_byte) = found_byte else {
-            return false;
+        let start_byte = if start_char_idx == 0 {
+            0
+        } else {
+            self.text
+                .char_indices()
+                .nth(start_char_idx)
+                .map(|(b, _)| b)
+                .unwrap_or(self.text.len())
         };
 
-        let match_start_char = self.text[..match_byte].chars().count();
+        let (_match_byte, match_start_char) =
+            if let Some(rel) = self.text[start_byte..].find(&self.find_query) {
+                let mb = start_byte + rel;
+                let mc = start_char_idx + self.text[start_byte..mb].chars().count();
+                (mb, mc)
+            } else if let Some(mb) = self.text.find(&self.find_query) {
+                let mc = self.text[..mb].chars().count();
+                (mb, mc)
+            } else {
+                return false;
+            };
+
         let match_end_char = match_start_char + self.find_query.chars().count();
 
         state.cursor.set_char_range(Some(egui::text::CCursorRange::two(
@@ -645,7 +749,8 @@ impl Document {
             self.text_revision = self.text_revision.wrapping_add(1);
             self.refresh_line_ending();
             let was_dirty = self.is_current_dirty;
-            self.is_current_dirty = !self.path.is_empty() && self.text != self.saved_text;
+            self.is_current_dirty = !self.path.is_empty()
+                && (self.text.len() != self.saved_text.len() || self.text.as_str() != self.saved_text);
             if was_dirty != self.is_current_dirty {
                 ctx.request_repaint();
             }

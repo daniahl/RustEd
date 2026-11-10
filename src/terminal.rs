@@ -3,6 +3,7 @@
 //! Manages pseudo-terminal (PTY) child process execution, streaming I/O, VT100 escape sequence parsing,
 //! screen buffer rendering, and terminal keyboard input forwarding.
 
+use crate::editor::{FastEditor, FastEditorState};
 use eframe::egui;
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use std::{
@@ -22,6 +23,7 @@ pub struct TerminalState {
 pub struct TerminalPane {
     pub term: Arc<Mutex<TerminalState>>,
     pub term_screen_text: String,
+    pub term_revision: u64,
     pub term_cursor_idx: usize,
     pub pty_writer: Option<Box<dyn Write + Send>>,
     pub _pty_master: Option<Box<dyn portable_pty::MasterPty + Send>>,
@@ -70,9 +72,11 @@ impl TerminalPane {
                         }
                         let mut lock = term_clone.lock().unwrap();
                         lock.parser.process(&buf[..n]);
-                        lock.pty_updated = true;
+                        let was_updated = std::mem::replace(&mut lock.pty_updated, true);
                         drop(lock);
-                        ctx.request_repaint();
+                        if !was_updated {
+                            ctx.request_repaint();
+                        }
                     }
                 });
             }
@@ -86,6 +90,7 @@ impl TerminalPane {
         Self {
             term,
             term_screen_text: String::new(),
+            term_revision: 0,
             term_cursor_idx: 0,
             pty_writer,
             _pty_master: pty_master,
@@ -102,6 +107,7 @@ impl TerminalPane {
                 pty_updated: false,
             })),
             term_screen_text: String::new(),
+            term_revision: 0,
             term_cursor_idx: 0,
             pty_writer: None,
             _pty_master: None,
@@ -109,6 +115,10 @@ impl TerminalPane {
             focus_terminal: false,
             selecting_in_terminal: false,
         }
+    }
+
+    pub const fn size_label(&self) -> &'static str {
+        "120x30"
     }
 
     pub fn write_to_pty(&mut self, bytes: &[u8]) {
@@ -140,6 +150,7 @@ impl TerminalPane {
                         exit_selection_mode = true;
                         false
                     }
+                    egui::Event::Cut => false,
                     egui::Event::Copy => {
                         if self.selecting_in_terminal {
                             true
@@ -220,14 +231,15 @@ impl TerminalPane {
 
         self.handle_terminal_input(ctx, term_focused);
 
+        let prev_selecting = self.selecting_in_terminal;
         let pty_updated = {
             let mut lock = self.term.lock().unwrap();
             let updated = lock.pty_updated || self.term_screen_text.is_empty();
             if updated {
                 lock.pty_updated = false;
-                let (text, idx) = render_vt100_screen(lock.parser.screen());
-                self.term_screen_text = text;
-                self.term_cursor_idx = idx;
+                self.term_cursor_idx =
+                    render_vt100_screen_into(lock.parser.screen(), &mut self.term_screen_text);
+                self.term_revision = self.term_revision.wrapping_add(1);
             }
             updated
         };
@@ -236,39 +248,50 @@ impl TerminalPane {
             self.selecting_in_terminal = false;
         }
 
-        if !self.selecting_in_terminal {
-            let mut state = egui::text_edit::TextEditState::load(ctx, term_id).unwrap_or_default();
-            let ccursor = egui::text::CCursor::new(self.term_cursor_idx);
-            state
-                .cursor
-                .set_char_range(Some(egui::text::CCursorRange::one(ccursor)));
-            state.store(ctx, term_id);
+        if !self.selecting_in_terminal && (pty_updated || prev_selecting) {
+            ctx.data_mut(|d| {
+                let mut state = d.get_temp::<FastEditorState>(term_id).unwrap_or_default();
+                let target_range =
+                    egui::text::CCursorRange::one(egui::text::CCursor::new(self.term_cursor_idx));
+                if state.cursor.char_range() != Some(target_range) {
+                    state.cursor.set_char_range(Some(target_range));
+                    state.scroll_to_cursor = true;
+                }
+                d.insert_temp(term_id, state);
+            });
         }
 
         let screen_text = &mut self.term_screen_text;
+        let term_revision = self.term_revision;
         let focus_terminal = &mut self.focus_terminal;
 
         egui::CentralPanel::default().frame(panel_frame).show(ctx, |ui| {
+            let font_id = egui::TextStyle::Monospace.resolve(ui.style());
+            let text_color = ui.visuals().widgets.inactive.text_color();
+            let mut layouter = |ui: &egui::Ui, text: &str, _wrap_width: f32| {
+                let job = egui::text::LayoutJob::simple(
+                    text.to_owned(),
+                    font_id.clone(),
+                    text_color,
+                    f32::INFINITY,
+                );
+                ui.fonts(|f| f.layout_job(job))
+            };
+
             let available_size = ui.available_size();
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .animated(false)
                 .show(ui, |ui| {
-                    let output = egui::TextEdit::multiline(screen_text)
-                        .id(term_id)
-                        .code_editor()
-                        .frame(false)
-                        .desired_width(f32::INFINITY)
-                        .min_size(available_size)
-                        .lock_focus(true)
-                        .show(ui);
+                    let output =
+                        FastEditor::new(term_id, screen_text, available_size, &mut layouter)
+                            .text_revision(term_revision)
+                            .show(ui);
 
                     if *focus_terminal {
                         output.response.request_focus();
                         *focus_terminal = false;
                     }
-
-                    fix_accesskit_caret(ctx, &output);
                 });
         });
     }
@@ -276,9 +299,17 @@ impl TerminalPane {
 
 pub fn render_vt100_screen(screen: &vt100::Screen) -> (String, usize) {
     let (rows, cols) = screen.size();
+    let mut full_text = String::with_capacity((rows as usize) * (cols as usize + 1));
+    let cursor_char_idx = render_vt100_screen_into(screen, &mut full_text);
+    (full_text, cursor_char_idx)
+}
+
+pub fn render_vt100_screen_into(screen: &vt100::Screen, full_text: &mut String) -> usize {
+    let (rows, cols) = screen.size();
     let (cur_row, cur_col) = screen.cursor_position();
 
-    let mut full_text = String::with_capacity((rows as usize) * (cols as usize + 1));
+    full_text.clear();
+    full_text.reserve((rows as usize) * (cols as usize + 1));
     let mut cursor_char_idx = 0;
     let mut total_chars = 0;
 
@@ -306,117 +337,5 @@ pub fn render_vt100_screen(screen: &vt100::Screen) -> (String, usize) {
         }
     }
 
-    (full_text, cursor_char_idx)
-}
-
-pub fn fix_accesskit_caret(ctx: &egui::Context, output: &egui::text_edit::TextEditOutput) {
-    let Some(cursor_range) = output.cursor_range else {
-        return;
-    };
-
-    let cursor_rect = output
-        .galley
-        .pos_from_cursor(&cursor_range.primary)
-        .translate(output.galley_pos.to_vec2());
-
-    // If an edit/paste or large jump puts the cursor outside the visible scroll clip rect,
-    // request an immediate second pass in the same frame so ScrollArea scrolls to it INSTANTLY,
-    // and clear the selection on this pass so Windows Magnifier NEVER sees off-screen coordinates.
-    if !output.text_clip_rect.contains(cursor_rect.center()) {
-        ctx.request_discard("scroll to cursor after paste/edit");
-        ctx.accesskit_node_builder(output.response.id, |builder| {
-            builder.clear_text_selection();
-        });
-        return;
-    }
-
-    let focus = cursor_range.primary.rcursor;
-    let Some(row) = output.galley.rows.get(focus.row) else {
-        return;
-    };
-
-    let widget_id = output.response.id;
-    let row_id = widget_id.with(focus.row);
-
-    // Pad the active row's AccessKit TextRun with a 1px leading anchor at x=0 (index 0)
-    // and a 1px trailing anchor at the end of the row (index N+1), then report the caret at
-    // `focus.column + 1`.
-    // This prevents `accesskit_consumer` from treating column 0 (`focus.column == 0`) as
-    // `is_run_start()` (which otherwise jumps backward to the previous row's far-right `\n`
-    // when arrowing right across a line break) or treating an empty last line as `is_document_end()`.
-    ctx.accesskit_node_builder(row_id, |builder| {
-        let mut row_min = output.galley_pos + row.rect.min.to_vec2();
-        let mut row_max = output.galley_pos + row.rect.max.to_vec2();
-
-        // Hard-clamp row bounds to the visible text area so coordinates can NEVER escape beyond the window
-        row_min.y = row_min.y.clamp(output.text_clip_rect.min.y, output.text_clip_rect.max.y);
-        row_max.y = row_max.y.clamp(row_min.y, output.text_clip_rect.max.y);
-        row_min.x = row_min.x.clamp(output.text_clip_rect.min.x, output.text_clip_rect.max.x);
-        row_max.x = row_max.x.clamp(row_min.x, output.text_clip_rect.max.x);
-
-        if row_max.x - row_min.x < 2.0 {
-            row_max.x = row_min.x + 2.0;
-        }
-        let rect = egui::Rect::from_min_max(row_min, row_max);
-        builder.set_bounds(egui::accesskit::Rect {
-            x0: rect.min.x.into(),
-            y0: rect.min.y.into(),
-            x1: rect.max.x.into(),
-            y1: rect.max.y.into(),
-        });
-
-        let glyph_count = row.glyphs.len();
-        let mut value = String::with_capacity(glyph_count + 2);
-        let mut character_lengths = Vec::<u8>::with_capacity(glyph_count + 2);
-        let mut character_positions = Vec::<f32>::with_capacity(glyph_count + 2);
-        let mut character_widths = Vec::<f32>::with_capacity(glyph_count + 2);
-
-        // Index 0: leading anchor at x = 0.0 on this row
-        value.push(' ');
-        character_lengths.push(1);
-        character_positions.push(0.0);
-        character_widths.push(1.0);
-
-        for glyph in &row.glyphs {
-            let old_len = value.len();
-            value.push(glyph.chr);
-            character_lengths.push((value.len() - old_len) as u8);
-            character_positions.push(glyph.pos.x - row.rect.min.x);
-            character_widths.push(glyph.advance_width.max(1.0));
-        }
-
-        // Index N+1: trailing anchor at the right end of this row
-        let end_x = row.rect.width();
-        value.push(if row.ends_with_newline { '\n' } else { ' ' });
-        character_lengths.push(1);
-        character_positions.push(end_x);
-        character_widths.push(1.0);
-
-        let mut remaining = character_lengths.len();
-        let mut word_lengths = Vec::with_capacity((remaining / 255) + 1);
-        while remaining > 0 {
-            let chunk = remaining.min(u8::MAX as usize);
-            word_lengths.push(chunk as u8);
-            remaining -= chunk;
-        }
-        builder.set_value(value);
-        builder.set_character_lengths(character_lengths);
-        builder.set_character_positions(character_positions);
-        builder.set_character_widths(character_widths);
-        builder.set_word_lengths(word_lengths);
-    });
-
-    ctx.accesskit_node_builder(widget_id, |builder| {
-        if let Some(sel) = builder.text_selection() {
-            let target_idx = (focus.column + 1).min(row.glyphs.len() + 1);
-            let pos = egui::accesskit::TextPosition {
-                node: sel.focus.node,
-                character_index: target_idx,
-            };
-            builder.set_text_selection(egui::accesskit::TextSelection {
-                anchor: pos,
-                focus: pos,
-            });
-        }
-    });
+    cursor_char_idx
 }

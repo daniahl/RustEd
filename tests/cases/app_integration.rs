@@ -24,7 +24,7 @@ fn test_find_dialog_ctrl_f_and_f3_find_next() {
         o.max_passes = std::num::NonZeroUsize::new(4).unwrap();
     });
     let mut app = TextEditor::new_headless(&temp_dir);
-    app.text = "alpha beta alpha gamma alpha".to_string();
+    app.text = "alpha beta alpha gamma alpha".into();
     app.text_revision = 1;
 
     // Render initial frame
@@ -272,7 +272,7 @@ fn test_tree_new_folder_new_file_rename_and_f2() {
     assert_eq!(app.explorer.selected_node, Some((new_file.clone(), false)));
 
     // 3. Edit the open file (so it has unsaved state) and press F2 to rename it
-    app.text = "fn main() {}".to_string();
+    app.text = "fn main() {}".into();
     app.is_current_dirty = true;
 
     let mut f2_input = egui::RawInput::default();

@@ -6,7 +6,7 @@
 use crate::{
     document::Document,
     explorer::{FileExplorer, PendingTreeEdit, TreeAction},
-    terminal::{TerminalPane, TERM_COLS, TERM_ROWS},
+    terminal::TerminalPane,
 };
 use eframe::egui;
 use std::{
@@ -168,18 +168,7 @@ impl TextEditor {
                 ui.horizontal_centered(|ui| {
                     match self.tab {
                         Tab::Editor => {
-                            let file_name = &self.doc.file_name;
-                            let line_count = self.doc.line_count.max(1);
-                            let bytes = self.doc.text.len();
-                            let size_str = if bytes >= 1024 * 1024 {
-                                format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
-                            } else if bytes >= 1024 {
-                                format!("{:.1} KB", bytes as f64 / 1024.0)
-                            } else {
-                                format!("{bytes} B")
-                            };
-
-                            ui.label(format!("{file_name} — {line_count} lines ({size_str})"));
+                            ui.label(self.doc.status_file_label());
 
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
@@ -187,26 +176,19 @@ impl TextEditor {
                                     ui.label(self.doc.language_name)
                                         .on_hover_text("Language Mode");
 
-                                     ui.separator();
-                                     ui.label(self.doc.line_ending)
-                                         .on_hover_text("End of Line Sequence");
+                                    ui.separator();
+                                    ui.label(self.doc.line_ending)
+                                        .on_hover_text("End of Line Sequence");
 
-                                     ui.separator();
-                                     ui.label("UTF-8").on_hover_text("Encoding");
+                                    ui.separator();
+                                    ui.label("UTF-8").on_hover_text("Encoding");
 
-                                     ui.separator();
-                                     ui.label("Spaces: 4").on_hover_text("Indentation");
+                                    ui.separator();
+                                    ui.label("Spaces: 4").on_hover_text("Indentation");
 
-                                     ui.separator();
-                                     let pos_text = if self.doc.selected_chars > 0 {
-                                         format!(
-                                             "Ln {}, Col {} ({} selected)",
-                                             self.doc.cursor_line, self.doc.cursor_col, self.doc.selected_chars
-                                         )
-                                     } else {
-                                         format!("Ln {}, Col {}", self.doc.cursor_line, self.doc.cursor_col)
-                                     };
-                                     ui.label(pos_text).on_hover_text("Cursor Position");
+                                    ui.separator();
+                                    ui.label(self.doc.status_pos_label())
+                                        .on_hover_text("Cursor Position");
                                 },
                             );
                         }
@@ -215,7 +197,7 @@ impl TextEditor {
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
-                                    ui.label(format!("{TERM_COLS}x{TERM_ROWS}"))
+                                    ui.label(self.terminal.size_label())
                                         .on_hover_text("Terminal Size");
                                     ui.separator();
                                     ui.label("UTF-8").on_hover_text("Encoding");

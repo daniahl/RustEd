@@ -158,11 +158,22 @@ impl FileNode {
             return Some(self);
         }
         for child in &mut self.children {
+            if child.is_dir && !target.starts_with(&child.path) {
+                continue;
+            }
             if let Some(found) = child.find_mut(target) {
                 return Some(found);
             }
         }
         None
+    }
+
+    pub fn visible_count(&self) -> usize {
+        if !self.is_dir || !self.expanded {
+            1
+        } else {
+            1 + self.children.iter().map(|c| c.visible_count()).sum::<usize>()
+        }
     }
 
     pub fn load_children(&mut self) {
@@ -206,11 +217,17 @@ impl FileNode {
             // Folders first, then files sorted case-insensitively without per-comparison heap allocations
             self.children.sort_by(|a, b| {
                 b.is_dir.cmp(&a.is_dir).then_with(|| {
-                    a.name
-                        .bytes()
-                        .map(|c| c.to_ascii_lowercase())
-                        .cmp(b.name.bytes().map(|c| c.to_ascii_lowercase()))
-                        .then_with(|| a.name.cmp(&b.name))
+                    let a_bytes = a.name.as_bytes();
+                    let b_bytes = b.name.as_bytes();
+                    let min_len = a_bytes.len().min(b_bytes.len());
+                    for i in 0..min_len {
+                        let ca = a_bytes[i].to_ascii_lowercase();
+                        let cb = b_bytes[i].to_ascii_lowercase();
+                        if ca != cb {
+                            return ca.cmp(&cb);
+                        }
+                    }
+                    a_bytes.len().cmp(&b_bytes.len()).then_with(|| a.name.cmp(&b.name))
                 })
             });
         }
@@ -274,6 +291,31 @@ pub fn render_file_node(
         Some(e) if matches!(&e.kind, TreeEditKind::Rename { target_path, .. } if target_path == &node.path)
     );
 
+    let has_pending_edit = match pending_edit {
+        Some(e) => match &e.kind {
+            TreeEditKind::NewFolder { parent_path } | TreeEditKind::NewFile { parent_path } => {
+                parent_path.starts_with(&node.path)
+            }
+            TreeEditKind::Rename { target_path, .. } => target_path.starts_with(&node.path),
+        },
+        None => false,
+    };
+
+    let clip_rect = ui.clip_rect();
+    let row_height = ui.spacing().interact_size.y.max(18.0) + ui.spacing().item_spacing.y;
+    let cursor_y = ui.cursor().min.y;
+
+    // Fast-path: if this node (and its entire subtree) is completely below the visible viewport,
+    // advance cursor by the total height of its visible rows and return immediately.
+    if !has_pending_edit && cursor_y > clip_rect.max.y {
+        let count = node.visible_count();
+        ui.add_space(count as f32 * row_height);
+        return;
+    }
+
+    let row_above_clip =
+        !has_pending_edit && !is_renaming_self && (cursor_y + row_height < clip_rect.min.y);
+
     if node.is_dir {
         if is_renaming_self {
             ui.horizontal(|ui| {
@@ -283,6 +325,8 @@ pub fn render_file_node(
                     render_inline_tree_edit(ui, edit, edit_outcome);
                 }
             });
+        } else if row_above_clip {
+            ui.add_space(row_height);
         } else {
             let is_selected = selected_node
                 .as_ref()
@@ -378,6 +422,8 @@ pub fn render_file_node(
                 render_inline_tree_edit(ui, edit, edit_outcome);
             }
         });
+    } else if row_above_clip {
+        ui.add_space(row_height);
     } else {
         let is_selected = match selected_node.as_ref() {
             Some((sel_path, _)) => sel_path == &node.path,

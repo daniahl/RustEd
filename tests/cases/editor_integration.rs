@@ -322,13 +322,23 @@ fn test_coalesced_relayout_and_long_line_accesskit() {
         })
     };
 
-    // Frame 1: Initial layout + focus
-    let _ = run_frame(&ctx, &mut text, &mut rev, vec![]);
+    // Frame 1: Initial layout + focus -> emits Window, MultilineTextInput, and active TextRun
+    let out1 = run_frame(&ctx, &mut text, &mut rev, vec![]);
     assert_eq!(layout_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    let u1 = out1.platform_output.accesskit_update.unwrap();
+    assert!(
+        u1.nodes.iter().any(|(_, n)| n.role() == egui::accesskit::Role::TextRun),
+        "Initial frame should emit the active TextRun node"
+    );
 
-    // Frame 2: Idle frame with same revision -> 0 new layout calls
-    let _ = run_frame(&ctx, &mut text, &mut rev, vec![]);
+    // Frame 2: Idle frame with same revision and no movement -> 0 new layout calls and 0 TextRun rebuilds
+    let out2 = run_frame(&ctx, &mut text, &mut rev, vec![]);
     assert_eq!(layout_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    let u2 = out2.platform_output.accesskit_update.unwrap();
+    assert!(
+        !u2.nodes.iter().any(|(_, n)| n.role() == egui::accesskit::Role::TextRun),
+        "Idle frame should not rebuild or re-allocate the AccessKit TextRun node"
+    );
 
     // Frame 3: Multiple text events in a single frame -> coalesced into 1 layout call
     let long_chunk = "a".repeat(150);

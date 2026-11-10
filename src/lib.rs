@@ -11,6 +11,8 @@ pub mod app;
 pub mod document;
 pub mod editor;
 pub mod explorer;
+pub mod piece_table;
 pub mod terminal;
 
 pub use app::TextEditor;
+pub use piece_table::PieceTable;

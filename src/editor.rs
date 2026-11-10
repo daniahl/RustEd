@@ -10,7 +10,7 @@ use eframe::egui::{
         visuals::paint_text_cursor,
         CCursorRange, CursorRange, TextCursorState,
     },
-    Color32, Event, Id, Key, Pos2, Rect, Response, Sense, TextBuffer, Ui, Vec2,
+    Color32, Event, Id, Key, Pos2, Rect, Response, Sense, Ui, Vec2,
 };
 use std::sync::{Arc, Mutex};
 
@@ -25,12 +25,23 @@ pub struct FastEditorState {
     pub scroll_to_cursor: bool,
     /// Last layout result, reused on frames where text, width and theme are unchanged.
     pub layout_cache: Option<Arc<LayoutCache>>,
+    /// Last active-row AccessKit `TextRun` state, reused on frames where galley, active row,
+    /// and clamped row bounds are unchanged so idle frames do not re-allocate or re-emit the row node.
+    pub accesskit_row_cache: Option<AccessKitRowCache>,
     /// Tracks whether the editor had focus on the previous frame so we can force a
     /// `UIA_Text_TextSelectionChangedEventId` transition on the frame after focus is gained.
     pub had_focus_prev_frame: bool,
     /// Set when the editor just gained focus; causes one repaint where the selection is updated
     /// while `old.is_text_pattern_supported()` is already true.
     pub pending_accesskit_selection_sync: bool,
+}
+
+/// Cached identity of the active AccessKit `TextRun` row node.
+#[derive(Clone)]
+pub struct AccessKitRowCache {
+    pub galley: Arc<Galley>,
+    pub row: usize,
+    pub bounds: egui::accesskit::Rect,
 }
 
 /// Cached galley for a given text + layout parameters.
@@ -51,19 +62,19 @@ pub struct EditorOutput {
     pub text_changed: bool,
 }
 
-pub struct FastEditor<'a> {
+pub struct FastEditor<'a, T: egui::TextBuffer = String> {
     id: Id,
-    text: &'a mut String,
+    text: &'a mut T,
     min_size: Vec2,
     layouter: &'a mut dyn FnMut(&Ui, &str, f32) -> Arc<Galley>,
     cache_salt: u64,
     text_revision: Option<u64>,
 }
 
-impl<'a> FastEditor<'a> {
+impl<'a, T: egui::TextBuffer> FastEditor<'a, T> {
     pub fn new(
         id: Id,
-        text: &'a mut String,
+        text: &'a mut T,
         min_size: Vec2,
         layouter: &'a mut dyn FnMut(&Ui, &str, f32) -> Arc<Galley>,
     ) -> Self {
@@ -116,7 +127,7 @@ impl<'a> FastEditor<'a> {
             Some(c)
                 if c.key == cache_key
                     && match (self.text_revision, c.text_revision) {
-                        (Some(r1), Some(r2)) => r1 == r2 && c.text.len() == self.text.len(),
+                        (Some(r1), Some(r2)) => r1 == r2 && c.text.len() == self.text.as_str().len(),
                         _ => c.text.as_str() == self.text.as_str(),
                     } =>
             {
@@ -189,17 +200,27 @@ impl<'a> FastEditor<'a> {
                 if undoer.is_in_flux() {
                     let text_arc = match &state.layout_cache {
                         Some(c) if !layout_dirty => Arc::clone(&c.text),
-                        _ => Arc::new(self.text.clone()),
+                        _ => Arc::new(self.text.as_str().to_owned()),
                     };
                     undoer.feed_state(now, &(cursor_range.as_ccursor_range(), text_arc));
                 }
             }
 
             let events = ui.input(|i| {
-                if i.events.is_empty() {
-                    Vec::new()
-                } else {
+                let has_relevant = i.events.iter().any(|e| {
+                    matches!(
+                        e,
+                        Event::Key { .. }
+                            | Event::Text(_)
+                            | Event::Paste(_)
+                            | Event::Copy
+                            | Event::Cut
+                    )
+                });
+                if has_relevant {
                     i.events.clone()
+                } else {
+                    Vec::new()
                 }
             });
             let mut pending_relayout = false;
@@ -278,12 +299,12 @@ impl<'a> FastEditor<'a> {
                     }
                     Event::Copy => {
                         if !cursor_range.is_empty() {
-                            ui.ctx().copy_text(cursor_range.slice_str(self.text).to_owned());
+                            ui.ctx().copy_text(cursor_range.slice_str(self.text.as_str()).to_owned());
                         }
                     }
                     Event::Cut => {
                         if !cursor_range.is_empty() {
-                            ui.ctx().copy_text(cursor_range.slice_str(self.text).to_owned());
+                            ui.ctx().copy_text(cursor_range.slice_str(self.text.as_str()).to_owned());
                             let ccursor = self.text.delete_selected(&cursor_range);
                             mutated = Some(CCursorRange::one(ccursor));
                         }
@@ -364,14 +385,17 @@ impl<'a> FastEditor<'a> {
                         modifiers,
                         ..
                     } if modifiers.command => {
-                        let current_arc = Arc::new(self.text.clone());
+                        let current_arc = match &state.layout_cache {
+                            Some(c) if !layout_dirty => Arc::clone(&c.text),
+                            _ => Arc::new(self.text.as_str().to_owned()),
+                        };
                         if let Some((undo_range, undo_txt)) = state
                             .undoer
                             .lock()
                             .unwrap()
                             .undo(&(cursor_range.as_ccursor_range(), current_arc))
                         {
-                            *self.text = (**undo_txt).clone();
+                            self.text.replace_with(undo_txt.as_str());
                             mutated = Some(*undo_range);
                         }
                     }
@@ -381,14 +405,17 @@ impl<'a> FastEditor<'a> {
                         modifiers,
                         ..
                     } if modifiers.command => {
-                        let current_arc = Arc::new(self.text.clone());
+                        let current_arc = match &state.layout_cache {
+                            Some(c) if !layout_dirty => Arc::clone(&c.text),
+                            _ => Arc::new(self.text.as_str().to_owned()),
+                        };
                         if let Some((redo_range, redo_txt)) = state
                             .undoer
                             .lock()
                             .unwrap()
                             .redo(&(cursor_range.as_ccursor_range(), current_arc))
                         {
-                            *self.text = (**redo_txt).clone();
+                            self.text.replace_with(redo_txt.as_str());
                             mutated = Some(*redo_range);
                         }
                     }
@@ -419,7 +446,7 @@ impl<'a> FastEditor<'a> {
 
         // Allocate the updated text buffer once (shared between LayoutCache and Undoer).
         let updated_text_arc = if layout_dirty || text_changed {
-            Some(Arc::new(self.text.clone()))
+            Some(Arc::new(self.text.as_str().to_owned()))
         } else {
             None
         };
@@ -446,7 +473,7 @@ impl<'a> FastEditor<'a> {
             state.scroll_to_cursor = true;
         }
 
-        if state.scroll_to_cursor || (has_focus && !cursor_range.is_empty()) {
+        if state.scroll_to_cursor {
             ui.scroll_to_rect(cursor_box, None);
         }
 
@@ -500,9 +527,7 @@ impl<'a> FastEditor<'a> {
 
         if has_focus {
             let now = ui.input(|i| i.time);
-            let mut primary_cursor_rect = galley
-                .pos_from_cursor(&cursor_range.primary)
-                .translate(galley_pos.to_vec2());
+            let mut primary_cursor_rect = cursor_box;
             // An empty galley has a zero-height row, which would render only a sliver of the caret.
             let line_height = ui.text_style_height(&egui::TextStyle::Monospace);
             if primary_cursor_rect.height() < line_height {
@@ -537,14 +562,14 @@ impl<'a> FastEditor<'a> {
             });
         });
 
-        // 2. Always build the active row node inside `with_accessibility_parent(self.id, ...)`
-        // so `self.id` always has a `TextRun` child (`old.is_text_pattern_supported() == true`),
-        // ensuring `accesskit_windows` fires `UIA_Text_TextSelectionChangedEventId` immediately
+        // 2. Keep the active row node attached to `self.id` so `self.id` always has a
+        // `TextRun` child (`old.is_text_pattern_supported() == true`), ensuring
+        // `accesskit_windows` fires `UIA_Text_TextSelectionChangedEventId` immediately
         // even on the exact frame the editor regains focus (e.g. when closing the Find dialog).
+        // Only rebuild and allocate the `TextRun` node's glyph buffers when the galley,
+        // active row index, or clamped row bounds actually change.
         let focus = cursor_range.primary.rcursor;
-        let cursor_rect = galley
-            .pos_from_cursor(&cursor_range.primary)
-            .translate(galley_pos.to_vec2());
+        let cursor_rect = cursor_box;
 
         if text_clip_rect.contains(cursor_rect.center()) {
             state.scroll_to_cursor = false;
@@ -561,6 +586,7 @@ impl<'a> FastEditor<'a> {
                 // If the pass limit is hit, keep scrolling on the next frame.
                 ui.ctx().request_repaint();
             }
+            state.accesskit_row_cache = None;
             ui.ctx().accesskit_node_builder(self.id, |builder| {
                 builder.clear_text_selection();
             });
@@ -611,70 +637,98 @@ impl<'a> FastEditor<'a> {
                 });
             }
 
-            // Build active row inside with_accessibility_parent so self.id is its parent:
-            ui.ctx().with_accessibility_parent(self.id, || {
-                ui.ctx().accesskit_node_builder(row_id, |builder| {
-                    builder.set_role(egui::accesskit::Role::TextRun);
-                    builder.set_text_direction(egui::accesskit::TextDirection::LeftToRight);
-                    let mut row_min = galley_pos + row.rect.min.to_vec2();
-                    let mut row_max = galley_pos + row.rect.max.to_vec2();
+            let mut row_min = galley_pos + row.rect.min.to_vec2();
+            let mut row_max = galley_pos + row.rect.max.to_vec2();
 
-                    // Hard-clamp row bounds to visible text area so coordinates never escape beyond the window
-                    row_min.y = row_min.y.clamp(text_clip_rect.min.y, text_clip_rect.max.y);
-                    row_max.y = row_max.y.clamp(row_min.y, text_clip_rect.max.y);
-                    row_min.x = row_min.x.clamp(text_clip_rect.min.x, text_clip_rect.max.x);
-                    row_max.x = row_max.x.clamp(row_min.x, text_clip_rect.max.x);
-                    if row_max.x - row_min.x < 2.0 {
-                        row_max.x = row_min.x + 2.0;
-                    }
-                    builder.set_bounds(egui::accesskit::Rect {
-                        x0: row_min.x.into(),
-                        y0: row_min.y.into(),
-                        x1: row_max.x.into(),
-                        y1: row_max.y.into(),
-                    });
+            // Hard-clamp row bounds to visible text area so coordinates never escape beyond the window
+            row_min.y = row_min.y.clamp(text_clip_rect.min.y, text_clip_rect.max.y);
+            row_max.y = row_max.y.clamp(row_min.y, text_clip_rect.max.y);
+            row_min.x = row_min.x.clamp(text_clip_rect.min.x, text_clip_rect.max.x);
+            row_max.x = row_max.x.clamp(row_min.x, text_clip_rect.max.x);
+            if row_max.x - row_min.x < 2.0 {
+                row_max.x = row_min.x + 2.0;
+            }
+            let row_bounds = egui::accesskit::Rect {
+                x0: row_min.x.into(),
+                y0: row_min.y.into(),
+                x1: row_max.x.into(),
+                y1: row_max.y.into(),
+            };
 
-                    let glyph_count = row.glyphs.len();
-                    let mut value = String::with_capacity(glyph_count + 2);
-                    let mut character_lengths = Vec::<u8>::with_capacity(glyph_count + 2);
-                    let mut character_positions = Vec::<f32>::with_capacity(glyph_count + 2);
-                    let mut character_widths = Vec::<f32>::with_capacity(glyph_count + 2);
+            let row_unchanged = match &state.accesskit_row_cache {
+                Some(c) => {
+                    Arc::ptr_eq(&c.galley, &galley)
+                        && c.row == focus.row
+                        && c.bounds == row_bounds
+                }
+                None => false,
+            };
 
-                    // Index 0: leading anchor at x = 0.0 on this row
-                    value.push(' ');
-                    character_lengths.push(1);
-                    character_positions.push(0.0);
-                    character_widths.push(1.0);
-
-                    for glyph in &row.glyphs {
-                        let old_len = value.len();
-                        value.push(glyph.chr);
-                        character_lengths.push((value.len() - old_len) as u8);
-                        character_positions.push(glyph.pos.x - row.rect.min.x);
-                        character_widths.push(glyph.advance_width.max(1.0));
-                    }
-
-                    // Index N+1: trailing anchor at the right end of this row
-                    let end_x = row.rect.width();
-                    value.push(if row.ends_with_newline { '\n' } else { ' ' });
-                    character_lengths.push(1);
-                    character_positions.push(end_x);
-                    character_widths.push(1.0);
-
-                    let mut remaining = character_lengths.len();
-                    let mut word_lengths = Vec::with_capacity((remaining / 255) + 1);
-                    while remaining > 0 {
-                        let chunk = remaining.min(u8::MAX as usize);
-                        word_lengths.push(chunk as u8);
-                        remaining -= chunk;
-                    }
-                    builder.set_value(value);
-                    builder.set_character_lengths(character_lengths);
-                    builder.set_character_positions(character_positions);
-                    builder.set_character_widths(character_widths);
-                    builder.set_word_lengths(word_lengths);
+            if row_unchanged {
+                // Keep `row_id` linked as a child of `self.id` without rebuilding or
+                // re-allocating the `TextRun` node's glyph buffers.
+                ui.ctx().accesskit_node_builder(self.id, |builder| {
+                    builder.push_child(row_accesskit_id);
                 });
-            });
+            } else if !ui.ctx().will_discard() {
+                let mut built_row = false;
+                // Build active row inside with_accessibility_parent so self.id is its parent:
+                ui.ctx().with_accessibility_parent(self.id, || {
+                    ui.ctx().accesskit_node_builder(row_id, |builder| {
+                        built_row = true;
+                        builder.set_role(egui::accesskit::Role::TextRun);
+                        builder.set_text_direction(egui::accesskit::TextDirection::LeftToRight);
+                        builder.set_bounds(row_bounds);
+
+                        let glyph_count = row.glyphs.len();
+                        let mut value = String::with_capacity(glyph_count + 2);
+                        let mut character_lengths = Vec::<u8>::with_capacity(glyph_count + 2);
+                        let mut character_positions = Vec::<f32>::with_capacity(glyph_count + 2);
+                        let mut character_widths = Vec::<f32>::with_capacity(glyph_count + 2);
+
+                        // Index 0: leading anchor at x = 0.0 on this row
+                        value.push(' ');
+                        character_lengths.push(1);
+                        character_positions.push(0.0);
+                        character_widths.push(1.0);
+
+                        for glyph in &row.glyphs {
+                            let old_len = value.len();
+                            value.push(glyph.chr);
+                            character_lengths.push((value.len() - old_len) as u8);
+                            character_positions.push(glyph.pos.x - row.rect.min.x);
+                            character_widths.push(glyph.advance_width.max(1.0));
+                        }
+
+                        // Index N+1: trailing anchor at the right end of this row
+                        let end_x = row.rect.width();
+                        value.push(if row.ends_with_newline { '\n' } else { ' ' });
+                        character_lengths.push(1);
+                        character_positions.push(end_x);
+                        character_widths.push(1.0);
+
+                        let mut remaining = character_lengths.len();
+                        let mut word_lengths = Vec::with_capacity((remaining / 255) + 1);
+                        while remaining > 0 {
+                            let chunk = remaining.min(u8::MAX as usize);
+                            word_lengths.push(chunk as u8);
+                            remaining -= chunk;
+                        }
+                        builder.set_value(value);
+                        builder.set_character_lengths(character_lengths);
+                        builder.set_character_positions(character_positions);
+                        builder.set_character_widths(character_widths);
+                        builder.set_word_lengths(word_lengths);
+                    });
+                });
+                if built_row {
+                    state.accesskit_row_cache = Some(AccessKitRowCache {
+                        galley: Arc::clone(&galley),
+                        row: focus.row,
+                        bounds: row_bounds,
+                    });
+                }
+            }
         }
 
         if !ui.ctx().will_discard() {
@@ -683,7 +737,7 @@ impl<'a> FastEditor<'a> {
 
         if layout_dirty {
             let text_arc =
-                updated_text_arc.unwrap_or_else(|| Arc::new(self.text.clone()));
+                updated_text_arc.unwrap_or_else(|| Arc::new(self.text.as_str().to_owned()));
             let cached_rev = if text_changed {
                 self.text_revision.map(|r| r.wrapping_add(1))
             } else {

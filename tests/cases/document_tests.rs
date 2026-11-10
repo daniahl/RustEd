@@ -99,24 +99,24 @@ fn test_refresh_line_ending() {
     assert_eq!(doc.line_ending, "LF");
 
     // Pure LF text
-    doc.text = "line1\nline2\nline3\n".to_string();
+    doc.text = "line1\nline2\nline3\n".into();
     doc.refresh_line_ending();
     assert_eq!(doc.line_ending, "LF");
 
     // CRLF text
-    doc.text = "line1\r\nline2\r\n".to_string();
+    doc.text = "line1\r\nline2\r\n".into();
     doc.refresh_line_ending();
     assert_eq!(doc.line_ending, "CRLF");
 
     // Mixed text with CRLF early
-    doc.text = "first\r\nsecond\nthird".to_string();
+    doc.text = "first\r\nsecond\nthird".into();
     doc.refresh_line_ending();
     assert_eq!(doc.line_ending, "CRLF");
 
     // Large file with CRLF placed after the 4096-byte check window -> detected as LF
     let mut large_text = "a".repeat(5000);
     large_text.push_str("\r\nb");
-    doc.text = large_text;
+    doc.text = large_text.into();
     doc.refresh_line_ending();
     assert_eq!(doc.line_ending, "LF");
 
@@ -124,7 +124,7 @@ fn test_refresh_line_ending() {
     let mut large_crlf = "a".repeat(100);
     large_crlf.push_str("\r\n");
     large_crlf.push_str(&"b".repeat(5000));
-    doc.text = large_crlf;
+    doc.text = large_crlf.into();
     doc.refresh_line_ending();
     assert_eq!(doc.line_ending, "CRLF");
 }
@@ -137,7 +137,7 @@ fn test_find_next_unicode_and_wraparound() {
     // Multibyte emojis and accented letters:
     // "🦀" (4 bytes, 1 char)
     // "café" (5 bytes, 4 chars)
-    doc.text = "🦀 Rust café 🦀 Rust café 🦀".to_string();
+    doc.text = "🦀 Rust café 🦀 Rust café 🦀".into();
     doc.text_revision = 1;
 
     let editor_id = egui::Id::new("code_editor");
@@ -208,7 +208,7 @@ fn test_document_update_path_if_renamed() {
     doc.unsaved_files.insert(
         other_file.clone(),
         UnsavedFileState {
-            text: "// dirty".to_string(),
+            text: "// dirty".into(),
             saved_text: "".to_string(),
             editor_state: None,
             line_count: 1,
@@ -249,7 +249,7 @@ fn test_document_close_if_deleted() {
     let external_file = PathBuf::from("other_proj").join("ext.rs");
 
     doc.path = active_file.to_string_lossy().into_owned();
-    doc.text = "fn main() {}".to_string();
+    doc.text = "fn main() {}".into();
     doc.saved_text = "fn main() {}".to_string();
     doc.is_current_dirty = false;
     doc.refresh_file_metadata();
@@ -258,7 +258,7 @@ fn test_document_close_if_deleted() {
     doc.unsaved_files.insert(
         other_file.clone(),
         UnsavedFileState {
-            text: "dirty".to_string(),
+            text: "dirty".into(),
             saved_text: "".to_string(),
             editor_state: None,
             line_count: 1,
@@ -270,7 +270,7 @@ fn test_document_close_if_deleted() {
     doc.unsaved_files.insert(
         external_file.clone(),
         UnsavedFileState {
-            text: "external".to_string(),
+            text: "external".into(),
             saved_text: "".to_string(),
             editor_state: None,
             line_count: 1,
