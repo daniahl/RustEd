@@ -183,3 +183,34 @@ fn test_has_crlf_and_byte_to_char_ascii_fast_path() {
     assert!(pt_split.piece_count() >= 2);
     assert!(pt_split.has_crlf_in_initial_bytes(4096));
 }
+
+#[test]
+fn test_piece_table_snapshot_and_restore_zero_copy() {
+    let mut pt = PieceTable::from_string("Hello world".to_string());
+    let snap0 = pt.snapshot();
+
+    // Edit 1: insert ", Rust" -> "Hello, Rust world"
+    pt.insert(5, ", Rust");
+    assert_eq!(pt.build_string(), "Hello, Rust world");
+    let snap1 = pt.snapshot();
+    assert_ne!(snap0, snap1);
+
+    // Edit 2: delete " world" -> "Hello, Rust"
+    pt.delete(11..17);
+    assert_eq!(pt.as_str(), "Hello, Rust");
+    let snap2 = pt.snapshot();
+
+    // Undo to snap1
+    pt.restore_snapshot(&snap1);
+    assert_eq!(pt.as_str(), "Hello, Rust world");
+    assert_eq!(pt.char_count(), 17);
+
+    // Undo to snap0 (single original piece)
+    pt.restore_snapshot(&snap0);
+    assert_eq!(pt.as_str(), "Hello world");
+    assert_eq!(pt.piece_count(), 1);
+
+    // Redo to snap2
+    pt.restore_snapshot(&snap2);
+    assert_eq!(pt.as_str(), "Hello, Rust");
+}

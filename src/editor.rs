@@ -3,6 +3,7 @@
 //! Custom multiline text editing component optimized for large files, with syntax layout caching,
 //! undo/redo history, scroll management, and screen-magnifier/screen-reader accessibility (AccessKit).
 
+use crate::piece_table::{PieceTable, PieceTableSnapshot};
 use eframe::egui::{
     self,
     epaint::text::Galley,
@@ -14,12 +15,46 @@ use eframe::egui::{
 };
 use std::sync::{Arc, Mutex};
 
-type Undoer = egui::util::undoer::Undoer<(CCursorRange, Arc<String>)>;
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum UndoSnapshot {
+    PieceTable(PieceTableSnapshot),
+    FullText(Arc<str>),
+}
+
+pub trait EditorBuffer: egui::TextBuffer {
+    fn undo_snapshot(&self) -> UndoSnapshot {
+        UndoSnapshot::FullText(Arc::from(self.as_str()))
+    }
+
+    fn restore_undo_snapshot(&mut self, snapshot: &UndoSnapshot) {
+        if let UndoSnapshot::FullText(text) = snapshot {
+            self.replace_with(text);
+        }
+    }
+}
+
+impl EditorBuffer for String {}
+
+impl EditorBuffer for PieceTable {
+    fn undo_snapshot(&self) -> UndoSnapshot {
+        UndoSnapshot::PieceTable(self.snapshot())
+    }
+
+    fn restore_undo_snapshot(&mut self, snapshot: &UndoSnapshot) {
+        match snapshot {
+            UndoSnapshot::PieceTable(snap) => self.restore_snapshot(snap),
+            UndoSnapshot::FullText(text) => egui::TextBuffer::replace_with(self, text),
+        }
+    }
+}
+
+type Undoer = egui::util::undoer::Undoer<(CCursorRange, UndoSnapshot)>;
 
 #[derive(Clone, Default)]
 pub struct FastEditorState {
     pub cursor: TextCursorState,
     pub undoer: Arc<Mutex<Undoer>>,
+    pub last_undo_snapshot: Option<UndoSnapshot>,
     pub last_interaction_time: f64,
     /// Set after an edit / caret move until the caret has actually been scrolled into view.
     pub scroll_to_cursor: bool,
@@ -52,7 +87,6 @@ pub struct AccessKitRowCache {
 pub struct LayoutCache {
     key: (u32, u32, bool, u64),
     text_revision: Option<u64>,
-    text: Arc<String>,
     galley: Arc<Galley>,
 }
 
@@ -66,16 +100,30 @@ pub struct EditorOutput {
     pub text_changed: bool,
 }
 
-pub struct FastEditor<'a, T: egui::TextBuffer = String> {
+enum Layouter<'a, T> {
+    Str(&'a mut dyn FnMut(&Ui, &str, f32) -> Arc<Galley>),
+    Buffer(&'a mut dyn FnMut(&Ui, &T, f32) -> Arc<Galley>),
+}
+
+impl<'a, T: egui::TextBuffer> Layouter<'a, T> {
+    fn layout(&mut self, ui: &Ui, buffer: &T, wrap_width: f32) -> Arc<Galley> {
+        match self {
+            Layouter::Str(f) => f(ui, buffer.as_str(), wrap_width),
+            Layouter::Buffer(f) => f(ui, buffer, wrap_width),
+        }
+    }
+}
+
+pub struct FastEditor<'a, T: EditorBuffer = String> {
     id: Id,
     text: &'a mut T,
     min_size: Vec2,
-    layouter: &'a mut dyn FnMut(&Ui, &str, f32) -> Arc<Galley>,
+    layouter: Layouter<'a, T>,
     cache_salt: u64,
     text_revision: Option<u64>,
 }
 
-impl<'a, T: egui::TextBuffer> FastEditor<'a, T> {
+impl<'a, T: EditorBuffer> FastEditor<'a, T> {
     pub fn new(
         id: Id,
         text: &'a mut T,
@@ -86,7 +134,23 @@ impl<'a, T: egui::TextBuffer> FastEditor<'a, T> {
             id,
             text,
             min_size,
-            layouter,
+            layouter: Layouter::Str(layouter),
+            cache_salt: 0,
+            text_revision: None,
+        }
+    }
+
+    pub fn new_with_buffer(
+        id: Id,
+        text: &'a mut T,
+        min_size: Vec2,
+        layouter: &'a mut dyn FnMut(&Ui, &T, f32) -> Arc<Galley>,
+    ) -> Self {
+        Self {
+            id,
+            text,
+            min_size,
+            layouter: Layouter::Buffer(layouter),
             cache_salt: 0,
             text_revision: None,
         }
@@ -108,7 +172,7 @@ impl<'a, T: egui::TextBuffer> FastEditor<'a, T> {
         self
     }
 
-    pub fn show(self, ui: &mut Ui) -> EditorOutput {
+    pub fn show(mut self, ui: &mut Ui) -> EditorOutput {
         const MARGIN: Vec2 = Vec2::new(6.0, 2.0);
         let wrap_width = (ui.available_width() - MARGIN.x * 2.0).max(100.0);
 
@@ -127,27 +191,29 @@ impl<'a, T: egui::TextBuffer> FastEditor<'a, T> {
 
         // Reuse the previous layout when nothing it depends on has changed.
         // When `text_revision` is supplied, this is an O(1) integer comparison;
-        // otherwise it falls back to a string comparison.
+        // otherwise it falls back to comparing against the cached galley's text.
         let cache_key = (
             wrap_width.to_bits(),
             ui.ctx().pixels_per_point().to_bits(),
             ui.visuals().dark_mode,
             self.cache_salt,
         );
+        let text_unchanged = match &state.layout_cache {
+            Some(c) => match (self.text_revision, c.text_revision) {
+                (Some(r1), Some(r2)) => r1 == r2,
+                _ => c.galley.text() == self.text.as_str(),
+            },
+            None => false,
+        };
+        if !text_unchanged {
+            state.last_undo_snapshot = None;
+        }
         let mut layout_dirty = false;
         let mut galley = match &state.layout_cache {
-            Some(c)
-                if c.key == cache_key
-                    && match (self.text_revision, c.text_revision) {
-                        (Some(r1), Some(r2)) => r1 == r2,
-                        _ => c.text.as_str() == self.text.as_str(),
-                    } =>
-            {
-                Arc::clone(&c.galley)
-            }
+            Some(c) if c.key == cache_key && text_unchanged => Arc::clone(&c.galley),
             _ => {
                 layout_dirty = true;
-                (self.layouter)(ui, self.text.as_str(), wrap_width)
+                self.layouter.layout(ui, self.text, wrap_width)
             }
         };
         let desired_size = (galley.size() + MARGIN * 2.0).max(self.min_size);
@@ -205,16 +271,20 @@ impl<'a, T: egui::TextBuffer> FastEditor<'a, T> {
         if has_focus {
             let now = ui.input(|i| i.time);
 
-            // Feed state to undoer if in flux or initially empty so undo points can stabilize.
-            // Reuse the cached Arc<String> when available to avoid cloning the buffer on idle frames.
+            // Feed state to undoer if in flux so undo points can stabilize.
+            // Reuse the cached UndoSnapshot when available to avoid snapshotting on idle frames.
             {
                 let mut undoer = state.undoer.lock().unwrap();
                 if undoer.is_in_flux() {
-                    let text_arc = match &state.layout_cache {
-                        Some(c) if !layout_dirty => Arc::clone(&c.text),
-                        _ => Arc::new(self.text.as_str().to_owned()),
+                    let snap = match &state.last_undo_snapshot {
+                        Some(s) => s.clone(),
+                        None => {
+                            let s = self.text.undo_snapshot();
+                            state.last_undo_snapshot = Some(s.clone());
+                            s
+                        }
                     };
-                    undoer.feed_state(now, &(cursor_range.as_ccursor_range(), text_arc));
+                    undoer.feed_state(now, &(cursor_range.as_ccursor_range(), snap));
                 }
             }
 
@@ -260,7 +330,7 @@ impl<'a, T: egui::TextBuffer> FastEditor<'a, T> {
                     )
                 {
                     let ccursor_range = cursor_range.as_ccursor_range();
-                    galley = (self.layouter)(ui, self.text.as_str(), wrap_width);
+                    galley = self.layouter.layout(ui, self.text, wrap_width);
                     layout_dirty = true;
                     pending_relayout = false;
                     cursor_range = CursorRange {
@@ -397,18 +467,20 @@ impl<'a, T: egui::TextBuffer> FastEditor<'a, T> {
                         modifiers,
                         ..
                     } if modifiers.command => {
-                        let current_arc = match &state.layout_cache {
-                            Some(c) if !layout_dirty => Arc::clone(&c.text),
-                            _ => Arc::new(self.text.as_str().to_owned()),
+                        let current_snap = match &state.last_undo_snapshot {
+                            Some(s) if !text_changed => s.clone(),
+                            _ => self.text.undo_snapshot(),
                         };
-                        if let Some((undo_range, undo_txt)) = state
+                        let undo_target = state
                             .undoer
                             .lock()
                             .unwrap()
-                            .undo(&(cursor_range.as_ccursor_range(), current_arc))
-                        {
-                            self.text.replace_with(undo_txt.as_str());
-                            mutated = Some(*undo_range);
+                            .undo(&(cursor_range.as_ccursor_range(), current_snap))
+                            .cloned();
+                        if let Some((undo_range, undo_snap)) = undo_target {
+                            self.text.restore_undo_snapshot(&undo_snap);
+                            state.last_undo_snapshot = Some(undo_snap);
+                            mutated = Some(undo_range);
                         }
                     }
                     Event::Key {
@@ -417,18 +489,20 @@ impl<'a, T: egui::TextBuffer> FastEditor<'a, T> {
                         modifiers,
                         ..
                     } if modifiers.command => {
-                        let current_arc = match &state.layout_cache {
-                            Some(c) if !layout_dirty => Arc::clone(&c.text),
-                            _ => Arc::new(self.text.as_str().to_owned()),
+                        let current_snap = match &state.last_undo_snapshot {
+                            Some(s) if !text_changed => s.clone(),
+                            _ => self.text.undo_snapshot(),
                         };
-                        if let Some((redo_range, redo_txt)) = state
+                        let redo_target = state
                             .undoer
                             .lock()
                             .unwrap()
-                            .redo(&(cursor_range.as_ccursor_range(), current_arc))
-                        {
-                            self.text.replace_with(redo_txt.as_str());
-                            mutated = Some(*redo_range);
+                            .redo(&(cursor_range.as_ccursor_range(), current_snap))
+                            .cloned();
+                        if let Some((redo_range, redo_snap)) = redo_target {
+                            self.text.restore_undo_snapshot(&redo_snap);
+                            state.last_undo_snapshot = Some(redo_snap);
+                            mutated = Some(redo_range);
                         }
                     }
                     _ => {}
@@ -445,7 +519,7 @@ impl<'a, T: egui::TextBuffer> FastEditor<'a, T> {
 
             if pending_relayout {
                 let ccursor_range = cursor_range.as_ccursor_range();
-                galley = (self.layouter)(ui, self.text.as_str(), wrap_width);
+                galley = self.layouter.layout(ui, self.text, wrap_width);
                 layout_dirty = true;
                 cursor_range = CursorRange {
                     primary: galley.from_ccursor(ccursor_range.primary),
@@ -456,20 +530,13 @@ impl<'a, T: egui::TextBuffer> FastEditor<'a, T> {
 
         state.cursor.set_range(Some(cursor_range));
 
-        // Allocate the updated text buffer once (shared between LayoutCache and Undoer).
-        let updated_text_arc = if layout_dirty || text_changed {
-            Some(Arc::new(self.text.as_str().to_owned()))
-        } else {
-            None
-        };
-
         if text_changed {
-            if let Some(ref text_arc) = updated_text_arc {
-                state.undoer.lock().unwrap().feed_state(
-                    ui.input(|i| i.time),
-                    &(cursor_range.as_ccursor_range(), Arc::clone(text_arc)),
-                );
-            }
+            let snap = self.text.undo_snapshot();
+            state.undoer.lock().unwrap().feed_state(
+                ui.input(|i| i.time),
+                &(cursor_range.as_ccursor_range(), snap.clone()),
+            );
+            state.last_undo_snapshot = Some(snap);
         }
 
         let text_clip_rect = ui.clip_rect().intersect(rect);
@@ -740,8 +807,6 @@ impl<'a, T: egui::TextBuffer> FastEditor<'a, T> {
         }
 
         if layout_dirty {
-            let text_arc =
-                updated_text_arc.unwrap_or_else(|| Arc::new(self.text.as_str().to_owned()));
             let cached_rev = if text_changed {
                 self.text_revision.map(|r| r.wrapping_add(1))
             } else {
@@ -750,7 +815,6 @@ impl<'a, T: egui::TextBuffer> FastEditor<'a, T> {
             state.layout_cache = Some(Arc::new(LayoutCache {
                 key: cache_key,
                 text_revision: cached_rev,
-                text: text_arc,
                 galley: Arc::clone(&galley),
             }));
         }

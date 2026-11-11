@@ -590,20 +590,20 @@ impl Document {
             let text_color = ui.visuals().widgets.inactive.text_color();
             let font_id_for_layout = font_id.clone();
 
-            let mut layouter = |ui: &egui::Ui, text: &str, wrap_width: f32| {
+            let mut layouter = |ui: &egui::Ui, text: &PieceTable, wrap_width: f32| {
                 let layout_job = if text.len() <= MAX_HIGHLIGHT_BYTES {
                     let mut job = syntax_highlighting::highlight(
                         ui.ctx(),
                         ui.style(),
                         &theme,
-                        text,
+                        text.as_str(),
                         language,
                     );
                     job.wrap.max_width = wrap_width;
                     job
                 } else {
                     egui::text::LayoutJob::simple(
-                        text.to_owned(),
+                        text.build_string(),
                         font_id_for_layout.clone(),
                         text_color,
                         wrap_width,
@@ -635,7 +635,7 @@ impl Document {
                             available_size.y,
                         );
 
-                        let editor = FastEditor::new(
+                        let editor = FastEditor::new_with_buffer(
                             egui::Id::new("code_editor"),
                             &mut self.text,
                             editor_min_size,

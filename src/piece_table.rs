@@ -82,6 +82,15 @@ impl Piece {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PieceTableSnapshot {
+    original: Arc<str>,
+    pieces: Arc<[Piece]>,
+    total_chars: usize,
+    total_bytes: usize,
+    total_line_feeds: usize,
+}
+
 pub struct PieceTable {
     original: Arc<str>,
     added: String,
@@ -99,7 +108,6 @@ unsafe impl Send for PieceTable {}
 
 impl Clone for PieceTable {
     fn clone(&self) -> Self {
-        let text = self.as_str().to_string();
         Self {
             original: Arc::clone(&self.original),
             added: self.added.clone(),
@@ -107,8 +115,8 @@ impl Clone for PieceTable {
             total_chars: self.total_chars,
             total_bytes: self.total_bytes,
             total_line_feeds: self.total_line_feeds,
-            cached_text: UnsafeCell::new(text),
-            cached_dirty: Cell::new(false),
+            cached_text: UnsafeCell::new(String::new()),
+            cached_dirty: Cell::new(true),
         }
     }
 }
@@ -125,13 +133,17 @@ impl PieceTable {
     }
 
     pub fn from_string(original: String) -> Self {
-        Self::from_str(&original)
+        Self::from_arc_str(Arc::<str>::from(original))
     }
 
     pub fn from_str(text: &str) -> Self {
-        let char_count = text.chars().count();
-        let byte_len = text.len();
-        let line_feed_cnt = text.bytes().filter(|&b| b == b'\n').count();
+        Self::from_arc_str(Arc::<str>::from(text))
+    }
+
+    fn from_arc_str(original: Arc<str>) -> Self {
+        let char_count = original.chars().count();
+        let byte_len = original.len();
+        let line_feed_cnt = original.bytes().filter(|&b| b == b'\n').count();
 
         let mut pieces = Vec::new();
         if byte_len > 0 {
@@ -145,14 +157,42 @@ impl PieceTable {
         }
 
         Self {
-            original: text.into(),
+            original,
             added: String::new(),
             pieces,
             total_chars: char_count,
             total_bytes: byte_len,
             total_line_feeds: line_feed_cnt,
-            cached_text: UnsafeCell::new(text.to_string()),
-            cached_dirty: Cell::new(false),
+            cached_text: UnsafeCell::new(String::new()),
+            cached_dirty: Cell::new(true),
+        }
+    }
+
+    /// Captures a lightweight O(P) snapshot of piece descriptors without copying text buffers.
+    pub fn snapshot(&self) -> PieceTableSnapshot {
+        PieceTableSnapshot {
+            original: Arc::clone(&self.original),
+            pieces: Arc::from(self.pieces.as_slice()),
+            total_chars: self.total_chars,
+            total_bytes: self.total_bytes,
+            total_line_feeds: self.total_line_feeds,
+        }
+    }
+
+    /// Restores piece descriptors from a previously captured `PieceTableSnapshot` in O(P) time.
+    pub fn restore_snapshot(&mut self, snapshot: &PieceTableSnapshot) {
+        if snapshot
+            .pieces
+            .iter()
+            .all(|p| p.buffer != BufferType::Added || p.start + p.length <= self.added.len())
+        {
+            self.original = Arc::clone(&snapshot.original);
+            self.pieces.clear();
+            self.pieces.extend_from_slice(&snapshot.pieces);
+            self.total_chars = snapshot.total_chars;
+            self.total_bytes = snapshot.total_bytes;
+            self.total_line_feeds = snapshot.total_line_feeds;
+            self.cached_dirty.set(true);
         }
     }
 
@@ -403,18 +443,35 @@ impl PieceTable {
         self.pieces.truncate(write + 1);
     }
 
-    /// Returns the flattened string view. Rebuilt only on demand when marked dirty.
+    /// Returns the flattened string view.
+    /// Zero-copy when the document consists of 0 or 1 piece; otherwise rebuilt on demand when dirty.
     pub fn as_str(&self) -> &str {
-        if self.cached_dirty.get() {
-            let s = unsafe { &mut *self.cached_text.get() };
-            s.clear();
-            s.reserve(self.total_bytes);
-            for p in &self.pieces {
-                s.push_str(p.get_text(&self.original, &self.added));
+        match self.pieces.as_slice() {
+            [] => "",
+            [p] => p.get_text(&self.original, &self.added),
+            _ => {
+                if self.cached_dirty.get() {
+                    let s = unsafe { &mut *self.cached_text.get() };
+                    s.clear();
+                    s.reserve(self.total_bytes);
+                    for p in &self.pieces {
+                        s.push_str(p.get_text(&self.original, &self.added));
+                    }
+                    self.cached_dirty.set(false);
+                }
+                unsafe { (*self.cached_text.get()).as_str() }
             }
-            self.cached_dirty.set(false);
         }
-        unsafe { (*self.cached_text.get()).as_str() }
+    }
+
+    /// Allocates and builds an owned `String` directly from the piece descriptors in a single pass,
+    /// avoiding an intermediate copy into `cached_text`.
+    pub fn build_string(&self) -> String {
+        let mut s = String::with_capacity(self.total_bytes);
+        for p in &self.pieces {
+            s.push_str(p.get_text(&self.original, &self.added));
+        }
+        s
     }
 
     /// Converts a character index to a byte offset in the document.
@@ -518,7 +575,10 @@ impl AsRef<str> for PieceTable {
 
 impl fmt::Display for PieceTable {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
+        for p in &self.pieces {
+            f.write_str(p.get_text(&self.original, &self.added))?;
+        }
+        Ok(())
     }
 }
 
@@ -597,13 +657,13 @@ impl From<&String> for PieceTable {
 
 impl From<PieceTable> for String {
     fn from(pt: PieceTable) -> Self {
-        pt.to_string()
+        pt.build_string()
     }
 }
 
 impl From<&PieceTable> for String {
     fn from(pt: &PieceTable) -> Self {
-        pt.to_string()
+        pt.build_string()
     }
 }
 
@@ -629,11 +689,29 @@ impl eframe::egui::TextBuffer for PieceTable {
     }
 
     fn replace_with(&mut self, text: &str) {
-        *self = PieceTable::from_str(text);
+        let char_count = text.chars().count();
+        let byte_len = text.len();
+        let line_feed_cnt = text.bytes().filter(|&b| b == b'\n').count();
+
+        self.original = Arc::<str>::from(text);
+        self.pieces.clear();
+        if byte_len > 0 {
+            self.pieces.push(Piece {
+                buffer: BufferType::Original,
+                start: 0,
+                length: byte_len,
+                char_count,
+                line_feed_cnt,
+            });
+        }
+        self.total_chars = char_count;
+        self.total_bytes = byte_len;
+        self.total_line_feeds = line_feed_cnt;
+        self.cached_dirty.set(true);
     }
 
     fn take(&mut self) -> String {
-        let s = self.to_string();
+        let s = self.build_string();
         self.clear();
         s
     }
