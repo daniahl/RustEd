@@ -2800,6 +2800,7 @@ dependencies = [
 name = "rusted"
 version = "0.1.0"
 dependencies = [
+ "accesskit_consumer",
  "eframe",
  "egui_extras",
  "portable-pty",

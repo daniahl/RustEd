@@ -5,23 +5,7 @@
 
 use eframe::egui;
 use rusted::terminal::{render_vt100_screen, TerminalPane};
-use std::{
-    io::Write,
-    sync::{Arc, Mutex},
-};
-
-struct TestWriter(Arc<Mutex<Vec<u8>>>);
-
-impl Write for TestWriter {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(buf);
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
+use std::sync::mpsc;
 
 #[test]
 fn test_render_vt100_screen_plain_text_and_cursor() {
@@ -73,8 +57,8 @@ fn test_handle_terminal_input_key_mappings() {
     let ctx = egui::Context::default();
     let mut pane = TerminalPane::new_headless();
 
-    let sent_bytes = Arc::new(Mutex::new(Vec::<u8>::new()));
-    pane.pty_writer = Some(Box::new(TestWriter(Arc::clone(&sent_bytes))));
+    let (tx, rx) = mpsc::channel();
+    pane.pty_writer = Some(tx);
 
     let send_event = |pane: &mut TerminalPane, ctx: &egui::Context, event: egui::Event, focused: bool| {
         let mut raw = egui::RawInput::default();
@@ -82,6 +66,14 @@ fn test_handle_terminal_input_key_mappings() {
         let _ = ctx.run(raw, |ctx| {
             pane.handle_terminal_input(ctx, focused);
         });
+    };
+
+    let take_sent = || {
+        let mut out = Vec::new();
+        while let Ok(chunk) = rx.try_recv() {
+            out.extend_from_slice(&chunk);
+        }
+        out
     };
 
     // 1. Not focused -> nothing sent
@@ -97,7 +89,7 @@ fn test_handle_terminal_input_key_mappings() {
         },
         false,
     );
-    assert!(sent_bytes.lock().unwrap().is_empty());
+    assert!(take_sent().is_empty());
 
     // 2. Focused -> Enter key sends '\r'
     send_event(
@@ -112,8 +104,7 @@ fn test_handle_terminal_input_key_mappings() {
         },
         true,
     );
-    assert_eq!(&*sent_bytes.lock().unwrap(), b"\r");
-    sent_bytes.lock().unwrap().clear();
+    assert_eq!(&take_sent(), b"\r");
 
     // 3. Backspace sends 0x7F
     send_event(
@@ -128,8 +119,7 @@ fn test_handle_terminal_input_key_mappings() {
         },
         true,
     );
-    assert_eq!(&*sent_bytes.lock().unwrap(), b"\x7f");
-    sent_bytes.lock().unwrap().clear();
+    assert_eq!(&take_sent(), b"\x7f");
 
     // 4. Tab sends '\t'
     send_event(
@@ -144,8 +134,7 @@ fn test_handle_terminal_input_key_mappings() {
         },
         true,
     );
-    assert_eq!(&*sent_bytes.lock().unwrap(), b"\t");
-    sent_bytes.lock().unwrap().clear();
+    assert_eq!(&take_sent(), b"\t");
 
     // 5. Arrow keys send ANSI escape sequences
     send_event(
@@ -160,8 +149,7 @@ fn test_handle_terminal_input_key_mappings() {
         },
         true,
     );
-    assert_eq!(&*sent_bytes.lock().unwrap(), b"\x1b[A");
-    sent_bytes.lock().unwrap().clear();
+    assert_eq!(&take_sent(), b"\x1b[A");
 
     // 6. Ctrl+C sends 0x03
     send_event(
@@ -176,13 +164,11 @@ fn test_handle_terminal_input_key_mappings() {
         },
         true,
     );
-    assert_eq!(&*sent_bytes.lock().unwrap(), b"\x03");
-    sent_bytes.lock().unwrap().clear();
+    assert_eq!(&take_sent(), b"\x03");
 
     // 7. Text input sends raw UTF-8 bytes
     send_event(&mut pane, &ctx, egui::Event::Text("cargo test".to_string()), true);
-    assert_eq!(&*sent_bytes.lock().unwrap(), b"cargo test");
-    sent_bytes.lock().unwrap().clear();
+    assert_eq!(&take_sent(), b"cargo test");
 
     // 8. Shift+ArrowLeft enters selection mode without sending bytes
     assert!(!pane.selecting_in_terminal);
@@ -199,10 +185,10 @@ fn test_handle_terminal_input_key_mappings() {
         true,
     );
     assert!(pane.selecting_in_terminal, "Shift+Arrow should activate selection mode");
-    assert!(sent_bytes.lock().unwrap().is_empty(), "Shift+Arrow should not send bytes to PTY");
+    assert!(take_sent().is_empty(), "Shift+Arrow should not send bytes to PTY");
 
     // 9. Subsequent text input exits selection mode
     send_event(&mut pane, &ctx, egui::Event::Text("a".to_string()), true);
     assert!(!pane.selecting_in_terminal, "Typing text should exit selection mode");
-    assert_eq!(&*sent_bytes.lock().unwrap(), b"a");
+    assert_eq!(&take_sent(), b"a");
 }

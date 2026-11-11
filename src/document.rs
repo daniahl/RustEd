@@ -21,6 +21,7 @@ pub const MAX_HIGHLIGHT_BYTES: usize = 16_384;
 pub struct UnsavedFileState {
     pub text: PieceTable,
     pub saved_text: String,
+    pub saved_revision: u64,
     pub editor_state: Option<editor::FastEditorState>,
     pub line_count: usize,
     pub cursor_line: usize,
@@ -32,6 +33,7 @@ pub struct Document {
     pub path: String,
     pub text: PieceTable,
     pub saved_text: String,
+    pub saved_revision: u64,
     pub is_current_dirty: bool,
     pub unsaved_files: HashMap<PathBuf, UnsavedFileState>,
     pub text_revision: u64,
@@ -67,6 +69,7 @@ impl Document {
             path: String::new(),
             text: PieceTable::new(),
             saved_text: String::new(),
+            saved_revision: 0,
             is_current_dirty: false,
             unsaved_files: HashMap::new(),
             text_revision: 0,
@@ -109,6 +112,7 @@ impl Document {
         if !self.path.is_empty() && self.is_current_dirty {
             if fs::write(&self.path, self.text.as_str()).is_ok() {
                 self.saved_text = self.text.to_string();
+                self.saved_revision = self.text_revision;
                 self.is_current_dirty = false;
                 self.unsaved_files.remove(Path::new(&self.path));
             }
@@ -145,6 +149,7 @@ impl Document {
                 UnsavedFileState {
                     text: std::mem::take(&mut self.text),
                     saved_text: std::mem::take(&mut self.saved_text),
+                    saved_revision: self.saved_revision,
                     editor_state: prev_state,
                     line_count: self.line_count,
                     cursor_line: self.cursor_line,
@@ -162,7 +167,8 @@ impl Document {
             IncomingFile::Unsaved(unsaved) => {
                 self.text = unsaved.text;
                 self.saved_text = unsaved.saved_text;
-                self.is_current_dirty = self.text.as_str() != self.saved_text;
+                self.saved_revision = unsaved.saved_revision;
+                self.is_current_dirty = self.text_revision != self.saved_revision;
                 self.line_count = unsaved.line_count;
                 self.cursor_line = unsaved.cursor_line;
                 self.cursor_col = unsaved.cursor_col;
@@ -179,6 +185,7 @@ impl Document {
                 self.line_count = content.bytes().filter(|&b| b == b'\n').count() + 1;
                 self.saved_text = content.clone();
                 self.text = PieceTable::from_string(content);
+                self.saved_revision = self.text_revision;
                 self.is_current_dirty = false;
                 self.cursor_line = 1;
                 self.cursor_col = 1;
@@ -212,6 +219,7 @@ impl Document {
                 self.saved_text.clear();
                 self.is_current_dirty = false;
                 self.text_revision = self.text_revision.wrapping_add(1);
+                self.saved_revision = self.text_revision;
                 self.gutter_cache = None;
                 self.line_count = 1;
                 self.cursor_line = 1;
@@ -263,11 +271,7 @@ impl Document {
     }
 
     pub fn refresh_line_ending(&mut self) {
-        let check_len = self.text.len().min(4096);
-        self.line_ending = if self.text.as_bytes()[..check_len]
-            .windows(2)
-            .any(|w| w == b"\r\n")
-        {
+        self.line_ending = if self.text.has_crlf_in_initial_bytes(4096) {
             "CRLF"
         } else {
             "LF"
@@ -749,8 +753,8 @@ impl Document {
             self.text_revision = self.text_revision.wrapping_add(1);
             self.refresh_line_ending();
             let was_dirty = self.is_current_dirty;
-            self.is_current_dirty = !self.path.is_empty()
-                && (self.text.len() != self.saved_text.len() || self.text.as_str() != self.saved_text);
+            self.is_current_dirty =
+                !self.path.is_empty() && self.text_revision != self.saved_revision;
             if was_dirty != self.is_current_dirty {
                 ctx.request_repaint();
             }

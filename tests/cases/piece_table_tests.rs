@@ -165,3 +165,21 @@ fn test_piece_table_large_edit_performance() {
     assert!(pt.len() > doc_content.len());
     assert!(pt.as_str().contains("debugging hot path performance"));
 }
+
+#[test]
+fn test_has_crlf_and_byte_to_char_ascii_fast_path() {
+    let pt = PieceTable::from_str("Hello\r\nWorld");
+    assert!(pt.has_crlf_in_initial_bytes(4096));
+
+    // Pure ASCII byte_to_char check
+    assert_eq!(pt.byte_to_char(0), 0);
+    assert_eq!(pt.byte_to_char(5), 5); // after "Hello"
+    assert_eq!(pt.byte_to_char(7), 7); // after "\r\n"
+    assert_eq!(pt.byte_to_char(12), 12);
+
+    // Cross-piece CRLF check: piece 1 ends with '\r', piece 2 starts with '\n'
+    let mut pt_split = PieceTable::from_str("Line1\r");
+    pt_split.insert(pt_split.char_count(), "\nLine2");
+    assert!(pt_split.piece_count() >= 2);
+    assert!(pt_split.has_crlf_in_initial_bytes(4096));
+}

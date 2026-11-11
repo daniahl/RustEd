@@ -49,7 +49,7 @@ impl TextEditor {
             s.scroll_animation = egui::style::ScrollAnimation::none();
         });
         ctx.options_mut(|o| {
-            o.max_passes = std::num::NonZeroUsize::new(4).unwrap();
+            o.max_passes = std::num::NonZeroUsize::new(2).unwrap();
         });
 
         let initial_folder = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));

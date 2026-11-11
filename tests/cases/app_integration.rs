@@ -201,10 +201,10 @@ fn test_unsaved_state_asterisk_and_file_switching() {
     assert!(app.is_file_dirty(&file_a), "file_a should be marked dirty");
     assert!(!app.is_file_dirty(&file_b), "file_b should still be clean");
 
-    // Verify FileNode has the asterisk dirty label
+    // Verify FileNode exists for file_a
     let root = app.explorer.tree_root.as_ref().unwrap();
     let node_a = root.children.iter().find(|n| n.path == file_a).unwrap();
-    assert_eq!(node_a.dirty_label, "a.rs *");
+    assert_eq!(node_a.name, "a.rs");
 
     // 4. Switch to file_b without saving file_a
     app.open_file(&ctx, file_b.clone());
@@ -355,3 +355,85 @@ fn test_tree_new_folder_new_file_rename_and_f2() {
 
     let _ = fs::remove_dir_all(&temp_dir);
 }
+
+#[test]
+fn test_switch_to_terminal_and_back_to_editor() {
+    let temp_dir =
+        std::env::temp_dir().join(format!("rusted_tab_switch_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    let ctx = egui::Context::default();
+    ctx.enable_accesskit();
+    let mut app = TextEditor::new_headless(&temp_dir);
+
+    let editor_row_id: egui::accesskit::NodeId =
+        egui::Id::new("code_editor").with(0usize).value().into();
+
+    // Frame 1: Editor tab (initial render)
+    let out1 = ctx.run(egui::RawInput::default(), |ctx| {
+        app.update_ui(ctx);
+    });
+    let u1 = out1.platform_output.accesskit_update.unwrap();
+    assert!(
+        u1.nodes.iter().any(|(id, _)| *id == editor_row_id),
+        "Initial editor render should include active TextRun row node"
+    );
+
+    // Frame 2: Consecutive idle editor frame -> TextRun should NOT be rebuilt
+    let out2 = ctx.run(egui::RawInput::default(), |ctx| {
+        app.update_ui(ctx);
+    });
+    let u2 = out2.platform_output.accesskit_update.unwrap();
+    assert!(
+        !u2.nodes.iter().any(|(id, _)| *id == editor_row_id),
+        "Consecutive idle editor frame should not rebuild AccessKit TextRun node"
+    );
+
+    // Frame 3: Switch to Terminal tab -> Editor removed, Terminal shown
+    app.tab = rusted::app::Tab::Terminal;
+    let out3 = ctx.run(egui::RawInput::default(), |ctx| {
+        app.update_ui(ctx);
+    });
+    let u3 = out3.platform_output.accesskit_update.unwrap();
+
+    // Frame 4: Switch back to Editor tab -> Editor re-shown after being hidden
+    app.tab = rusted::app::Tab::Editor;
+    let out4 = ctx.run(egui::RawInput::default(), |ctx| {
+        app.update_ui(ctx);
+    });
+    let u4 = out4.platform_output.accesskit_update.unwrap();
+    assert!(
+        u4.nodes.iter().any(|(id, _)| *id == editor_row_id),
+        "Switching back to editor must rebuild TextRun child so AccessKit tree stays consistent"
+    );
+
+    // Frame 5: Switch to Terminal tab again
+    app.tab = rusted::app::Tab::Terminal;
+    let out5 = ctx.run(egui::RawInput::default(), |ctx| {
+        app.update_ui(ctx);
+    });
+    let u5 = out5.platform_output.accesskit_update.unwrap();
+
+    // Frame 6: Switch back to Editor tab again
+    app.tab = rusted::app::Tab::Editor;
+    let out6 = ctx.run(egui::RawInput::default(), |ctx| {
+        app.update_ui(ctx);
+    });
+    let u6 = out6.platform_output.accesskit_update.unwrap();
+    assert!(
+        u6.nodes.iter().any(|(id, _)| *id == editor_row_id),
+        "Switching back to editor again must rebuild TextRun child"
+    );
+
+    // Feed all updates into accesskit consumer Tree to ensure no panics occur
+    let mut tree = accesskit_consumer::Tree::new(u1, false);
+    tree.update(u2);
+    tree.update(u3);
+    tree.update(u4);
+    tree.update(u5);
+    tree.update(u6);
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+

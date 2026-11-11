@@ -210,6 +210,7 @@ fn test_document_update_path_if_renamed() {
         UnsavedFileState {
             text: "// dirty".into(),
             saved_text: "".to_string(),
+            saved_revision: 0,
             editor_state: None,
             line_count: 1,
             cursor_line: 1,
@@ -260,6 +261,7 @@ fn test_document_close_if_deleted() {
         UnsavedFileState {
             text: "dirty".into(),
             saved_text: "".to_string(),
+            saved_revision: 0,
             editor_state: None,
             line_count: 1,
             cursor_line: 1,
@@ -272,6 +274,7 @@ fn test_document_close_if_deleted() {
         UnsavedFileState {
             text: "external".into(),
             saved_text: "".to_string(),
+            saved_revision: 0,
             editor_state: None,
             line_count: 1,
             cursor_line: 1,

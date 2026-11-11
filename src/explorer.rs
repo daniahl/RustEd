@@ -119,9 +119,6 @@ pub enum TreeEditOutcome {
 
 pub struct FileNode {
     pub name: String,
-    pub dirty_label: String,
-    pub collapsed_label: String,
-    pub expanded_label: String,
     pub path: PathBuf,
     pub is_dir: bool,
     pub expanded: bool,
@@ -136,13 +133,8 @@ impl FileNode {
             .and_then(|n| n.to_str())
             .unwrap_or_else(|| path.to_str().unwrap_or("root"))
             .to_string();
-        let collapsed_label = format!("▸ {name}");
-        let expanded_label = format!("▾ {name}");
         let mut node = Self {
             name,
-            dirty_label: String::new(),
-            collapsed_label,
-            expanded_label,
             path,
             is_dir: true,
             expanded: true,
@@ -190,11 +182,6 @@ impl FileNode {
                 let path = entry.path();
                 let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
                 let name = entry.file_name().to_string_lossy().into_owned();
-                let (dirty_label, collapsed_label, expanded_label) = if is_dir {
-                    (String::new(), format!("▸ {name}"), format!("▾ {name}"))
-                } else {
-                    (format!("{name} *"), String::new(), String::new())
-                };
                 let (expanded, children_loaded, children) = if is_dir {
                     old_dirs
                         .remove(&path)
@@ -204,9 +191,6 @@ impl FileNode {
                 };
                 self.children.push(Self {
                     name,
-                    dirty_label,
-                    collapsed_label,
-                    expanded_label,
                     path,
                     is_dir,
                     expanded,
@@ -334,12 +318,8 @@ pub fn render_file_node(
                 .unwrap_or(false);
             ui.horizontal(|ui| {
                 ui.add_space(indent);
-                let label = if node.expanded {
-                    node.expanded_label.as_str()
-                } else {
-                    node.collapsed_label.as_str()
-                };
-                let resp = ui.selectable_label(is_selected, label);
+                let prefix = if node.expanded { "▾ " } else { "▸ " };
+                let resp = ui.selectable_label(is_selected, format!("{prefix}{}", node.name));
                 if resp.clicked() {
                     *selected_node = Some((node.path.clone(), true));
                     node.expanded = !node.expanded;
@@ -431,14 +411,13 @@ pub fn render_file_node(
         };
         let is_dirty = (current_path == node.path && is_current_dirty)
             || (!unsaved_files.is_empty() && unsaved_files.contains_key(&node.path));
-        let label = if is_dirty {
-            node.dirty_label.as_str()
-        } else {
-            node.name.as_str()
-        };
         ui.horizontal(|ui| {
             ui.add_space(indent + 14.0);
-            let resp = ui.selectable_label(is_selected, label);
+            let resp = if is_dirty {
+                ui.selectable_label(is_selected, format!("{} *", node.name))
+            } else {
+                ui.selectable_label(is_selected, &node.name)
+            };
             if resp.clicked() {
                 *selected_node = Some((node.path.clone(), false));
                 *file_to_open = Some(node.path.clone());

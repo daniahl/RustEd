@@ -118,6 +118,33 @@ fn test_editor_full_lifecycle() {
     let _ = run_frame(&ctx, &mut text, input_undo);
     assert_eq!(text, "First Line\nSecond Line");
 
+    // Frame 7: Ctrl+C without selection (should be a no-op, no hang)
+    let mut input_copy = egui::RawInput::default();
+    input_copy.events.push(Event::Key {
+        key: Key::C,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: Modifiers::COMMAND,
+    });
+    input_copy.events.push(Event::Copy);
+    let _ = run_frame(&ctx, &mut text, input_copy);
+
+    // Frame 8: Select all (Ctrl+A) then Ctrl+C with selection (copies text without deadlocking)
+    let mut input_select_copy = egui::RawInput::default();
+    input_select_copy.events.push(Event::Key {
+        key: Key::A,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: Modifiers::COMMAND,
+    });
+    input_select_copy.events.push(Event::Copy);
+    let out_copy = run_frame(&ctx, &mut text, input_select_copy);
+    assert!(out_copy.platform_output.commands.iter().any(|cmd| {
+        matches!(cmd, egui::OutputCommand::CopyText(t) if t == "First Line\nSecond Line")
+    }));
+
     println!("Full lifecycle test passed successfully!");
 }
 

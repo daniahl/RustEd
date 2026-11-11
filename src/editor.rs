@@ -34,6 +34,10 @@ pub struct FastEditorState {
     /// Set when the editor just gained focus; causes one repaint where the selection is updated
     /// while `old.is_text_pattern_supported()` is already true.
     pub pending_accesskit_selection_sync: bool,
+    /// Cumulative egui pass number when this editor was last rendered.
+    /// If the editor was not rendered on the immediately preceding pass (e.g. user switched tabs),
+    /// the AccessKit tree dropped this widget's children, so any cached AccessKit row node must be invalidated.
+    pub last_rendered_pass: Option<u64>,
 }
 
 /// Cached identity of the active AccessKit `TextRun` row node.
@@ -113,6 +117,14 @@ impl<'a, T: egui::TextBuffer> FastEditor<'a, T> {
             .data_mut(|d| d.get_temp::<FastEditorState>(self.id))
             .unwrap_or_default();
 
+        let current_pass = ui.ctx().cumulative_pass_nr();
+        let was_rendered_last_pass =
+            state.last_rendered_pass == Some(current_pass.saturating_sub(1));
+        if !was_rendered_last_pass {
+            state.accesskit_row_cache = None;
+            state.had_focus_prev_frame = false;
+        }
+
         // Reuse the previous layout when nothing it depends on has changed.
         // When `text_revision` is supplied, this is an O(1) integer comparison;
         // otherwise it falls back to a string comparison.
@@ -127,7 +139,7 @@ impl<'a, T: egui::TextBuffer> FastEditor<'a, T> {
             Some(c)
                 if c.key == cache_key
                     && match (self.text_revision, c.text_revision) {
-                        (Some(r1), Some(r2)) => r1 == r2 && c.text.len() == self.text.as_str().len(),
+                        (Some(r1), Some(r2)) => r1 == r2,
                         _ => c.text.as_str() == self.text.as_str(),
                     } =>
             {
@@ -541,12 +553,19 @@ impl<'a, T: egui::TextBuffer> FastEditor<'a, T> {
                 primary_cursor_rect,
                 now - state.last_interaction_time,
             );
-        } else if text_clip_rect.contains(cursor_box.center()) {
+        }
+
+        let cursor_in_view = text_clip_rect.contains(cursor_box.center());
+        if cursor_in_view {
             state.scroll_to_cursor = false;
         } else if state.scroll_to_cursor {
+            // Only redo the pass when we've just asked the ScrollArea to scroll to the
+            // caret (edit / caret move). If the user simply scrolled the caret out of view,
+            // discarding every frame would re-run layout continuously.
             if !ui.ctx().will_discard() {
                 ui.ctx().request_discard("scroll to cursor");
             }
+            // If the pass limit is hit, keep scrolling on the next frame.
             ui.ctx().request_repaint();
         }
 
@@ -569,23 +588,8 @@ impl<'a, T: egui::TextBuffer> FastEditor<'a, T> {
         // Only rebuild and allocate the `TextRun` node's glyph buffers when the galley,
         // active row index, or clamped row bounds actually change.
         let focus = cursor_range.primary.rcursor;
-        let cursor_rect = cursor_box;
 
-        if text_clip_rect.contains(cursor_rect.center()) {
-            state.scroll_to_cursor = false;
-        }
-
-        if has_focus && !text_clip_rect.contains(cursor_rect.center()) {
-            // Only redo the pass when we've just asked the ScrollArea to scroll to the
-            // caret (edit / caret move). If the user simply scrolled the caret out of view,
-            // discarding every frame would re-run layout continuously.
-            if state.scroll_to_cursor {
-                if !ui.ctx().will_discard() {
-                    ui.ctx().request_discard("scroll to cursor");
-                }
-                // If the pass limit is hit, keep scrolling on the next frame.
-                ui.ctx().request_repaint();
-            }
+        if has_focus && !cursor_in_view {
             state.accesskit_row_cache = None;
             ui.ctx().accesskit_node_builder(self.id, |builder| {
                 builder.clear_text_selection();
@@ -750,6 +754,7 @@ impl<'a, T: egui::TextBuffer> FastEditor<'a, T> {
                 galley: Arc::clone(&galley),
             }));
         }
+        state.last_rendered_pass = Some(current_pass);
         ui.ctx().data_mut(|d| d.insert_temp(self.id, state));
 
         let focus_filter = egui::EventFilter {

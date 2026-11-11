@@ -20,6 +20,10 @@ egui_extras = { version = "0.31", features = ["syntect"] }
 portable-pty = "0.8"
 vt100 = "0.15"
 
+[dev-dependencies]
+accesskit_consumer = "0.26"
+
+
 # Optimize dependencies (egui text layout, syntect) even in debug builds;
 # they dominate edit latency on large files.
 [profile.dev.package."*"]

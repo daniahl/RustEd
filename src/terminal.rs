@@ -8,7 +8,7 @@ use eframe::egui;
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use std::{
     io::{Read, Write},
-    sync::{Arc, Mutex},
+    sync::{mpsc, Arc, Mutex},
     thread,
 };
 
@@ -25,7 +25,7 @@ pub struct TerminalPane {
     pub term_screen_text: String,
     pub term_revision: u64,
     pub term_cursor_idx: usize,
-    pub pty_writer: Option<Box<dyn Write + Send>>,
+    pub pty_writer: Option<mpsc::Sender<Vec<u8>>>,
     pub _pty_master: Option<Box<dyn portable_pty::MasterPty + Send>>,
     pub _pty_child: Option<Box<dyn portable_pty::Child + Send + Sync>>,
     pub focus_terminal: bool,
@@ -58,8 +58,15 @@ impl TerminalPane {
             }
             drop(pair.slave);
 
-            if let Ok(writer) = pair.master.take_writer() {
-                pty_writer = Some(writer);
+            if let Ok(mut writer) = pair.master.take_writer() {
+                let (tx, rx) = mpsc::channel::<Vec<u8>>();
+                thread::spawn(move || {
+                    while let Ok(bytes) = rx.recv() {
+                        let _ = writer.write_all(&bytes);
+                        let _ = writer.flush();
+                    }
+                });
+                pty_writer = Some(tx);
             }
 
             if let Ok(mut reader) = pair.master.try_clone_reader() {
@@ -122,9 +129,8 @@ impl TerminalPane {
     }
 
     pub fn write_to_pty(&mut self, bytes: &[u8]) {
-        if let Some(writer) = &mut self.pty_writer {
-            let _ = writer.write_all(bytes);
-            let _ = writer.flush();
+        if let Some(writer) = &self.pty_writer {
+            let _ = writer.send(bytes.to_vec());
         }
     }
 
@@ -232,17 +238,22 @@ impl TerminalPane {
         self.handle_terminal_input(ctx, term_focused);
 
         let prev_selecting = self.selecting_in_terminal;
-        let pty_updated = {
+        let (screen_snapshot, pty_updated) = {
             let mut lock = self.term.lock().unwrap();
             let updated = lock.pty_updated || self.term_screen_text.is_empty();
             if updated {
                 lock.pty_updated = false;
-                self.term_cursor_idx =
-                    render_vt100_screen_into(lock.parser.screen(), &mut self.term_screen_text);
-                self.term_revision = self.term_revision.wrapping_add(1);
+                (Some(lock.parser.screen().clone()), true)
+            } else {
+                (None, false)
             }
-            updated
         };
+
+        if let Some(screen) = screen_snapshot {
+            self.term_cursor_idx =
+                render_vt100_screen_into(&screen, &mut self.term_screen_text);
+            self.term_revision = self.term_revision.wrapping_add(1);
+        }
 
         if pty_updated {
             self.selecting_in_terminal = false;

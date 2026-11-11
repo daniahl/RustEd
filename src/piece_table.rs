@@ -382,24 +382,25 @@ impl PieceTable {
         self.cached_dirty.set(true);
     }
 
-    /// Merges contiguous pieces that point to adjacent regions in the same buffer.
+    /// Merges contiguous pieces that point to adjacent regions in the same buffer in a single O(M) pass.
     pub fn coalesce(&mut self) {
         if self.pieces.len() <= 1 {
             return;
         }
-        let mut i = 0;
-        while i + 1 < self.pieces.len() {
-            let a = self.pieces[i];
-            let b = self.pieces[i + 1];
-            if a.buffer == b.buffer && a.start + a.length == b.start {
-                self.pieces[i].length += b.length;
-                self.pieces[i].char_count += b.char_count;
-                self.pieces[i].line_feed_cnt += b.line_feed_cnt;
-                self.pieces.remove(i + 1);
+        let mut write = 0;
+        for read in 1..self.pieces.len() {
+            let next = self.pieces[read];
+            let curr = &mut self.pieces[write];
+            if curr.buffer == next.buffer && curr.start + curr.length == next.start {
+                curr.length += next.length;
+                curr.char_count += next.char_count;
+                curr.line_feed_cnt += next.line_feed_cnt;
             } else {
-                i += 1;
+                write += 1;
+                self.pieces[write] = next;
             }
         }
+        self.pieces.truncate(write + 1);
     }
 
     /// Returns the flattened string view. Rebuilt only on demand when marked dirty.
@@ -451,6 +452,10 @@ impl PieceTable {
         for p in &self.pieces {
             if byte_idx <= curr_byte + p.length {
                 let offset_in_piece = byte_idx - curr_byte;
+                // Fast path: if char count equals byte length, all characters are single-byte ASCII
+                if p.char_count == p.length {
+                    return curr_char + offset_in_piece;
+                }
                 let text = p.get_text(&self.original, &self.added);
                 let chars_in_offset = text[..offset_in_piece].chars().count();
                 return curr_char + chars_in_offset;
@@ -459,6 +464,34 @@ impl PieceTable {
             curr_char += p.char_count;
         }
         self.total_chars
+    }
+
+    /// Checks whether the text starts with CRLF within the first `max_bytes`
+    /// without flattening the buffer into `cached_text`.
+    pub fn has_crlf_in_initial_bytes(&self, max_bytes: usize) -> bool {
+        if self.total_line_feeds == 0 || max_bytes == 0 || self.pieces.is_empty() {
+            return false;
+        }
+        let mut remaining = max_bytes;
+        let mut prev_byte = None;
+        for p in &self.pieces {
+            if remaining == 0 {
+                break;
+            }
+            let text = p.get_text(&self.original, &self.added);
+            let slice = &text.as_bytes()[..text.len().min(remaining)];
+            if let Some(prev) = prev_byte {
+                if prev == b'\r' && slice.first() == Some(&b'\n') {
+                    return true;
+                }
+            }
+            if slice.windows(2).any(|w| w == b"\r\n") {
+                return true;
+            }
+            prev_byte = slice.last().copied();
+            remaining -= slice.len();
+        }
+        false
     }
 
     #[inline]
