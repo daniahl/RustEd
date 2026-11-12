@@ -523,6 +523,161 @@ impl PieceTable {
         self.total_chars
     }
 
+    /// Returns the starting character index of 0-based `target_line` without flattening the buffer.
+    pub fn line_to_char(&self, target_line: usize) -> usize {
+        if target_line == 0 {
+            return 0;
+        }
+        if target_line > self.total_line_feeds {
+            return self.total_chars;
+        }
+
+        let mut curr_line = 0usize;
+        let mut curr_char = 0usize;
+
+        for p in &self.pieces {
+            if curr_line + p.line_feed_cnt < target_line {
+                curr_line += p.line_feed_cnt;
+                curr_char += p.char_count;
+                continue;
+            }
+
+            let text = p.get_text(&self.original, &self.added);
+            let bytes = text.as_bytes();
+            let mut last_pos = 0usize;
+            for (i, &b) in bytes.iter().enumerate() {
+                if b == b'\n' {
+                    curr_line += 1;
+                    if curr_line == target_line {
+                        let byte_end = i + 1;
+                        let chars_in_prefix = if p.char_count == p.length {
+                            byte_end
+                        } else {
+                            text[..byte_end].chars().count()
+                        };
+                        return curr_char + chars_in_prefix;
+                    }
+                    last_pos = i + 1;
+                }
+            }
+            let _ = last_pos;
+            curr_char += p.char_count;
+        }
+
+        self.total_chars
+    }
+
+    /// Returns `(line_idx, col_chars)` (both 0-based) for `char_idx` without flattening the buffer.
+    pub fn char_to_line_col(&self, char_idx: usize) -> (usize, usize) {
+        let target = char_idx.min(self.total_chars);
+        if target == 0 {
+            return (0, 0);
+        }
+
+        let mut curr_char = 0usize;
+        let mut curr_line = 0usize;
+        let mut last_line_start_char = 0usize;
+
+        for p in &self.pieces {
+            if curr_char + p.char_count < target {
+                if p.line_feed_cnt > 0 {
+                    let text = p.get_text(&self.original, &self.added);
+                    if let Some(last_nl_byte) = text.as_bytes().iter().rposition(|&b| b == b'\n') {
+                        let byte_after_nl = last_nl_byte + 1;
+                        let chars_before_nl_end = if p.char_count == p.length {
+                            byte_after_nl
+                        } else {
+                            text[..byte_after_nl].chars().count()
+                        };
+                        last_line_start_char = curr_char + chars_before_nl_end;
+                    }
+                    curr_line += p.line_feed_cnt;
+                }
+                curr_char += p.char_count;
+                continue;
+            }
+
+            let offset_chars = target - curr_char;
+            if p.line_feed_cnt > 0 {
+                let offset_bytes = p.char_to_byte_offset(&self.original, &self.added, offset_chars);
+                let prefix = &p.get_text(&self.original, &self.added)[..offset_bytes];
+                let lf_count = prefix.bytes().filter(|&b| b == b'\n').count();
+                if lf_count > 0 {
+                    curr_line += lf_count;
+                    let last_nl_byte = prefix
+                        .as_bytes()
+                        .iter()
+                        .rposition(|&b| b == b'\n')
+                        .unwrap();
+                    let byte_after_nl = last_nl_byte + 1;
+                    let chars_to_nl_end = if p.char_count == p.length {
+                        byte_after_nl
+                    } else {
+                        prefix[..byte_after_nl].chars().count()
+                    };
+                    last_line_start_char = curr_char + chars_to_nl_end;
+                }
+            }
+
+            return (curr_line, target - last_line_start_char);
+        }
+
+        (curr_line, target - last_line_start_char)
+    }
+
+    /// Returns the character range `start..end` (excluding trailing `'\n'`) of 0-based `line_idx`.
+    pub fn line_char_range(&self, line_idx: usize) -> Range<usize> {
+        let start = self.line_to_char(line_idx);
+        let end = if line_idx >= self.total_line_feeds {
+            self.total_chars
+        } else {
+            self.line_to_char(line_idx + 1).saturating_sub(1)
+        };
+        start..end.max(start)
+    }
+
+    /// Extracts characters in `char_range` into `out` (cleared first) without flattening the full buffer.
+    pub fn extract_char_range(&self, char_range: Range<usize>, out: &mut String) {
+        out.clear();
+        let start = char_range.start.min(self.total_chars);
+        let end = char_range.end.min(self.total_chars);
+        if start >= end {
+            return;
+        }
+
+        let mut curr_char = 0usize;
+        for p in &self.pieces {
+            let piece_start = curr_char;
+            let piece_end = curr_char + p.char_count;
+            curr_char = piece_end;
+
+            if piece_end <= start {
+                continue;
+            }
+            if piece_start >= end {
+                break;
+            }
+
+            let local_start = start.saturating_sub(piece_start);
+            let local_end = (end - piece_start).min(p.char_count);
+            let byte_start = p.char_to_byte_offset(&self.original, &self.added, local_start);
+            let byte_end = if local_end == p.char_count {
+                p.length
+            } else {
+                p.char_to_byte_offset(&self.original, &self.added, local_end)
+            };
+            let text = p.get_text(&self.original, &self.added);
+            out.push_str(&text[byte_start..byte_end]);
+        }
+    }
+
+    /// Returns an owned `String` for `char_range` without flattening the full buffer.
+    pub fn slice_chars(&self, char_range: Range<usize>) -> String {
+        let mut s = String::new();
+        self.extract_char_range(char_range, &mut s);
+        s
+    }
+
     /// Checks whether the text starts with CRLF within the first `max_bytes`
     /// without flattening the buffer into `cached_text`.
     pub fn has_crlf_in_initial_bytes(&self, max_bytes: usize) -> bool {

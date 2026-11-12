@@ -635,6 +635,7 @@ impl Document {
                             available_size.y,
                         );
 
+                        let is_large = self.text.len() > MAX_HIGHLIGHT_BYTES;
                         let editor = FastEditor::new_with_buffer(
                             egui::Id::new("code_editor"),
                             &mut self.text,
@@ -642,7 +643,8 @@ impl Document {
                             &mut layouter,
                         )
                         .cache_salt(language_salt)
-                        .text_revision(text_revision);
+                        .text_revision(text_revision)
+                        .virtualized(is_large);
                         let output = editor.show(ui);
                         editor_text_changed = output.text_changed;
 
@@ -653,18 +655,26 @@ impl Document {
                         };
                         if stale {
                             let mut nums = Vec::with_capacity(output.galley.rows.len());
-                            let mut line_no = 0u32;
-                            let mut new_line = true;
-                            for row in &output.galley.rows {
-                                if new_line {
-                                    line_no += 1;
-                                    nums.push(line_no);
-                                } else {
-                                    nums.push(0);
+                            let new_count = if output.virtualized {
+                                let base = output.first_line as u32;
+                                for i in 0..output.galley.rows.len() {
+                                    nums.push(base + i as u32 + 1);
                                 }
-                                new_line = row.ends_with_newline;
-                            }
-                            let new_count = (line_no as usize).max(1);
+                                self.text.line_count().max(1)
+                            } else {
+                                let mut line_no = 0u32;
+                                let mut new_line = true;
+                                for row in &output.galley.rows {
+                                    if new_line {
+                                        line_no += 1;
+                                        nums.push(line_no);
+                                    } else {
+                                        nums.push(0);
+                                    }
+                                    new_line = row.ends_with_newline;
+                                }
+                                (line_no as usize).max(1)
+                            };
                             if new_count.max(1).ilog10() != self.line_count.max(1).ilog10() {
                                 ui.ctx().request_repaint();
                             }
@@ -674,7 +684,9 @@ impl Document {
 
                         if let Some(cursor_range) = output.cursor_range {
                             let focus = cursor_range.primary.rcursor;
-                            self.cursor_line = if let Some((_, nums)) = &self.gutter_cache {
+                            self.cursor_line = if output.virtualized {
+                                focus.row + 1
+                            } else if let Some((_, nums)) = &self.gutter_cache {
                                 if nums.is_empty() {
                                     1
                                 } else {

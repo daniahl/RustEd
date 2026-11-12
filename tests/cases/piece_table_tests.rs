@@ -214,3 +214,32 @@ fn test_piece_table_snapshot_and_restore_zero_copy() {
     pt.restore_snapshot(&snap2);
     assert_eq!(pt.as_str(), "Hello, Rust");
 }
+
+#[test]
+fn test_piece_table_line_and_range_helpers() {
+    let mut pt = PieceTable::from_str("alpha\n🦀beta\ngamma");
+    pt.insert(6, "X"); // "alpha\nX🦀beta\ngamma" (multiple pieces + multibyte UTF-8)
+    assert!(pt.piece_count() >= 2);
+    assert_eq!(pt.line_count(), 3);
+
+    assert_eq!(pt.line_to_char(0), 0);
+    assert_eq!(pt.line_to_char(1), 6);
+    assert_eq!(pt.line_to_char(2), 13);
+    assert_eq!(pt.line_to_char(3), pt.char_count());
+
+    assert_eq!(pt.char_to_line_col(0), (0, 0));
+    assert_eq!(pt.char_to_line_col(5), (0, 5));
+    assert_eq!(pt.char_to_line_col(6), (1, 0));
+    assert_eq!(pt.char_to_line_col(8), (1, 2)); // after "X🦀"
+    assert_eq!(pt.char_to_line_col(13), (2, 0));
+    assert_eq!(pt.char_to_line_col(18), (2, 5));
+
+    assert_eq!(pt.line_char_range(0), 0..5);
+    assert_eq!(pt.line_char_range(1), 6..12);
+    assert_eq!(pt.line_char_range(2), 13..18);
+
+    assert_eq!(pt.slice_chars(6..12), "X🦀beta");
+    let mut buf = String::from("stale");
+    pt.extract_char_range(0..5, &mut buf);
+    assert_eq!(buf, "alpha");
+}

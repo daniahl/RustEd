@@ -397,3 +397,80 @@ fn test_coalesced_relayout_and_long_line_accesskit() {
     let total_word_len: usize = text_run.word_lengths().iter().map(|&w| w as usize).sum();
     assert_eq!(total_word_len, text_run.character_lengths().len());
 }
+
+#[test]
+fn test_virtualized_large_file_layout_and_editing() {
+    use rusted::PieceTable;
+
+    let ctx = egui::Context::default();
+    let mut pt = PieceTable::from_string((0..5000).map(|i| format!("line {i:04}\n")).collect());
+    let mut rev = 1u64;
+    let id = Id::new("test_virtualized_editor");
+    let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), Vec2::new(600.0, 300.0));
+
+    let run_frame = |pt: &mut PieceTable, rev: &mut u64, events: Vec<Event>| {
+        let mut input = egui::RawInput::default();
+        input.screen_rect = Some(screen);
+        input.events = events;
+        let mut last_rows = 0usize;
+        let mut last_first_line = 0usize;
+        let mut last_cursor = None;
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .animated(false)
+                    .show(ui, |ui| {
+                        let mut layouter = |_ui: &Ui, _buf: &PieceTable, _wrap: f32| {
+                            panic!("full-buffer layouter must not be called in virtualized mode");
+                        };
+                        let output = FastEditor::new_with_buffer(
+                            id,
+                            pt,
+                            Vec2::new(400.0, 200.0),
+                            &mut layouter,
+                        )
+                        .text_revision(*rev)
+                        .virtualized(true)
+                        .show(ui);
+                        output.response.request_focus();
+                        last_rows = output.galley.rows.len();
+                        last_first_line = output.first_line;
+                        last_cursor = output.cursor_range;
+                        if output.text_changed {
+                            *rev = rev.wrapping_add(1);
+                        }
+                    });
+            });
+        });
+        (last_rows, last_first_line, last_cursor)
+    };
+
+    // Frame 1: Initial render — only visible window (+ overscan) is laid out, far less than 5000 rows
+    let (last_rows, last_first_line, _) = run_frame(&mut pt, &mut rev, vec![]);
+    assert_eq!(last_first_line, 0);
+    assert!(
+        last_rows > 0 && last_rows < 100,
+        "Expected only visible rows to be laid out, got {last_rows}"
+    );
+
+    // Frame 2: Type "ABC" at start and press ArrowDown
+    let (_, _, last_cursor) = run_frame(
+        &mut pt,
+        &mut rev,
+        vec![
+            Event::Text("ABC".to_string()),
+            Event::Key {
+                key: Key::ArrowDown,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::NONE,
+            },
+        ],
+    );
+    assert_eq!(pt.slice_chars(0..12), "ABCline 0000");
+    let cur = last_cursor.unwrap().primary;
+    assert_eq!(cur.rcursor.row, 1);
+    assert_eq!(cur.rcursor.column, 3);
+}
