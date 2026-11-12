@@ -4,9 +4,10 @@
 //! and orchestrates interactions between the file explorer, active document, and terminal.
 
 use crate::{
-    document::Document,
+    document::{DiskSyncResult, Document},
     explorer::{FileExplorer, PendingTreeEdit, TreeAction},
     terminal::TerminalPane,
+    watcher::{path_starts_with, paths_equal, FileWatcher},
 };
 use eframe::egui;
 use std::{
@@ -26,6 +27,7 @@ pub struct TextEditor {
     pub doc: Document,
     pub explorer: FileExplorer,
     pub terminal: TerminalPane,
+    pub watcher: Option<FileWatcher>,
     /// When set, the next editor frame grabs keyboard focus so the caret is active at startup.
     pub focus_editor_pending: bool,
 }
@@ -63,6 +65,7 @@ impl TextEditor {
             .or_else(|| std::env::current_dir().ok())
             .unwrap_or_else(|| PathBuf::from("."));
         let terminal = TerminalPane::new(ctx.clone(), Some(&initial_folder));
+        let watcher = Some(FileWatcher::new(ctx, &initial_folder));
         let explorer = FileExplorer::new(initial_folder);
         let doc = Document::new();
 
@@ -71,6 +74,7 @@ impl TextEditor {
             doc,
             explorer,
             terminal,
+            watcher,
             focus_editor_pending: true,
         }
     }
@@ -85,6 +89,7 @@ impl TextEditor {
             doc,
             explorer,
             terminal,
+            watcher: None,
             focus_editor_pending: false,
         }
     }
@@ -106,7 +111,61 @@ impl TextEditor {
         self.explorer.start_rename_selected();
     }
 
+    /// Applies a batch of filesystem change paths to the explorer tree and the active document.
+    /// Returns the active document path if syncing hit a transient file lock and should be retried.
+    pub fn process_fs_events(
+        &mut self,
+        ctx: &egui::Context,
+        paths: &[PathBuf],
+        rescan_all: bool,
+    ) -> Option<PathBuf> {
+        self.explorer.refresh_watched_paths(paths, rescan_all);
+
+        if self.doc.path.is_empty() {
+            return None;
+        }
+        let doc_path = PathBuf::from(&self.doc.path);
+        let touches_doc = rescan_all
+            || paths
+                .iter()
+                .any(|p| paths_equal(p, &doc_path) || path_starts_with(&doc_path, p));
+        if touches_doc
+            && matches!(
+                self.doc.sync_with_disk(ctx, false),
+                DiskSyncResult::RetryTransientError
+            )
+        {
+            return Some(doc_path);
+        }
+        None
+    }
+
+    fn poll_watcher(&mut self, ctx: &egui::Context) {
+        let Some((batch, due_retries)) = self.watcher.as_mut().and_then(|w| w.poll()) else {
+            return;
+        };
+        if let Some(retry_path) = self.process_fs_events(ctx, &batch.paths, batch.rescan_all) {
+            let attempt = due_retries
+                .iter()
+                .find(|(p, _)| paths_equal(p, &retry_path))
+                .map(|(_, attempt)| *attempt)
+                .unwrap_or(0);
+            if let Some(watcher) = &mut self.watcher {
+                watcher.schedule_retry(retry_path, attempt);
+            }
+        }
+    }
+
+    fn sync_watcher(&mut self) {
+        if let Some(watcher) = &mut self.watcher {
+            watcher.watch_root(Path::new(&self.explorer.folder_path));
+            let active = (!self.doc.path.is_empty()).then(|| Path::new(&self.doc.path));
+            watcher.watch_extra_file(active);
+        }
+    }
+
     pub fn update_ui(&mut self, ctx: &egui::Context) {
+        self.poll_watcher(ctx);
         let ctrl_tab = ctx.input_mut(|i| {
             let ctrl = i.consume_key(egui::Modifiers::CTRL, egui::Key::Tab)
                 || i.consume_key(egui::Modifiers::COMMAND, egui::Key::Tab);
@@ -292,6 +351,7 @@ impl TextEditor {
                 self.terminal.show(ctx, panel_frame);
             }
         }
+        self.sync_watcher();
     }
 }
 

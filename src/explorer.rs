@@ -3,7 +3,10 @@
 //! Manages the directory tree hierarchy, lazy-loading child directories, inline renaming and creation
 //! of files and folders, context menus, and trash/recycle bin operations.
 
-use crate::document::{Document, UnsavedFileState};
+use crate::{
+    document::{Document, UnsavedFileState},
+    watcher::{path_starts_with, paths_equal},
+};
 use eframe::egui;
 use std::{
     collections::HashMap,
@@ -146,11 +149,11 @@ impl FileNode {
     }
 
     pub fn find_mut(&mut self, target: &Path) -> Option<&mut FileNode> {
-        if self.path == target {
+        if paths_equal(&self.path, target) {
             return Some(self);
         }
         for child in &mut self.children {
-            if child.is_dir && !target.starts_with(&child.path) {
+            if child.is_dir && !path_starts_with(target, &child.path) {
                 continue;
             }
             if let Some(found) = child.find_mut(target) {
@@ -222,6 +225,80 @@ impl FileNode {
                     a_bytes.len().cmp(&b_bytes.len()).then_with(|| a.name.cmp(&b.name))
                 })
             });
+        }
+    }
+
+    /// Recursively refreshes all already-loaded directories in this subtree while leaving
+    /// collapsed/unloaded directories lazy.
+    pub fn refresh_loaded_subtree(&mut self) {
+        if !self.is_dir || !self.children_loaded {
+            return;
+        }
+        self.load_children();
+        for child in &mut self.children {
+            if child.is_dir && child.children_loaded {
+                child.refresh_loaded_subtree();
+            }
+        }
+    }
+
+    /// Walks down loaded directories toward `changed_path` and refreshes the deepest loaded
+    /// directory that actually owns the visible change, avoiding scans inside collapsed folders.
+    pub fn refresh_for_path(&mut self, changed_path: &Path, refreshed: &mut Vec<PathBuf>) {
+        if !self.is_dir || !self.children_loaded || !path_starts_with(changed_path, &self.path) {
+            return;
+        }
+        if paths_equal(changed_path, &self.path) {
+            if !refreshed.iter().any(|d| paths_equal(d, &self.path)) {
+                self.load_children();
+                refreshed.push(self.path.clone());
+            }
+            return;
+        }
+
+        let matching_idx = self
+            .children
+            .iter()
+            .position(|c| path_starts_with(changed_path, &c.path));
+
+        match matching_idx {
+            Some(idx) => {
+                let child = &self.children[idx];
+                if child.is_dir {
+                    if paths_equal(changed_path, &child.path) {
+                        // Direct child directory created/deleted/renamed: refresh parent if missing
+                        // on disk, or refresh the directory itself if loaded.
+                        if !child.path.exists() {
+                            if !refreshed.iter().any(|d| paths_equal(d, &self.path)) {
+                                self.load_children();
+                                refreshed.push(self.path.clone());
+                            }
+                        } else if child.children_loaded {
+                            self.children[idx].refresh_for_path(changed_path, refreshed);
+                        }
+                    } else if child.children_loaded {
+                        self.children[idx].refresh_for_path(changed_path, refreshed);
+                    }
+                    // If !child.children_loaded and changed_path is strictly inside it (e.g.
+                    // `target\debug\...`), skip reloading so unexpanded trees stay fast.
+                } else {
+                    // Existing file child changed or was deleted; reload parent only if deleted/new
+                    // metadata changed directory listing.
+                    if (!child.path.exists() || child.path.is_dir())
+                        && !refreshed.iter().any(|d| paths_equal(d, &self.path))
+                    {
+                        self.load_children();
+                        refreshed.push(self.path.clone());
+                    }
+                }
+            }
+            None => {
+                // Missing direct child (newly created file/folder, or first level of `mkdir a\b`).
+                if !refreshed.iter().any(|d| paths_equal(d, &self.path)) {
+                    self.load_children();
+                    refreshed.push(self.path.clone());
+                }
+            }
         }
     }
 }
@@ -527,6 +604,38 @@ impl FileExplorer {
         if let Some(parent) = p.parent() {
             if !parent.as_os_str().is_empty() {
                 self.open_folder(parent.to_path_buf());
+            }
+        }
+    }
+
+    /// Updates loaded explorer tree nodes for a batch of filesystem watcher events while leaving
+    /// unexpanded subdirectories lazy and preserving active inline edits unless their target vanished.
+    pub fn refresh_watched_paths(&mut self, paths: &[PathBuf], rescan_all: bool) {
+        if let Some(root) = &mut self.tree_root {
+            if rescan_all {
+                root.refresh_loaded_subtree();
+            } else {
+                let mut refreshed = Vec::new();
+                for path in paths {
+                    root.refresh_for_path(path, &mut refreshed);
+                }
+            }
+        }
+
+        if let Some((ref sel_path, _)) = self.selected_node {
+            if !sel_path.exists() {
+                self.selected_node = None;
+            }
+        }
+
+        if let Some(ref edit) = self.pending_tree_edit {
+            let missing = match &edit.kind {
+                TreeEditKind::NewFolder { parent_path }
+                | TreeEditKind::NewFile { parent_path } => !parent_path.exists(),
+                TreeEditKind::Rename { target_path, .. } => !target_path.exists(),
+            };
+            if missing {
+                self.pending_tree_edit = None;
             }
         }
     }

@@ -6,6 +6,7 @@
 //! - `editor`: High-performance custom text editor widget with full AccessKit accessibility support.
 //! - `explorer`: File tree sidebar, inline filesystem operations (create/rename), and recycle bin support.
 //! - `terminal`: Embedded ConPTY terminal pane with VT100 emulation.
+//! - `watcher`: Background filesystem watcher for syncing tree and open files with disk.
 
 pub mod app;
 pub mod document;
@@ -13,6 +14,7 @@ pub mod editor;
 pub mod explorer;
 pub mod piece_table;
 pub mod terminal;
+pub mod watcher;
 
 pub use app::TextEditor;
 pub use piece_table::PieceTable;

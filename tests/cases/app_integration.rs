@@ -614,3 +614,15 @@ fn test_ctrl_tab_switches_tabs_between_editor_and_terminal() {
 
     let _ = fs::remove_dir_all(&temp_dir);
 }
+
+#[test]
+fn test_app_icon_assets_valid() {
+    let icon = eframe::icon_data::from_png_bytes(include_bytes!("../../assets/icon.png"))
+        .expect("assets/icon.png must decode cleanly");
+    assert_eq!((icon.width, icon.height), (256, 256));
+    assert_eq!(icon.rgba.len(), 256 * 256 * 4);
+
+    let ico = include_bytes!("../../assets/rusted.ico");
+    assert!(ico.len() > 22);
+    assert_eq!(&ico[0..6], &[0, 0, 1, 0, 4, 0]);
+}

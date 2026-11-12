@@ -660,6 +660,23 @@ impl PieceTable {
         writer.flush()
     }
 
+    /// Compares the piece table contents against `other` without allocating a flattened string.
+    pub fn eq_str(&self, other: &str) -> bool {
+        if self.total_bytes != other.len() {
+            return false;
+        }
+        let mut offset = 0usize;
+        for p in self.pieces.iter() {
+            let chunk = p.get_text(&self.original, &self.added);
+            let end = offset + chunk.len();
+            if &other.as_bytes()[offset..end] != chunk.as_bytes() {
+                return false;
+            }
+            offset = end;
+        }
+        true
+    }
+
     /// Converts a character index to a byte offset in the document.
     pub fn char_to_byte(&self, char_idx: usize) -> usize {
         if char_idx == 0 {

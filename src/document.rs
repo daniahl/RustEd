@@ -4,8 +4,9 @@
 //! gutter line numbers, and the interactive Find / Find-Next dialog.
 
 use crate::{
-    editor::{self, FastEditor},
+    editor::{self, EditorBuffer, FastEditor},
     piece_table::PieceTable,
+    watcher::{path_starts_with, paths_equal},
 };
 use eframe::egui;
 use egui_extras::syntax_highlighting::{self, CodeTheme};
@@ -14,9 +15,67 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::Arc,
+    time::SystemTime,
 };
 
 pub const MAX_HIGHLIGHT_BYTES: usize = 16_384;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DiskStamp {
+    pub len: u64,
+    pub modified: Option<SystemTime>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExternalConflict {
+    ModifiedOnDisk,
+    DeletedOnDisk,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DiskSyncResult {
+    Unchanged,
+    Reloaded,
+    ClosedDeleted,
+    Conflict(ExternalConflict),
+    RetryTransientError,
+}
+
+fn read_disk_stamp(path: &Path) -> Option<DiskStamp> {
+    fs::metadata(path).ok().map(|m| DiskStamp {
+        len: m.len(),
+        modified: m.modified().ok(),
+    })
+}
+
+fn is_transient_fs_error(err: &std::io::Error) -> bool {
+    if err.kind() == std::io::ErrorKind::WouldBlock {
+        return true;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        matches!(err.raw_os_error(), Some(32) | Some(33))
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        false
+    }
+}
+
+fn take_unsaved_entry(
+    map: &mut HashMap<PathBuf, UnsavedFileState>,
+    target: &Path,
+) -> Option<UnsavedFileState> {
+    if let Some(exact) = map.remove(target) {
+        return Some(exact);
+    }
+    let key = map.keys().find(|k| paths_equal(k, target)).cloned()?;
+    map.remove(&key)
+}
+
+fn has_unsaved_entry(map: &HashMap<PathBuf, UnsavedFileState>, target: &Path) -> bool {
+    map.contains_key(target) || map.keys().any(|k| paths_equal(k, target))
+}
 
 pub struct UnsavedFileState {
     pub text: PieceTable,
@@ -56,6 +115,8 @@ pub struct Document {
     pub find_query: String,
     pub focus_find_input: bool,
     pub focus_editor: bool,
+    pub disk_stamp: Option<DiskStamp>,
+    pub external_conflict: Option<ExternalConflict>,
 }
 
 impl Default for Document {
@@ -90,6 +151,8 @@ impl Document {
             find_query: String::new(),
             focus_find_input: false,
             focus_editor: false,
+            disk_stamp: None,
+            external_conflict: None,
         }
     }
 
@@ -106,8 +169,8 @@ impl Document {
     }
 
     pub fn is_file_dirty(&self, path: &Path) -> bool {
-        (self.is_current_dirty && Path::new(&self.path) == path)
-            || (!self.unsaved_files.is_empty() && self.unsaved_files.contains_key(path))
+        (self.is_current_dirty && !self.path.is_empty() && paths_equal(Path::new(&self.path), path))
+            || (!self.unsaved_files.is_empty() && has_unsaved_entry(&self.unsaved_files, path))
     }
 
     pub fn save_current_file(&mut self) {
@@ -116,28 +179,31 @@ impl Document {
                 .and_then(|file| self.text.write_to(std::io::BufWriter::new(file)))
                 .is_ok();
             if write_ok {
+                let path = Path::new(&self.path).to_path_buf();
                 self.saved_text.clear();
                 self.saved_revision = self.text_revision;
                 self.is_current_dirty = false;
-                self.unsaved_files.remove(Path::new(&self.path));
+                self.disk_stamp = read_disk_stamp(&path);
+                self.external_conflict = None;
+                take_unsaved_entry(&mut self.unsaved_files, &path);
             }
         }
     }
 
     pub fn open_file(&mut self, ctx: &egui::Context, chosen: PathBuf) {
-        if !self.path.is_empty() && Path::new(&self.path) == chosen {
+        if !self.path.is_empty() && paths_equal(Path::new(&self.path), &chosen) {
             return;
         }
 
         enum IncomingFile {
             Unsaved(UnsavedFileState),
-            FromDisk(String),
+            FromDisk(String, Option<DiskStamp>),
         }
 
-        let incoming = if let Some(unsaved) = self.unsaved_files.remove(&chosen) {
+        let incoming = if let Some(unsaved) = take_unsaved_entry(&mut self.unsaved_files, &chosen) {
             IncomingFile::Unsaved(unsaved)
         } else if let Ok(content) = fs::read_to_string(&chosen) {
-            IncomingFile::FromDisk(content)
+            IncomingFile::FromDisk(content, read_disk_stamp(&chosen))
         } else {
             return;
         };
@@ -167,6 +233,7 @@ impl Document {
         self.path = chosen.to_string_lossy().into_owned();
         self.text_revision = self.text_revision.wrapping_add(1);
         self.gutter_cache = None;
+        self.external_conflict = None;
 
         match incoming {
             IncomingFile::Unsaved(unsaved) => {
@@ -178,6 +245,7 @@ impl Document {
                 self.cursor_line = unsaved.cursor_line;
                 self.cursor_col = unsaved.cursor_col;
                 self.selected_chars = unsaved.selected_chars;
+                self.disk_stamp = read_disk_stamp(&chosen);
                 self.refresh_file_metadata();
 
                 ctx.data_mut(|d| {
@@ -186,7 +254,7 @@ impl Document {
                     d.insert_temp(editor_id, st);
                 });
             }
-            IncomingFile::FromDisk(content) => {
+            IncomingFile::FromDisk(content, stamp) => {
                 self.saved_text.clear();
                 self.text = PieceTable::from_string(content);
                 self.line_count = self.text.line_count();
@@ -195,6 +263,7 @@ impl Document {
                 self.cursor_line = 1;
                 self.cursor_col = 1;
                 self.selected_chars = 0;
+                self.disk_stamp = stamp;
                 self.refresh_file_metadata();
 
                 ctx.data_mut(|d| {
@@ -209,16 +278,130 @@ impl Document {
         }
     }
 
+    /// Synchronizes the open document with disk when an external change is reported.
+    ///
+    /// Clean buffers reload in place while clamping the caret position; dirty buffers set
+    /// `external_conflict` instead of overwriting unsaved user edits unless `force` is true.
+    pub fn sync_with_disk(&mut self, ctx: &egui::Context, force: bool) -> DiskSyncResult {
+        if self.path.is_empty() {
+            return DiskSyncResult::Unchanged;
+        }
+        let path = PathBuf::from(&self.path);
+        let meta = match fs::metadata(&path) {
+            Ok(m) => m,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                if !self.is_current_dirty {
+                    self.close_if_deleted(ctx, &path, false);
+                    ctx.request_repaint();
+                    return DiskSyncResult::ClosedDeleted;
+                }
+                self.external_conflict = Some(ExternalConflict::DeletedOnDisk);
+                ctx.request_repaint();
+                return DiskSyncResult::Conflict(ExternalConflict::DeletedOnDisk);
+            }
+            Err(err) if is_transient_fs_error(&err) => {
+                return DiskSyncResult::RetryTransientError;
+            }
+            Err(_) => return DiskSyncResult::Unchanged,
+        };
+
+        let stamp = DiskStamp {
+            len: meta.len(),
+            modified: meta.modified().ok(),
+        };
+        if !force && self.disk_stamp.as_ref() == Some(&stamp) {
+            return DiskSyncResult::Unchanged;
+        }
+
+        let content = match fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                if !self.is_current_dirty {
+                    self.close_if_deleted(ctx, &path, false);
+                    ctx.request_repaint();
+                    return DiskSyncResult::ClosedDeleted;
+                }
+                self.external_conflict = Some(ExternalConflict::DeletedOnDisk);
+                ctx.request_repaint();
+                return DiskSyncResult::Conflict(ExternalConflict::DeletedOnDisk);
+            }
+            Err(err) if is_transient_fs_error(&err) => {
+                return DiskSyncResult::RetryTransientError;
+            }
+            Err(_) => return DiskSyncResult::Unchanged,
+        };
+
+        if self.text.eq_str(&content) {
+            self.disk_stamp = Some(stamp);
+            self.external_conflict = None;
+            return DiskSyncResult::Unchanged;
+        }
+
+        if self.is_current_dirty && !force {
+            self.external_conflict = Some(ExternalConflict::ModifiedOnDisk);
+            ctx.request_repaint();
+            return DiskSyncResult::Conflict(ExternalConflict::ModifiedOnDisk);
+        }
+
+        self.apply_disk_reload(ctx, content, Some(stamp));
+        DiskSyncResult::Reloaded
+    }
+
+    fn apply_disk_reload(
+        &mut self,
+        ctx: &egui::Context,
+        content: String,
+        stamp: Option<DiskStamp>,
+    ) {
+        self.saved_text.clear();
+        self.text = PieceTable::from_string(content);
+        self.text_revision = self.text_revision.wrapping_add(1);
+        self.saved_revision = self.text_revision;
+        self.is_current_dirty = false;
+        self.gutter_cache = None;
+        self.line_count = self.text.line_count();
+        self.disk_stamp = stamp;
+        self.external_conflict = None;
+        self.refresh_file_metadata();
+
+        let editor_id = egui::Id::new("code_editor");
+        let total_chars = self.text.char_count();
+        let mut st = ctx
+            .data_mut(|d| d.get_temp::<editor::FastEditorState>(editor_id))
+            .unwrap_or_default();
+        let prev_range = st
+            .cursor
+            .char_range()
+            .unwrap_or_else(|| egui::text::CCursorRange::one(egui::text::CCursor::new(0)));
+        let primary_idx = prev_range.primary.index.min(total_chars);
+        let secondary_idx = prev_range.secondary.index.min(total_chars);
+        st.cursor.set_char_range(Some(egui::text::CCursorRange::two(
+            egui::text::CCursor::new(secondary_idx),
+            egui::text::CCursor::new(primary_idx),
+        )));
+        st.layout_cache = None;
+        st.virtual_layout_cache = None;
+        st.accesskit_row_cache = None;
+        st.last_undo_snapshot = Some(self.text.undo_snapshot());
+
+        let (line, col) = self.text.char_to_line_col(primary_idx);
+        self.cursor_line = line + 1;
+        self.cursor_col = col + 1;
+        self.selected_chars = primary_idx.abs_diff(secondary_idx);
+        ctx.data_mut(|d| d.insert_temp(editor_id, st));
+        ctx.request_repaint();
+    }
+
     pub fn close_if_deleted(&mut self, ctx: &egui::Context, path: &Path, is_dir: bool) {
         if is_dir {
-            self.unsaved_files.retain(|k, _| !k.starts_with(path));
+            self.unsaved_files.retain(|k, _| !path_starts_with(k, path));
         } else {
-            self.unsaved_files.remove(path);
+            take_unsaved_entry(&mut self.unsaved_files, path);
         }
 
         if !self.path.is_empty() {
             let cur = Path::new(&self.path);
-            if cur == path || (is_dir && cur.starts_with(path)) {
+            if paths_equal(cur, path) || (is_dir && path_starts_with(cur, path)) {
                 self.path.clear();
                 self.text.clear();
                 self.saved_text.clear();
@@ -230,6 +413,8 @@ impl Document {
                 self.cursor_line = 1;
                 self.cursor_col = 1;
                 self.selected_chars = 0;
+                self.disk_stamp = None;
+                self.external_conflict = None;
                 self.refresh_file_metadata();
 
                 let editor_id = egui::Id::new("code_editor");
@@ -558,12 +743,56 @@ impl Document {
     }
 
     pub fn show_editor(&mut self, ctx: &egui::Context, panel_frame: egui::Frame) {
-        let language = self.language_ext.as_str();
-        let language_salt = self.language_salt;
-        let text_revision = self.text_revision;
-
         let mut editor_text_changed = false;
         egui::CentralPanel::default().frame(panel_frame).show(ctx, |ui| {
+            if let Some(conflict) = self.external_conflict {
+                let mut do_reload = false;
+                let mut do_close = false;
+                let mut do_dismiss = false;
+                ui.horizontal(|ui| {
+                    let msg = match conflict {
+                        ExternalConflict::ModifiedOnDisk => {
+                            "File changed on disk while you have unsaved edits."
+                        }
+                        ExternalConflict::DeletedOnDisk => {
+                            "File was deleted on disk while you have unsaved edits."
+                        }
+                    };
+                    ui.colored_label(ui.visuals().warn_fg_color, msg);
+                    match conflict {
+                        ExternalConflict::ModifiedOnDisk => {
+                            if ui.button("Reload from disk").clicked() {
+                                do_reload = true;
+                            }
+                            if ui.button("Keep my edits").clicked() {
+                                do_dismiss = true;
+                            }
+                        }
+                        ExternalConflict::DeletedOnDisk => {
+                            if ui.button("Close file").clicked() {
+                                do_close = true;
+                            }
+                            if ui.button("Keep in editor").clicked() {
+                                do_dismiss = true;
+                            }
+                        }
+                    }
+                });
+                ui.separator();
+                if do_reload {
+                    self.sync_with_disk(ctx, true);
+                } else if do_close {
+                    let p = PathBuf::from(&self.path);
+                    self.close_if_deleted(ctx, &p, false);
+                } else if do_dismiss {
+                    self.external_conflict = None;
+                }
+            }
+
+            let language = self.language_ext.as_str();
+            let language_salt = self.language_salt;
+            let text_revision = self.text_revision;
+
             let theme = CodeTheme::from_memory(ui.ctx(), ui.style());
             let font_id = egui::TextStyle::Monospace.resolve(ui.style());
             let text_color = ui.visuals().widgets.inactive.text_color();
