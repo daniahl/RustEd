@@ -17,6 +17,15 @@ pub enum BufferType {
     Added,
 }
 
+const CHECKPOINT_STRIDE: usize = 32;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LineCheckpoint {
+    pub nl_count: usize,
+    pub byte_offset: usize,
+    pub char_offset: usize,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Piece {
     pub buffer: BufferType,
@@ -24,6 +33,8 @@ pub struct Piece {
     pub length: usize,        // Byte length of this piece
     pub char_count: usize,    // Unicode character (code point) count in this piece
     pub line_feed_cnt: usize, // Number of '\n' in this piece
+    pub char_start: usize,    // Starting character offset in the underlying buffer
+    pub nl_start: usize,      // Number of '\n' before `start` in the underlying buffer
 }
 
 impl Piece {
@@ -37,6 +48,16 @@ impl Piece {
 
     /// Finds the byte offset within this piece corresponding to `char_offset` (relative to the piece).
     pub fn char_to_byte_offset(&self, original: &str, added: &str, char_offset: usize) -> usize {
+        self.char_to_byte_offset_indexed(original, added, &[], char_offset)
+    }
+
+    pub fn char_to_byte_offset_indexed(
+        &self,
+        original: &str,
+        added: &str,
+        orig_checkpoints: &[LineCheckpoint],
+        char_offset: usize,
+    ) -> usize {
         if char_offset == 0 {
             return 0;
         }
@@ -47,6 +68,26 @@ impl Piece {
         if self.char_count == self.length {
             return char_offset;
         }
+        if self.buffer == BufferType::Original && !orig_checkpoints.is_empty() {
+            let abs_char = self.char_start + char_offset;
+            let idx = orig_checkpoints.partition_point(|cp| cp.char_offset <= abs_char);
+            if idx > 0 {
+                let cp = &orig_checkpoints[idx - 1];
+                if cp.char_offset >= self.char_start && cp.byte_offset >= self.start {
+                    let rem_chars = abs_char - cp.char_offset;
+                    let local_byte = cp.byte_offset - self.start;
+                    if rem_chars == 0 {
+                        return local_byte;
+                    }
+                    let tail = &original[cp.byte_offset..self.start + self.length];
+                    return tail
+                        .char_indices()
+                        .nth(rem_chars)
+                        .map(|(b, _)| local_byte + b)
+                        .unwrap_or(self.length);
+                }
+            }
+        }
         let text = self.get_text(original, added);
         text.char_indices()
             .nth(char_offset)
@@ -56,12 +97,52 @@ impl Piece {
 
     /// Splits this piece into two pieces at `char_offset` (relative to the piece).
     pub fn split_at_char(&self, original: &str, added: &str, char_offset: usize) -> (Piece, Piece) {
-        let byte_offset = self.char_to_byte_offset(original, added, char_offset);
-        let text = self.get_text(original, added);
-        let left_text = &text[..byte_offset];
-        let _right_text = &text[byte_offset..];
+        self.split_at_char_indexed(original, added, &[], char_offset)
+    }
 
-        let left_lf = left_text.bytes().filter(|&b| b == b'\n').count();
+    pub fn split_at_char_indexed(
+        &self,
+        original: &str,
+        added: &str,
+        orig_checkpoints: &[LineCheckpoint],
+        char_offset: usize,
+    ) -> (Piece, Piece) {
+        let byte_offset =
+            self.char_to_byte_offset_indexed(original, added, orig_checkpoints, char_offset);
+        let left_lf = if self.line_feed_cnt == 0 {
+            0
+        } else if self.buffer == BufferType::Original && !orig_checkpoints.is_empty() {
+            let abs_byte = self.start + byte_offset;
+            let idx = orig_checkpoints.partition_point(|cp| cp.byte_offset <= abs_byte);
+            if idx > 0 && orig_checkpoints[idx - 1].byte_offset >= self.start {
+                let cp = &orig_checkpoints[idx - 1];
+                let rem_lf = original.as_bytes()[cp.byte_offset..abs_byte]
+                    .iter()
+                    .filter(|&&b| b == b'\n')
+                    .count();
+                (cp.nl_count - self.nl_start) + rem_lf
+            } else {
+                let text = self.get_text(original, added);
+                text.as_bytes()[..byte_offset]
+                    .iter()
+                    .filter(|&&b| b == b'\n')
+                    .count()
+            }
+        } else {
+            let text = self.get_text(original, added);
+            if byte_offset <= self.length / 2 {
+                text.as_bytes()[..byte_offset]
+                    .iter()
+                    .filter(|&&b| b == b'\n')
+                    .count()
+            } else {
+                let right_lf = text.as_bytes()[byte_offset..]
+                    .iter()
+                    .filter(|&&b| b == b'\n')
+                    .count();
+                self.line_feed_cnt - right_lf
+            }
+        };
         let right_lf = self.line_feed_cnt - left_lf;
 
         let left = Piece {
@@ -70,6 +151,8 @@ impl Piece {
             length: byte_offset,
             char_count: char_offset,
             line_feed_cnt: left_lf,
+            char_start: self.char_start,
+            nl_start: self.nl_start,
         };
         let right = Piece {
             buffer: self.buffer,
@@ -77,6 +160,8 @@ impl Piece {
             length: self.length - byte_offset,
             char_count: self.char_count - char_offset,
             line_feed_cnt: right_lf,
+            char_start: self.char_start + char_offset,
+            nl_start: self.nl_start + left_lf,
         };
         (left, right)
     }
@@ -85,7 +170,8 @@ impl Piece {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PieceTableSnapshot {
     original: Arc<str>,
-    pieces: Arc<[Piece]>,
+    orig_checkpoints: Arc<[LineCheckpoint]>,
+    pieces: Arc<Vec<Piece>>,
     total_chars: usize,
     total_bytes: usize,
     total_line_feeds: usize,
@@ -93,8 +179,14 @@ pub struct PieceTableSnapshot {
 
 pub struct PieceTable {
     original: Arc<str>,
+    orig_checkpoints: Arc<[LineCheckpoint]>,
     added: String,
-    pieces: Vec<Piece>,
+    added_chars: usize,
+    added_lfs: usize,
+    /// Copy-on-write piece list: snapshots share it in O(1); edits call Arc::make_mut.
+    pieces: Arc<Vec<Piece>>,
+    /// Locality hint (piece_idx, char_start_of_piece) for the last lookup/edit.
+    hint: Cell<(usize, usize)>,
     total_chars: usize,
     total_bytes: usize,
     total_line_feeds: usize,
@@ -110,8 +202,12 @@ impl Clone for PieceTable {
     fn clone(&self) -> Self {
         Self {
             original: Arc::clone(&self.original),
+            orig_checkpoints: Arc::clone(&self.orig_checkpoints),
             added: self.added.clone(),
-            pieces: self.pieces.clone(),
+            added_chars: self.added_chars,
+            added_lfs: self.added_lfs,
+            pieces: Arc::clone(&self.pieces),
+            hint: Cell::new((0, 0)),
             total_chars: self.total_chars,
             total_bytes: self.total_bytes,
             total_line_feeds: self.total_line_feeds,
@@ -125,6 +221,46 @@ impl Default for PieceTable {
     fn default() -> Self {
         Self::new()
     }
+}
+
+fn scan_str_with_checkpoints(text: &str) -> (usize, usize, Vec<LineCheckpoint>) {
+    let bytes = text.as_bytes();
+    let mut char_count = 0usize;
+    let mut line_feed_cnt = 0usize;
+    let mut checkpoints = Vec::new();
+
+    for (i, &b) in bytes.iter().enumerate() {
+        if (b & 0xC0) != 0x80 {
+            char_count += 1;
+        }
+        if b == b'\n' {
+            line_feed_cnt += 1;
+            if line_feed_cnt % CHECKPOINT_STRIDE == 0 {
+                checkpoints.push(LineCheckpoint {
+                    nl_count: line_feed_cnt,
+                    byte_offset: i + 1,
+                    char_offset: char_count,
+                });
+            }
+        }
+    }
+
+    (char_count, line_feed_cnt, checkpoints)
+}
+
+#[inline]
+fn scan_str_counts(text: &str) -> (usize, usize) {
+    let mut char_count = 0usize;
+    let mut line_feed_cnt = 0usize;
+    for &b in text.as_bytes() {
+        if (b & 0xC0) != 0x80 {
+            char_count += 1;
+        }
+        if b == b'\n' {
+            line_feed_cnt += 1;
+        }
+    }
+    (char_count, line_feed_cnt)
 }
 
 impl PieceTable {
@@ -141,9 +277,8 @@ impl PieceTable {
     }
 
     fn from_arc_str(original: Arc<str>) -> Self {
-        let char_count = original.chars().count();
         let byte_len = original.len();
-        let line_feed_cnt = original.bytes().filter(|&b| b == b'\n').count();
+        let (char_count, line_feed_cnt, checkpoints) = scan_str_with_checkpoints(&original);
 
         let mut pieces = Vec::new();
         if byte_len > 0 {
@@ -153,13 +288,19 @@ impl PieceTable {
                 length: byte_len,
                 char_count,
                 line_feed_cnt,
+                char_start: 0,
+                nl_start: 0,
             });
         }
 
         Self {
             original,
+            orig_checkpoints: Arc::from(checkpoints),
             added: String::new(),
-            pieces,
+            added_chars: 0,
+            added_lfs: 0,
+            pieces: Arc::new(pieces),
+            hint: Cell::new((0, 0)),
             total_chars: char_count,
             total_bytes: byte_len,
             total_line_feeds: line_feed_cnt,
@@ -172,7 +313,8 @@ impl PieceTable {
     pub fn snapshot(&self) -> PieceTableSnapshot {
         PieceTableSnapshot {
             original: Arc::clone(&self.original),
-            pieces: Arc::from(self.pieces.as_slice()),
+            orig_checkpoints: Arc::clone(&self.orig_checkpoints),
+            pieces: Arc::clone(&self.pieces),
             total_chars: self.total_chars,
             total_bytes: self.total_bytes,
             total_line_feeds: self.total_line_feeds,
@@ -187,8 +329,9 @@ impl PieceTable {
             .all(|p| p.buffer != BufferType::Added || p.start + p.length <= self.added.len())
         {
             self.original = Arc::clone(&snapshot.original);
-            self.pieces.clear();
-            self.pieces.extend_from_slice(&snapshot.pieces);
+            self.orig_checkpoints = Arc::clone(&snapshot.orig_checkpoints);
+            self.pieces = Arc::clone(&snapshot.pieces);
+            self.hint.set((0, 0));
             self.total_chars = snapshot.total_chars;
             self.total_bytes = snapshot.total_bytes;
             self.total_line_feeds = snapshot.total_line_feeds;
@@ -223,8 +366,12 @@ impl PieceTable {
 
     pub fn clear(&mut self) {
         self.original = "".into();
+        self.orig_checkpoints = Arc::from(&[][..]);
         self.added.clear();
-        self.pieces.clear();
+        self.added_chars = 0;
+        self.added_lfs = 0;
+        self.pieces = Arc::new(Vec::new());
+        self.hint.set((0, 0));
         self.total_chars = 0;
         self.total_bytes = 0;
         self.total_line_feeds = 0;
@@ -232,6 +379,28 @@ impl PieceTable {
             (*self.cached_text.get()).clear();
         }
         self.cached_dirty.set(false);
+    }
+
+    /// Finds the first piece whose end is >= `target` (char index, `<= total_chars`).
+    /// Returns `(piece_idx, char_start_of_piece)`. Resumes from the last lookup so that
+    /// localized editing is O(1) amortized instead of O(P).
+    fn locate_char(&self, target: usize) -> (usize, usize) {
+        let pieces = &self.pieces[..];
+        let (mut idx, mut start) = self.hint.get();
+        if idx >= pieces.len() || start > self.total_chars {
+            idx = 0;
+            start = 0;
+        }
+        while idx > 0 && target <= start {
+            idx -= 1;
+            start -= pieces[idx].char_count;
+        }
+        while idx + 1 < pieces.len() && target > start + pieces[idx].char_count {
+            start += pieces[idx].char_count;
+            idx += 1;
+        }
+        self.hint.set((idx, start));
+        (idx, start)
     }
 
     /// Inserts `text` at the character index `char_index`.
@@ -242,128 +411,95 @@ impl PieceTable {
         }
 
         let text_bytes = text.len();
-        let text_chars = text.chars().count();
-        let text_lf = text.bytes().filter(|&b| b == b'\n').count();
+        let (text_chars, text_lf) = scan_str_counts(text);
 
         let add_start = self.added.len();
+        let add_char_start = self.added_chars;
+        let add_nl_start = self.added_lfs;
         self.added.push_str(text);
+        self.added_chars += text_chars;
+        self.added_lfs += text_lf;
 
         let target_char = char_index.min(self.total_chars);
+        let new_piece = Piece {
+            buffer: BufferType::Added,
+            start: add_start,
+            length: text_bytes,
+            char_count: text_chars,
+            line_feed_cnt: text_lf,
+            char_start: add_char_start,
+            nl_start: add_nl_start,
+        };
 
-        if self.pieces.is_empty() {
-            self.pieces.push(Piece {
-                buffer: BufferType::Added,
-                start: add_start,
-                length: text_bytes,
-                char_count: text_chars,
-                line_feed_cnt: text_lf,
-            });
+        let (target_idx, curr_char) = if self.pieces.is_empty() || target_char == 0 {
+            (0, 0)
+        } else {
+            self.locate_char(target_char)
+        };
+        let pieces = Arc::make_mut(&mut self.pieces);
+        let mut new_hint = (target_idx, curr_char);
+
+        if pieces.is_empty() {
+            pieces.push(new_piece);
+            new_hint = (0, 0);
         } else if target_char == self.total_chars {
-            // Append at the end: check VS Code consecutive insert optimization
-            let last_idx = self.pieces.len() - 1;
-            let last = &mut self.pieces[last_idx];
+            // Append at the end: extend the previous Added piece when contiguous.
+            let last_idx = pieces.len() - 1;
+            let last = &mut pieces[last_idx];
             if last.buffer == BufferType::Added && last.start + last.length == add_start {
-                // Extend the existing piece without allocating a new piece descriptor
                 last.length += text_bytes;
                 last.char_count += text_chars;
                 last.line_feed_cnt += text_lf;
+                new_hint = (last_idx, self.total_chars + text_chars - last.char_count);
             } else {
-                self.pieces.push(Piece {
-                    buffer: BufferType::Added,
-                    start: add_start,
-                    length: text_bytes,
-                    char_count: text_chars,
-                    line_feed_cnt: text_lf,
-                });
+                pieces.push(new_piece);
+                new_hint = (last_idx + 1, self.total_chars);
             }
         } else if target_char == 0 {
-            // Prepend at the beginning
-            self.pieces.insert(
-                0,
-                Piece {
-                    buffer: BufferType::Added,
-                    start: add_start,
-                    length: text_bytes,
-                    char_count: text_chars,
-                    line_feed_cnt: text_lf,
-                },
-            );
+            pieces.insert(0, new_piece);
+            new_hint = (0, 0);
         } else {
-            // Find target piece
-            let mut curr_char = 0;
-            let mut target_idx = 0;
-            for (idx, piece) in self.pieces.iter().enumerate() {
-                if target_char <= curr_char + piece.char_count {
-                    target_idx = idx;
-                    break;
-                }
-                curr_char += piece.char_count;
-            }
-
             let offset_in_piece = target_char - curr_char;
-            let piece = self.pieces[target_idx];
+            let piece = pieces[target_idx];
 
             if offset_in_piece == 0 {
-                // Boundary between pieces: check consecutive insert optimization on previous piece
+                let mut merged = false;
                 if target_idx > 0 {
-                    let prev = &mut self.pieces[target_idx - 1];
+                    let prev = &mut pieces[target_idx - 1];
                     if prev.buffer == BufferType::Added && prev.start + prev.length == add_start {
                         prev.length += text_bytes;
                         prev.char_count += text_chars;
                         prev.line_feed_cnt += text_lf;
-                        self.total_chars += text_chars;
-                        self.total_bytes += text_bytes;
-                        self.total_line_feeds += text_lf;
-                        self.cached_dirty.set(true);
-                        return text_chars;
+                        new_hint = (target_idx - 1, curr_char - (prev.char_count - text_chars));
+                        merged = true;
                     }
                 }
-                self.pieces.insert(
-                    target_idx,
-                    Piece {
-                        buffer: BufferType::Added,
-                        start: add_start,
-                        length: text_bytes,
-                        char_count: text_chars,
-                        line_feed_cnt: text_lf,
-                    },
-                );
+                if !merged {
+                    pieces.insert(target_idx, new_piece);
+                }
             } else if offset_in_piece == piece.char_count {
-                // At the end of target piece: check consecutive insert optimization
                 if piece.buffer == BufferType::Added && piece.start + piece.length == add_start {
-                    let target_piece = &mut self.pieces[target_idx];
+                    let target_piece = &mut pieces[target_idx];
                     target_piece.length += text_bytes;
                     target_piece.char_count += text_chars;
                     target_piece.line_feed_cnt += text_lf;
                 } else {
-                    self.pieces.insert(
-                        target_idx + 1,
-                        Piece {
-                            buffer: BufferType::Added,
-                            start: add_start,
-                            length: text_bytes,
-                            char_count: text_chars,
-                            line_feed_cnt: text_lf,
-                        },
-                    );
+                    pieces.insert(target_idx + 1, new_piece);
                 }
             } else {
-                // Inside the piece: split into left, new, right
-                let (left, right) =
-                    piece.split_at_char(&self.original, &self.added, offset_in_piece);
-                let new_piece = Piece {
-                    buffer: BufferType::Added,
-                    start: add_start,
-                    length: text_bytes,
-                    char_count: text_chars,
-                    line_feed_cnt: text_lf,
-                };
-                self.pieces[target_idx] = left;
-                self.pieces.insert(target_idx + 1, new_piece);
-                self.pieces.insert(target_idx + 2, right);
+                let (left, right) = piece.split_at_char_indexed(
+                    &self.original,
+                    &self.added,
+                    &self.orig_checkpoints,
+                    offset_in_piece,
+                );
+                pieces[target_idx] = left;
+                pieces.insert(target_idx + 1, new_piece);
+                pieces.insert(target_idx + 2, right);
             }
         }
 
+        self.hint.set(new_hint);
         self.total_chars += text_chars;
         self.total_bytes += text_bytes;
         self.total_line_feeds += text_lf;
@@ -373,6 +509,9 @@ impl PieceTable {
     }
 
     /// Deletes characters in the range `char_range`.
+    ///
+    /// Only the pieces overlapping the range are touched (via a single `splice`), the totals
+    /// are adjusted incrementally and only the seam is coalesced.
     pub fn delete(&mut self, char_range: Range<usize>) {
         let start = char_range.start.min(self.total_chars);
         let end = char_range.end.min(self.total_chars);
@@ -381,44 +520,81 @@ impl PieceTable {
             return;
         }
 
-        let mut new_pieces = Vec::with_capacity(self.pieces.len());
-        let mut curr_char = 0;
+        // First piece that overlaps [start, end): the first with end > start.
+        let (mut first, mut first_start) = self.locate_char(start);
+        while first < self.pieces.len() && first_start + self.pieces[first].char_count <= start {
+            first_start += self.pieces[first].char_count;
+            first += 1;
+        }
 
-        for piece in &self.pieces {
-            let piece_start = curr_char;
-            let piece_end = curr_char + piece.char_count;
-            curr_char = piece_end;
+        // Find the exclusive upper bound of overlapping pieces.
+        let mut last = first;
+        let mut last_start = first_start;
+        while last < self.pieces.len() && last_start < end {
+            last_start += self.pieces[last].char_count;
+            last += 1;
+        }
+        // `last_start` is now the char end of piece `last - 1`.
+        let last_piece_start = last_start - self.pieces[last - 1].char_count;
 
-            if piece_end <= start || piece_start >= end {
-                // Completely outside deleted range
-                new_pieces.push(*piece);
-            } else if piece_start >= start && piece_end <= end {
-                // Completely inside deleted range -> drop it
+        let mut replacement: [Option<Piece>; 2] = [None, None];
+        if first_start < start {
+            let (left, _) = self.pieces[first].split_at_char_indexed(
+                &self.original,
+                &self.added,
+                &self.orig_checkpoints,
+                start - first_start,
+            );
+            replacement[0] = Some(left);
+        }
+        if last_start > end {
+            let (_, right) = self.pieces[last - 1].split_at_char_indexed(
+                &self.original,
+                &self.added,
+                &self.orig_checkpoints,
+                end - last_piece_start,
+            );
+            replacement[1] = Some(right);
+        }
+
+        let (mut old_bytes, mut old_lfs) = (0usize, 0usize);
+        for p in &self.pieces[first..last] {
+            old_bytes += p.length;
+            old_lfs += p.line_feed_cnt;
+        }
+        let (mut new_bytes, mut new_lfs) = (0usize, 0usize);
+        for p in replacement.iter().flatten() {
+            new_bytes += p.length;
+            new_lfs += p.line_feed_cnt;
+        }
+
+        let repl_len = replacement.iter().flatten().count();
+        let pieces = Arc::make_mut(&mut self.pieces);
+        pieces.splice(first..last, replacement.into_iter().flatten());
+
+        // Coalesce only around the seam.
+        let mut merged = false;
+        let mut i = first.saturating_sub(1);
+        let mut upper = first + repl_len;
+        while i + 1 < pieces.len() && i < upper {
+            let next = pieces[i + 1];
+            let curr = &mut pieces[i];
+            if curr.buffer == next.buffer && curr.start + curr.length == next.start {
+                curr.length += next.length;
+                curr.char_count += next.char_count;
+                curr.line_feed_cnt += next.line_feed_cnt;
+                pieces.remove(i + 1);
+                upper = upper.saturating_sub(1);
+                merged = true;
             } else {
-                // Overlaps at left boundary
-                if piece_start < start {
-                    let left_len = start - piece_start;
-                    let (left, _) =
-                        piece.split_at_char(&self.original, &self.added, left_len);
-                    new_pieces.push(left);
-                }
-                // Overlaps at right boundary
-                if piece_end > end {
-                    let right_skip = end - piece_start;
-                    let (_, right) =
-                        piece.split_at_char(&self.original, &self.added, right_skip);
-                    new_pieces.push(right);
-                }
+                i += 1;
             }
         }
 
-        self.pieces = new_pieces;
-        self.coalesce();
-
-        // Recalculate totals from surviving pieces
-        self.total_chars = self.pieces.iter().map(|p| p.char_count).sum();
-        self.total_bytes = self.pieces.iter().map(|p| p.length).sum();
-        self.total_line_feeds = self.pieces.iter().map(|p| p.line_feed_cnt).sum();
+        self.hint.set(if merged { (0, 0) } else { (first, first_start) });
+        self.total_chars -= end - start;
+        self.total_bytes = self.total_bytes - old_bytes + new_bytes;
+        self.total_line_feeds = self.total_line_feeds - old_lfs + new_lfs;
         self.cached_dirty.set(true);
     }
 
@@ -427,20 +603,22 @@ impl PieceTable {
         if self.pieces.len() <= 1 {
             return;
         }
+        self.hint.set((0, 0));
+        let pieces = Arc::make_mut(&mut self.pieces);
         let mut write = 0;
-        for read in 1..self.pieces.len() {
-            let next = self.pieces[read];
-            let curr = &mut self.pieces[write];
+        for read in 1..pieces.len() {
+            let next = pieces[read];
+            let curr = &mut pieces[write];
             if curr.buffer == next.buffer && curr.start + curr.length == next.start {
                 curr.length += next.length;
                 curr.char_count += next.char_count;
                 curr.line_feed_cnt += next.line_feed_cnt;
             } else {
                 write += 1;
-                self.pieces[write] = next;
+                pieces[write] = next;
             }
         }
-        self.pieces.truncate(write + 1);
+        pieces.truncate(write + 1);
     }
 
     /// Returns the flattened string view.
@@ -454,7 +632,7 @@ impl PieceTable {
                     let s = unsafe { &mut *self.cached_text.get() };
                     s.clear();
                     s.reserve(self.total_bytes);
-                    for p in &self.pieces {
+                    for p in self.pieces.iter() {
                         s.push_str(p.get_text(&self.original, &self.added));
                     }
                     self.cached_dirty.set(false);
@@ -468,10 +646,18 @@ impl PieceTable {
     /// avoiding an intermediate copy into `cached_text`.
     pub fn build_string(&self) -> String {
         let mut s = String::with_capacity(self.total_bytes);
-        for p in &self.pieces {
+        for p in self.pieces.iter() {
             s.push_str(p.get_text(&self.original, &self.added));
         }
         s
+    }
+
+    /// Streams all piece slices directly to `writer` without flattening the buffer in memory.
+    pub fn write_to<W: std::io::Write>(&self, mut writer: W) -> std::io::Result<()> {
+        for p in self.pieces.iter() {
+            writer.write_all(p.get_text(&self.original, &self.added).as_bytes())?;
+        }
+        writer.flush()
     }
 
     /// Converts a character index to a byte offset in the document.
@@ -484,11 +670,16 @@ impl PieceTable {
         }
         let mut curr_char = 0;
         let mut curr_byte = 0;
-        for p in &self.pieces {
+        for p in self.pieces.iter() {
             if char_idx <= curr_char + p.char_count {
                 let offset_in_piece = char_idx - curr_char;
                 return curr_byte
-                    + p.char_to_byte_offset(&self.original, &self.added, offset_in_piece);
+                    + p.char_to_byte_offset_indexed(
+                        &self.original,
+                        &self.added,
+                        &self.orig_checkpoints,
+                        offset_in_piece,
+                    );
             }
             curr_char += p.char_count;
             curr_byte += p.length;
@@ -506,12 +697,25 @@ impl PieceTable {
         }
         let mut curr_byte = 0;
         let mut curr_char = 0;
-        for p in &self.pieces {
+        for p in self.pieces.iter() {
             if byte_idx <= curr_byte + p.length {
                 let offset_in_piece = byte_idx - curr_byte;
                 // Fast path: if char count equals byte length, all characters are single-byte ASCII
                 if p.char_count == p.length {
                     return curr_char + offset_in_piece;
+                }
+                if p.buffer == BufferType::Original && !self.orig_checkpoints.is_empty() {
+                    let abs_byte = p.start + offset_in_piece;
+                    let idx = self
+                        .orig_checkpoints
+                        .partition_point(|cp| cp.byte_offset <= abs_byte);
+                    if idx > 0 {
+                        let cp = &self.orig_checkpoints[idx - 1];
+                        if cp.byte_offset >= p.start && cp.char_offset >= p.char_start {
+                            let rem_chars = self.original[cp.byte_offset..abs_byte].chars().count();
+                            return curr_char + (cp.char_offset - p.char_start) + rem_chars;
+                        }
+                    }
                 }
                 let text = p.get_text(&self.original, &self.added);
                 let chars_in_offset = text[..offset_in_piece].chars().count();
@@ -523,48 +727,80 @@ impl PieceTable {
         self.total_chars
     }
 
-    /// Returns the starting character index of 0-based `target_line` without flattening the buffer.
-    pub fn line_to_char(&self, target_line: usize) -> usize {
+    /// Internal helper: returns `(char_idx, piece_idx, byte_offset_in_piece)` for the start of `target_line`.
+    fn find_line_start_pos(&self, target_line: usize) -> (usize, usize, usize) {
         if target_line == 0 {
-            return 0;
+            return (0, 0, 0);
         }
         if target_line > self.total_line_feeds {
-            return self.total_chars;
+            return (self.total_chars, self.pieces.len(), 0);
         }
 
         let mut curr_line = 0usize;
         let mut curr_char = 0usize;
 
-        for p in &self.pieces {
+        for (p_idx, p) in self.pieces.iter().enumerate() {
             if curr_line + p.line_feed_cnt < target_line {
                 curr_line += p.line_feed_cnt;
                 curr_char += p.char_count;
                 continue;
             }
 
+            let rel_line = target_line - curr_line;
             let text = p.get_text(&self.original, &self.added);
             let bytes = text.as_bytes();
-            let mut last_pos = 0usize;
-            for (i, &b) in bytes.iter().enumerate() {
-                if b == b'\n' {
-                    curr_line += 1;
-                    if curr_line == target_line {
-                        let byte_end = i + 1;
-                        let chars_in_prefix = if p.char_count == p.length {
-                            byte_end
+
+            let (scan_byte_start, mut scan_char_offset, mut rem_lines) =
+                if p.buffer == BufferType::Original && !self.orig_checkpoints.is_empty() {
+                    let abs_nl = p.nl_start + rel_line;
+                    let cp_idx = abs_nl / CHECKPOINT_STRIDE;
+                    if cp_idx > 0 {
+                        let cp = &self.orig_checkpoints[cp_idx - 1];
+                        if cp.nl_count > p.nl_start && cp.byte_offset >= p.start {
+                            (
+                                cp.byte_offset - p.start,
+                                cp.char_offset - p.char_start,
+                                abs_nl - cp.nl_count,
+                            )
                         } else {
-                            text[..byte_end].chars().count()
-                        };
-                        return curr_char + chars_in_prefix;
+                            (0, 0, rel_line)
+                        }
+                    } else {
+                        (0, 0, rel_line)
                     }
-                    last_pos = i + 1;
+                } else {
+                    (0, 0, rel_line)
+                };
+
+            if rem_lines == 0 {
+                return (curr_char + scan_char_offset, p_idx, scan_byte_start);
+            }
+
+            for (i, &b) in bytes[scan_byte_start..].iter().enumerate() {
+                if b == b'\n' {
+                    rem_lines -= 1;
+                    if rem_lines == 0 {
+                        let byte_end = scan_byte_start + i + 1;
+                        let chars_in_slice = if p.char_count == p.length {
+                            byte_end - scan_byte_start
+                        } else {
+                            text[scan_byte_start..byte_end].chars().count()
+                        };
+                        scan_char_offset += chars_in_slice;
+                        return (curr_char + scan_char_offset, p_idx, byte_end);
+                    }
                 }
             }
-            let _ = last_pos;
             curr_char += p.char_count;
+            curr_line += p.line_feed_cnt;
         }
 
-        self.total_chars
+        (self.total_chars, self.pieces.len(), 0)
+    }
+
+    /// Returns the starting character index of 0-based `target_line` without flattening the buffer.
+    pub fn line_to_char(&self, target_line: usize) -> usize {
+        self.find_line_start_pos(target_line).0
     }
 
     /// Returns `(line_idx, col_chars)` (both 0-based) for `char_idx` without flattening the buffer.
@@ -578,7 +814,7 @@ impl PieceTable {
         let mut curr_line = 0usize;
         let mut last_line_start_char = 0usize;
 
-        for p in &self.pieces {
+        for p in self.pieces.iter() {
             if curr_char + p.char_count < target {
                 if p.line_feed_cnt > 0 {
                     let text = p.get_text(&self.original, &self.added);
@@ -587,7 +823,7 @@ impl PieceTable {
                         let chars_before_nl_end = if p.char_count == p.length {
                             byte_after_nl
                         } else {
-                            text[..byte_after_nl].chars().count()
+                            p.char_count - text[byte_after_nl..].chars().count()
                         };
                         last_line_start_char = curr_char + chars_before_nl_end;
                     }
@@ -598,24 +834,58 @@ impl PieceTable {
             }
 
             let offset_chars = target - curr_char;
-            if p.line_feed_cnt > 0 {
-                let offset_bytes = p.char_to_byte_offset(&self.original, &self.added, offset_chars);
-                let prefix = &p.get_text(&self.original, &self.added)[..offset_bytes];
-                let lf_count = prefix.bytes().filter(|&b| b == b'\n').count();
-                if lf_count > 0 {
-                    curr_line += lf_count;
-                    let last_nl_byte = prefix
-                        .as_bytes()
-                        .iter()
-                        .rposition(|&b| b == b'\n')
-                        .unwrap();
-                    let byte_after_nl = last_nl_byte + 1;
-                    let chars_to_nl_end = if p.char_count == p.length {
-                        byte_after_nl
+            if p.line_feed_cnt > 0 && offset_chars > 0 {
+                let offset_bytes = p.char_to_byte_offset_indexed(
+                    &self.original,
+                    &self.added,
+                    &self.orig_checkpoints,
+                    offset_chars,
+                );
+                let text = p.get_text(&self.original, &self.added);
+                let prefix = &text[..offset_bytes];
+
+                let (base_lf, scan_start_byte, base_char_offset) =
+                    if p.buffer == BufferType::Original && !self.orig_checkpoints.is_empty() {
+                        let abs_byte = p.start + offset_bytes;
+                        let idx = self
+                            .orig_checkpoints
+                            .partition_point(|cp| cp.byte_offset <= abs_byte);
+                        if idx > 0 {
+                            let cp = &self.orig_checkpoints[idx - 1];
+                            if cp.byte_offset > p.start && cp.nl_count > p.nl_start {
+                                (
+                                    cp.nl_count - p.nl_start,
+                                    cp.byte_offset - p.start,
+                                    cp.char_offset - p.char_start,
+                                )
+                            } else {
+                                (0, 0, 0)
+                            }
+                        } else {
+                            (0, 0, 0)
+                        }
                     } else {
-                        prefix[..byte_after_nl].chars().count()
+                        (0, 0, 0)
                     };
-                    last_line_start_char = curr_char + chars_to_nl_end;
+
+                let tail_bytes = &prefix.as_bytes()[scan_start_byte..];
+                let tail_lf = tail_bytes.iter().filter(|&&b| b == b'\n').count();
+                let total_lf = base_lf + tail_lf;
+                if total_lf > 0 {
+                    curr_line += total_lf;
+                    if tail_lf > 0 {
+                        let rel_nl = tail_bytes.iter().rposition(|&b| b == b'\n').unwrap() + 1;
+                        let chars_in_tail = if p.char_count == p.length {
+                            rel_nl
+                        } else {
+                            prefix[scan_start_byte..scan_start_byte + rel_nl]
+                                .chars()
+                                .count()
+                        };
+                        last_line_start_char = curr_char + base_char_offset + chars_in_tail;
+                    } else {
+                        last_line_start_char = curr_char + base_char_offset;
+                    }
                 }
             }
 
@@ -627,13 +897,49 @@ impl PieceTable {
 
     /// Returns the character range `start..end` (excluding trailing `'\n'`) of 0-based `line_idx`.
     pub fn line_char_range(&self, line_idx: usize) -> Range<usize> {
-        let start = self.line_to_char(line_idx);
-        let end = if line_idx >= self.total_line_feeds {
-            self.total_chars
-        } else {
-            self.line_to_char(line_idx + 1).saturating_sub(1)
-        };
-        start..end.max(start)
+        if line_idx > self.total_line_feeds {
+            return self.total_chars..self.total_chars;
+        }
+        let (start, start_piece_idx, start_byte_in_piece) = self.find_line_start_pos(line_idx);
+        if line_idx == self.total_line_feeds {
+            return start..self.total_chars.max(start);
+        }
+
+        let mut curr_char = start;
+        for (idx, p) in self.pieces[start_piece_idx..].iter().enumerate() {
+            let byte_offset = if idx == 0 { start_byte_in_piece } else { 0 };
+            if byte_offset >= p.length {
+                continue;
+            }
+            if idx > 0 && p.line_feed_cnt == 0 {
+                curr_char += p.char_count;
+                continue;
+            }
+            let text = p.get_text(&self.original, &self.added);
+            let slice = &text[byte_offset..];
+            if let Some(nl_pos) = slice.as_bytes().iter().position(|&b| b == b'\n') {
+                let chars_in_line = if p.char_count == p.length {
+                    nl_pos
+                } else {
+                    slice[..nl_pos].chars().count()
+                };
+                let end = curr_char + chars_in_line;
+                return start..end.max(start);
+            } else {
+                let rem_chars = if idx == 0 {
+                    if p.char_count == p.length {
+                        slice.len()
+                    } else {
+                        slice.chars().count()
+                    }
+                } else {
+                    p.char_count
+                };
+                curr_char += rem_chars;
+            }
+        }
+
+        start..self.total_chars.max(start)
     }
 
     /// Extracts characters in `char_range` into `out` (cleared first) without flattening the full buffer.
@@ -646,7 +952,7 @@ impl PieceTable {
         }
 
         let mut curr_char = 0usize;
-        for p in &self.pieces {
+        for p in self.pieces.iter() {
             let piece_start = curr_char;
             let piece_end = curr_char + p.char_count;
             curr_char = piece_end;
@@ -660,11 +966,21 @@ impl PieceTable {
 
             let local_start = start.saturating_sub(piece_start);
             let local_end = (end - piece_start).min(p.char_count);
-            let byte_start = p.char_to_byte_offset(&self.original, &self.added, local_start);
+            let byte_start = p.char_to_byte_offset_indexed(
+                &self.original,
+                &self.added,
+                &self.orig_checkpoints,
+                local_start,
+            );
             let byte_end = if local_end == p.char_count {
                 p.length
             } else {
-                p.char_to_byte_offset(&self.original, &self.added, local_end)
+                p.char_to_byte_offset_indexed(
+                    &self.original,
+                    &self.added,
+                    &self.orig_checkpoints,
+                    local_end,
+                )
             };
             let text = p.get_text(&self.original, &self.added);
             out.push_str(&text[byte_start..byte_end]);
@@ -686,7 +1002,7 @@ impl PieceTable {
         }
         let mut remaining = max_bytes;
         let mut prev_byte = None;
-        for p in &self.pieces {
+        for p in self.pieces.iter() {
             if remaining == 0 {
                 break;
             }
@@ -730,7 +1046,7 @@ impl AsRef<str> for PieceTable {
 
 impl fmt::Display for PieceTable {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for p in &self.pieces {
+        for p in self.pieces.iter() {
             f.write_str(p.get_text(&self.original, &self.added))?;
         }
         Ok(())
@@ -750,7 +1066,9 @@ impl fmt::Debug for PieceTable {
 
 impl PartialEq for PieceTable {
     fn eq(&self, other: &Self) -> bool {
-        self.as_str() == other.as_str()
+        self.total_bytes == other.total_bytes
+            && self.total_chars == other.total_chars
+            && self.as_str() == other.as_str()
     }
 }
 
@@ -758,37 +1076,37 @@ impl Eq for PieceTable {}
 
 impl PartialEq<str> for PieceTable {
     fn eq(&self, other: &str) -> bool {
-        self.as_str() == other
+        self.total_bytes == other.len() && self.as_str() == other
     }
 }
 
 impl PartialEq<&str> for PieceTable {
     fn eq(&self, other: &&str) -> bool {
-        self.as_str() == *other
+        self.total_bytes == other.len() && self.as_str() == *other
     }
 }
 
 impl PartialEq<String> for PieceTable {
     fn eq(&self, other: &String) -> bool {
-        self.as_str() == other.as_str()
+        self.total_bytes == other.len() && self.as_str() == other.as_str()
     }
 }
 
 impl PartialEq<PieceTable> for str {
     fn eq(&self, other: &PieceTable) -> bool {
-        self == other.as_str()
+        self.len() == other.total_bytes && self == other.as_str()
     }
 }
 
 impl PartialEq<PieceTable> for &str {
     fn eq(&self, other: &PieceTable) -> bool {
-        *self == other.as_str()
+        self.len() == other.total_bytes && *self == other.as_str()
     }
 }
 
 impl PartialEq<PieceTable> for String {
     fn eq(&self, other: &PieceTable) -> bool {
-        self.as_str() == other.as_str()
+        self.len() == other.total_bytes && self.as_str() == other.as_str()
     }
 }
 
@@ -844,19 +1162,23 @@ impl eframe::egui::TextBuffer for PieceTable {
     }
 
     fn replace_with(&mut self, text: &str) {
-        let char_count = text.chars().count();
         let byte_len = text.len();
-        let line_feed_cnt = text.bytes().filter(|&b| b == b'\n').count();
+        let (char_count, line_feed_cnt, checkpoints) = scan_str_with_checkpoints(text);
 
         self.original = Arc::<str>::from(text);
-        self.pieces.clear();
+        self.orig_checkpoints = Arc::from(checkpoints);
+        self.hint.set((0, 0));
+        let pieces = Arc::make_mut(&mut self.pieces);
+        pieces.clear();
         if byte_len > 0 {
-            self.pieces.push(Piece {
+            pieces.push(Piece {
                 buffer: BufferType::Original,
                 start: 0,
                 length: byte_len,
                 char_count,
                 line_feed_cnt,
+                char_start: 0,
+                nl_start: 0,
             });
         }
         self.total_chars = char_count;

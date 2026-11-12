@@ -1,4 +1,4 @@
-//! Project folder and file explorer sidebar.
+﻿//! Project folder and file explorer sidebar.
 //!
 //! Manages the directory tree hierarchy, lazy-loading child directories, inline renaming and creation
 //! of files and folders, context menus, and trash/recycle bin operations.
@@ -162,10 +162,18 @@ impl FileNode {
 
     pub fn visible_count(&self) -> usize {
         if !self.is_dir || !self.expanded {
-            1
-        } else {
-            1 + self.children.iter().map(|c| c.visible_count()).sum::<usize>()
+            return 1;
         }
+        let mut total = 1 + self.children.len();
+        for child in &self.children {
+            if !child.is_dir {
+                break;
+            }
+            if child.expanded {
+                total += child.visible_count() - 1;
+            }
+        }
+        total
     }
 
     pub fn load_children(&mut self) {
@@ -269,6 +277,38 @@ pub fn render_file_node(
     depth: usize,
     file_to_open: &mut Option<PathBuf>,
 ) {
+    let mut label_buf = String::with_capacity(64);
+    render_file_node_with_buf(
+        ui,
+        node,
+        current_path,
+        is_current_dirty,
+        unsaved_files,
+        selected_node,
+        pending_edit,
+        tree_action,
+        edit_outcome,
+        depth,
+        file_to_open,
+        &mut label_buf,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_file_node_with_buf(
+    ui: &mut egui::Ui,
+    node: &mut FileNode,
+    current_path: &Path,
+    is_current_dirty: bool,
+    unsaved_files: &HashMap<PathBuf, UnsavedFileState>,
+    selected_node: &mut Option<(PathBuf, bool)>,
+    pending_edit: &mut Option<PendingTreeEdit>,
+    tree_action: &mut Option<TreeAction>,
+    edit_outcome: &mut Option<TreeEditOutcome>,
+    depth: usize,
+    file_to_open: &mut Option<PathBuf>,
+    label_buf: &mut String,
+) {
     let indent = depth as f32 * 14.0;
     let is_renaming_self = matches!(
         pending_edit,
@@ -319,7 +359,10 @@ pub fn render_file_node(
             ui.horizontal(|ui| {
                 ui.add_space(indent);
                 let prefix = if node.expanded { "▾ " } else { "▸ " };
-                let resp = ui.selectable_label(is_selected, format!("{prefix}{}", node.name));
+                label_buf.clear();
+                label_buf.push_str(prefix);
+                label_buf.push_str(&node.name);
+                let resp = ui.selectable_label(is_selected, label_buf.as_str());
                 if resp.clicked() {
                     *selected_node = Some((node.path.clone(), true));
                     node.expanded = !node.expanded;
@@ -380,7 +423,7 @@ pub fn render_file_node(
             }
 
             for child in &mut node.children {
-                render_file_node(
+                render_file_node_with_buf(
                     ui,
                     child,
                     current_path,
@@ -392,6 +435,7 @@ pub fn render_file_node(
                     edit_outcome,
                     depth + 1,
                     file_to_open,
+                    label_buf,
                 );
             }
         }
@@ -414,7 +458,10 @@ pub fn render_file_node(
         ui.horizontal(|ui| {
             ui.add_space(indent + 14.0);
             let resp = if is_dirty {
-                ui.selectable_label(is_selected, format!("{} *", node.name))
+                label_buf.clear();
+                label_buf.push_str(&node.name);
+                label_buf.push_str(" *");
+                ui.selectable_label(is_selected, label_buf.as_str())
             } else {
                 ui.selectable_label(is_selected, &node.name)
             };
@@ -452,6 +499,7 @@ pub struct FileExplorer {
     pub tree_root: Option<FileNode>,
     pub selected_node: Option<(PathBuf, bool)>,
     pub pending_tree_edit: Option<PendingTreeEdit>,
+    label_buf: String,
 }
 
 impl FileExplorer {
@@ -463,6 +511,7 @@ impl FileExplorer {
             tree_root,
             selected_node: None,
             pending_tree_edit: None,
+            label_buf: String::with_capacity(64),
         }
     }
 
@@ -739,13 +788,34 @@ impl FileExplorer {
                 let unsaved_files = &doc.unsaved_files;
                 let selected_node = &mut self.selected_node;
                 let pending_edit = &mut self.pending_tree_edit;
+                let label_buf = &mut self.label_buf;
 
+                let area_bottom = ui.max_rect().bottom();
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         if let Some(root) = &mut self.tree_root {
+                            let root_path = root.path.clone();
+                            // Inline name editor for items being created at the project root.
+                            if let Some(edit) = pending_edit.as_mut() {
+                                match &edit.kind {
+                                    TreeEditKind::NewFolder { parent_path } if *parent_path == root_path => {
+                                        ui.horizontal(|ui| {
+                                            ui.label("▸");
+                                            render_inline_tree_edit(ui, edit, &mut edit_outcome);
+                                        });
+                                    }
+                                    TreeEditKind::NewFile { parent_path } if *parent_path == root_path => {
+                                        ui.horizontal(|ui| {
+                                            ui.add_space(14.0);
+                                            render_inline_tree_edit(ui, edit, &mut edit_outcome);
+                                        });
+                                    }
+                                    _ => {}
+                                }
+                            }
                             for child in &mut root.children {
-                                render_file_node(
+                                render_file_node_with_buf(
                                     ui,
                                     child,
                                     current_path,
@@ -757,8 +827,28 @@ impl FileExplorer {
                                     &mut edit_outcome,
                                     0,
                                     &mut file_to_open,
+                                    label_buf,
                                 );
                             }
+                            // Empty space below the tree: right-click creates items at the project root.
+                            let remaining = (area_bottom - ui.cursor().top()).max(24.0);
+                            let empty = ui.allocate_response(
+                                egui::vec2(ui.available_width(), remaining),
+                                egui::Sense::click(),
+                            );
+                            if empty.secondary_clicked() {
+                                *selected_node = None;
+                            }
+                            empty.context_menu(|ui| {
+                                if ui.button("New Folder").clicked() {
+                                    tree_action = Some(TreeAction::StartNewFolder(root_path.clone()));
+                                    ui.close_menu();
+                                }
+                                if ui.button("New File").clicked() {
+                                    tree_action = Some(TreeAction::StartNewFile(root_path.clone()));
+                                    ui.close_menu();
+                                }
+                            });
                         }
                     });
 

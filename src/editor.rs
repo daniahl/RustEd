@@ -108,6 +108,14 @@ pub trait EditorBuffer: egui::TextBuffer {
         self.extract_char_range(char_range, &mut s);
         s
     }
+
+    fn delete_prev_word(&mut self, ccursor: CCursor) -> CCursor {
+        egui::TextBuffer::delete_previous_word(self, ccursor)
+    }
+
+    fn delete_nxt_word(&mut self, ccursor: CCursor) -> CCursor {
+        egui::TextBuffer::delete_next_word(self, ccursor)
+    }
 }
 
 impl EditorBuffer for String {}
@@ -150,6 +158,50 @@ impl EditorBuffer for PieceTable {
 
     fn slice_chars(&self, char_range: Range<usize>) -> String {
         PieceTable::slice_chars(self, char_range)
+    }
+
+    fn delete_prev_word(&mut self, ccursor: CCursor) -> CCursor {
+        let end = ccursor.index.min(self.char_count());
+        if end == 0 {
+            return CCursor::new(0);
+        }
+        let mut window = 256usize;
+        let mut buf = String::new();
+        loop {
+            let start = end.saturating_sub(window);
+            self.extract_char_range(start..end, &mut buf);
+            let local_len = end - start;
+            let new_local = egui::TextBuffer::delete_previous_word(&mut buf, CCursor::new(local_len));
+            if new_local.index > 0 || start == 0 {
+                let target_start = start + new_local.index;
+                self.delete(target_start..end);
+                return CCursor::new(target_start);
+            }
+            window = window.saturating_mul(2);
+        }
+    }
+
+    fn delete_nxt_word(&mut self, ccursor: CCursor) -> CCursor {
+        let total = self.char_count();
+        let start = ccursor.index.min(total);
+        if start >= total {
+            return CCursor::new(total);
+        }
+        let mut window = 256usize;
+        let mut buf = String::new();
+        loop {
+            let end = (start + window).min(total);
+            let local_len = end - start;
+            self.extract_char_range(start..end, &mut buf);
+            let _ = egui::TextBuffer::delete_next_word(&mut buf, CCursor::new(0));
+            let remaining = buf.chars().count();
+            let deleted = local_len.saturating_sub(remaining);
+            if remaining > 0 || end == total {
+                self.delete(start..start + deleted);
+                return CCursor::new(start);
+            }
+            window = window.saturating_mul(2);
+        }
     }
 }
 
@@ -555,8 +607,9 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
                     Event::Key {
                         key: Key::Tab,
                         pressed: true,
+                        modifiers,
                         ..
-                    } => {
+                    } if !modifiers.ctrl && !modifiers.command => {
                         let mut ccursor = self.text.delete_selected(&cursor_range);
                         self.text.insert_text_at(&mut ccursor, "    ", usize::MAX);
                         mutated = Some(CCursorRange::one(ccursor));
@@ -569,7 +622,7 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
                     } => {
                         let ccursor = if let Some(cursor) = cursor_range.single() {
                             if modifiers.ctrl {
-                                self.text.delete_previous_word(cursor.ccursor)
+                                self.text.delete_prev_word(cursor.ccursor)
                             } else {
                                 self.text.delete_previous_char(cursor.ccursor)
                             }
@@ -586,7 +639,7 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
                     } => {
                         let ccursor = if let Some(cursor) = cursor_range.single() {
                             if modifiers.ctrl {
-                                self.text.delete_next_word(cursor.ccursor)
+                                self.text.delete_nxt_word(cursor.ccursor)
                             } else {
                                 self.text.delete_next_char(cursor.ccursor)
                             }
@@ -1182,8 +1235,9 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
                     Event::Key {
                         key: Key::Tab,
                         pressed: true,
+                        modifiers,
                         ..
-                    } => {
+                    } if !modifiers.ctrl && !modifiers.command => {
                         let [min_c, max_c] = ccursor_range.sorted();
                         if min_c.index < max_c.index {
                             self.text.delete_char_range(min_c.index..max_c.index);
@@ -1203,7 +1257,7 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
                             self.text.delete_char_range(min_c.index..max_c.index);
                             min_c
                         } else if modifiers.ctrl {
-                            self.text.delete_previous_word(min_c)
+                            self.text.delete_prev_word(min_c)
                         } else {
                             self.text.delete_previous_char(min_c)
                         };
@@ -1220,7 +1274,7 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
                             self.text.delete_char_range(min_c.index..max_c.index);
                             min_c
                         } else if modifiers.ctrl {
-                            self.text.delete_next_word(min_c)
+                            self.text.delete_nxt_word(min_c)
                         } else {
                             self.text.delete_next_char(min_c)
                         };

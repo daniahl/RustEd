@@ -437,3 +437,180 @@ fn test_switch_to_terminal_and_back_to_editor() {
     let _ = fs::remove_dir_all(&temp_dir);
 }
 
+
+#[test]
+fn test_editor_has_focus_on_startup_when_requested() {
+    let temp_dir =
+        std::env::temp_dir().join(format!("rusted_startup_focus_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    let ctx = egui::Context::default();
+    let mut app = TextEditor::new_headless(&temp_dir);
+    // Headless construction does not request focus; the real app does.
+    assert!(!app.focus_editor_pending);
+    app.focus_editor_pending = true;
+
+    for _ in 0..2 {
+        let _ = ctx.run(egui::RawInput::default(), |ctx| app.update_ui(ctx));
+    }
+    assert!(!app.focus_editor_pending, "request is consumed once");
+    assert!(
+        ctx.memory(|m| m.has_focus(egui::Id::new("code_editor"))),
+        "editor should hold keyboard focus (active caret) after the first frames"
+    );
+
+    // Focus is not forcibly re-grabbed after the user moves it elsewhere.
+    ctx.memory_mut(|m| m.surrender_focus(egui::Id::new("code_editor")));
+    for _ in 0..2 {
+        let _ = ctx.run(egui::RawInput::default(), |ctx| app.update_ui(ctx));
+    }
+    assert!(!ctx.memory(|m| m.has_focus(egui::Id::new("code_editor"))));
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_folder_from_args_picks_first_existing_folder() {
+    use rusted::app::folder_from_args;
+    let dir = std::env::temp_dir().join(format!("rusted_args_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(dir.join("proj")).unwrap();
+    fs::write(dir.join("file.txt"), "").unwrap();
+    let s = |p: std::path::PathBuf| p.to_string_lossy().into_owned();
+
+    assert_eq!(folder_from_args(Vec::<String>::new()), None);
+    assert_eq!(folder_from_args(["--flag".to_string(), s(dir.join("nope"))]), None);
+    // Files are ignored; the first existing folder wins.
+    assert_eq!(
+        folder_from_args([s(dir.join("file.txt")), s(dir.join("proj")), s(dir.clone())]),
+        Some(dir.join("proj"))
+    );
+    // Relative paths are made absolute.
+    let cwd = std::env::current_dir().unwrap();
+    assert_eq!(folder_from_args(["src".to_string()]), Some(cwd.join("src")));
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_new_with_folder_uses_given_folder() {
+    let dir = std::env::temp_dir().join(format!("rusted_startdir_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let app = TextEditor::new_with_folder(egui::Context::default(), Some(dir.clone()));
+    assert_eq!(app.explorer.folder_path, dir.to_string_lossy());
+    assert_eq!(app.explorer.tree_root.as_ref().unwrap().path, dir);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_sidebar_lists_startup_folder_contents() {
+    let dir = std::env::temp_dir().join(format!("rusted_startlist_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("unique_startup_marker.txt"), "").unwrap();
+
+    let ctx = egui::Context::default();
+    ctx.enable_accesskit();
+    let mut app = TextEditor::new_with_folder(ctx.clone(), Some(dir.clone()));
+    let mut labels = Vec::new();
+    for _ in 0..2 {
+        let out = ctx.run(egui::RawInput::default(), |ctx| app.update_ui(ctx));
+        if let Some(u) = out.platform_output.accesskit_update {
+            labels.extend(u.nodes.iter().filter_map(|(_, n)| n.label().map(str::to_string)));
+        }
+    }
+    assert!(labels.iter().any(|l| l == "unique_startup_marker.txt"), "{labels:?}");
+    assert!(!labels.iter().any(|l| l == "Cargo.toml"), "cwd listing leaked: {labels:?}");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[cfg(windows)]
+#[test]
+fn test_folder_from_args_bare_drive_means_drive_root() {
+    use rusted::app::folder_from_args;
+    let drive = std::env::current_dir()
+        .unwrap()
+        .components()
+        .next()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .unwrap();
+    // e.g. "G:" must resolve to "G:\", not the current directory on that drive.
+    let resolved = folder_from_args([drive.clone()]).unwrap();
+    assert_eq!(resolved, std::path::PathBuf::from(format!("{drive}\\")));
+    assert!(resolved.is_absolute());
+}
+
+#[test]
+fn test_ctrl_tab_switches_tabs_between_editor_and_terminal() {
+    let temp_dir =
+        std::env::temp_dir().join(format!("rusted_ctrl_tab_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    let ctx = egui::Context::default();
+    let mut app = TextEditor::new_headless(&temp_dir);
+    assert_eq!(app.tab, rusted::app::Tab::Editor);
+
+    // Initial render
+    let _ = ctx.run(egui::RawInput::default(), |ctx| {
+        app.update_ui(ctx);
+    });
+
+    // Press Ctrl+Tab -> Should switch to Terminal
+    let mut ctrl_tab_input = egui::RawInput::default();
+    ctrl_tab_input.events.push(egui::Event::Key {
+        key: egui::Key::Tab,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: egui::Modifiers::CTRL,
+    });
+    let _ = ctx.run(ctrl_tab_input, |ctx| {
+        app.update_ui(ctx);
+    });
+    assert_eq!(app.tab, rusted::app::Tab::Terminal, "Ctrl+Tab should switch from Editor to Terminal");
+    assert!(
+        ctx.memory(|m| m.has_focus(egui::Id::new("conpty_terminal"))),
+        "Switching to Terminal should give focus to the terminal"
+    );
+
+    // Press Ctrl+Tab again -> Should switch back to Editor
+    let mut ctrl_tab_input2 = egui::RawInput::default();
+    ctrl_tab_input2.events.push(egui::Event::Key {
+        key: egui::Key::Tab,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: egui::Modifiers::CTRL,
+    });
+    let _ = ctx.run(ctrl_tab_input2, |ctx| {
+        app.update_ui(ctx);
+    });
+    assert_eq!(app.tab, rusted::app::Tab::Editor, "Ctrl+Tab should switch from Terminal to Editor");
+    assert!(
+        ctx.memory(|m| m.has_focus(egui::Id::new("code_editor"))),
+        "Switching to Editor should give focus to the code editor"
+    );
+
+    // Press Ctrl+Shift+Tab -> Should switch to Terminal as well
+    let mut ctrl_shift_tab_input = egui::RawInput::default();
+    ctrl_shift_tab_input.events.push(egui::Event::Key {
+        key: egui::Key::Tab,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: egui::Modifiers {
+            ctrl: true,
+            shift: true,
+            ..Default::default()
+        },
+    });
+    let _ = ctx.run(ctrl_shift_tab_input, |ctx| {
+        app.update_ui(ctx);
+    });
+    assert_eq!(app.tab, rusted::app::Tab::Terminal, "Ctrl+Shift+Tab should switch between tabs");
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}

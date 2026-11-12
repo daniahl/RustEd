@@ -1,4 +1,4 @@
-//! Top-level application coordinator for RustEd.
+﻿//! Top-level application coordinator for RustEd.
 //!
 //! Manages tab navigation (Editor vs. Terminal), top action bar, bottom status bar,
 //! and orchestrates interactions between the file explorer, active document, and terminal.
@@ -14,7 +14,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-#[derive(PartialEq, Eq, Default, Clone, Copy)]
+#[derive(PartialEq, Eq, Default, Clone, Copy, Debug)]
 pub enum Tab {
     #[default]
     Editor,
@@ -26,6 +26,8 @@ pub struct TextEditor {
     pub doc: Document,
     pub explorer: FileExplorer,
     pub terminal: TerminalPane,
+    /// When set, the next editor frame grabs keyboard focus so the caret is active at startup.
+    pub focus_editor_pending: bool,
 }
 
 impl Deref for TextEditor {
@@ -44,6 +46,11 @@ impl DerefMut for TextEditor {
 
 impl TextEditor {
     pub fn new(ctx: egui::Context) -> Self {
+        Self::new_with_folder(ctx, folder_from_args(std::env::args().skip(1)))
+    }
+
+    /// Creates the app showing older (or the current directory when None).
+    pub fn new_with_folder(ctx: egui::Context, folder: Option<PathBuf>) -> Self {
         ctx.set_zoom_factor(1.2);
         ctx.style_mut(|s| {
             s.scroll_animation = egui::style::ScrollAnimation::none();
@@ -52,8 +59,10 @@ impl TextEditor {
             o.max_passes = std::num::NonZeroUsize::new(2).unwrap();
         });
 
-        let initial_folder = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let terminal = TerminalPane::new(ctx.clone());
+        let initial_folder = folder
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| PathBuf::from("."));
+        let terminal = TerminalPane::new(ctx.clone(), Some(&initial_folder));
         let explorer = FileExplorer::new(initial_folder);
         let doc = Document::new();
 
@@ -62,6 +71,7 @@ impl TextEditor {
             doc,
             explorer,
             terminal,
+            focus_editor_pending: true,
         }
     }
 
@@ -75,6 +85,7 @@ impl TextEditor {
             doc,
             explorer,
             terminal,
+            focus_editor_pending: false,
         }
     }
 
@@ -96,6 +107,39 @@ impl TextEditor {
     }
 
     pub fn update_ui(&mut self, ctx: &egui::Context) {
+        let ctrl_tab = ctx.input_mut(|i| {
+            let ctrl = i.consume_key(egui::Modifiers::CTRL, egui::Key::Tab)
+                || i.consume_key(egui::Modifiers::COMMAND, egui::Key::Tab);
+            let ctrl_shift = i.consume_key(
+                egui::Modifiers {
+                    ctrl: true,
+                    shift: true,
+                    ..Default::default()
+                },
+                egui::Key::Tab,
+            ) || i.consume_key(
+                egui::Modifiers {
+                    command: true,
+                    shift: true,
+                    ..Default::default()
+                },
+                egui::Key::Tab,
+            );
+            ctrl || ctrl_shift
+        });
+        if ctrl_tab {
+            self.tab = match self.tab {
+                Tab::Editor => {
+                    self.terminal.focus_terminal = true;
+                    Tab::Terminal
+                }
+                Tab::Terminal => {
+                    self.focus_editor_pending = true;
+                    Tab::Editor
+                }
+            };
+        }
+
         if self.tab == Tab::Editor {
             let (ctrl_f, f3) = ctx.input_mut(|i| {
                 let ctrl_f = i.consume_key(egui::Modifiers::COMMAND, egui::Key::F)
@@ -120,8 +164,11 @@ impl TextEditor {
                 let prev_tab = self.tab;
                 ui.selectable_value(&mut self.tab, Tab::Editor, "Editor");
                 ui.selectable_value(&mut self.tab, Tab::Terminal, "Terminal");
-                if prev_tab != Tab::Terminal && self.tab == Tab::Terminal {
-                    self.terminal.focus_terminal = true;
+                if prev_tab != self.tab {
+                    match self.tab {
+                        Tab::Terminal => self.terminal.focus_terminal = true,
+                        Tab::Editor => self.focus_editor_pending = true,
+                    }
                 }
 
                 if self.tab == Tab::Editor {
@@ -131,12 +178,18 @@ impl TextEditor {
                     let enter_pressed =
                         resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
 
-                    if ui.button("Open").clicked() || enter_pressed {
+                    if enter_pressed {
                         self.explorer.open_folder(PathBuf::from(&self.explorer.folder_path));
                     }
 
-                    if ui.button("..").on_hover_text("Parent folder").clicked() {
-                        self.explorer.open_parent_folder();
+                    if ui
+                        .button("Open")
+                        .on_hover_text("Choose a project folder")
+                        .clicked()
+                    {
+                        if let Some(folder) = pick_folder(&self.explorer.folder_path) {
+                            self.explorer.open_folder(folder);
+                        }
                     }
 
                     if ui.add_enabled(self.doc.can_save(), egui::Button::new("Save")).clicked() {
@@ -215,6 +268,23 @@ impl TextEditor {
         match self.tab {
             Tab::Editor => {
                 self.explorer.show_sidebar(ctx, &mut self.doc);
+                if self.focus_editor_pending {
+                    self.focus_editor_pending = false;
+                    self.doc.focus_editor = true;
+                    let editor_id = egui::Id::new("code_editor");
+                    ctx.memory_mut(|m| {
+                        m.request_focus(editor_id);
+                        m.set_focus_lock_filter(
+                            editor_id,
+                            egui::EventFilter {
+                                horizontal_arrows: true,
+                                vertical_arrows: true,
+                                tab: true,
+                                escape: true,
+                            },
+                        );
+                    });
+                }
                 self.doc.show_find_dialog(ctx);
                 self.doc.show_editor(ctx, panel_frame);
             }
@@ -223,6 +293,35 @@ impl TextEditor {
             }
         }
     }
+}
+
+/// Returns the first command-line argument that names an existing folder, made absolute.
+/// Non-folder arguments (flags, files, missing paths) are ignored.
+pub fn folder_from_args<I: IntoIterator<Item = String>>(args: I) -> Option<PathBuf> {
+    args.into_iter().map(PathBuf::from).find(|p| p.is_dir()).map(|p| {
+        // A bare Windows drive ("G:") is drive-relative, i.e. the current directory on that
+        // drive. When given as an argument the user means the drive root ("G:\").
+        let mut parts = p.components();
+        if let (Some(std::path::Component::Prefix(prefix)), None) = (parts.next(), parts.next()) {
+            let mut root = prefix.as_os_str().to_os_string();
+            root.push(std::path::MAIN_SEPARATOR_STR);
+            return PathBuf::from(root);
+        }
+        if p.is_absolute() {
+            p
+        } else {
+            std::env::current_dir().map_or(p.clone(), |cwd| cwd.join(&p))
+        }
+    })
+}
+
+/// Shows the native folder-selection dialog, starting at start_dir when it exists.
+fn pick_folder(start_dir: &str) -> Option<PathBuf> {
+    let mut dialog = rfd::FileDialog::new().set_title("Open project folder");
+    if Path::new(start_dir).is_dir() {
+        dialog = dialog.set_directory(start_dir);
+    }
+    dialog.pick_folder()
 }
 
 impl eframe::App for TextEditor {

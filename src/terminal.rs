@@ -8,6 +8,7 @@ use eframe::egui;
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use std::{
     io::{Read, Write},
+    path::Path,
     sync::{mpsc, Arc, Mutex},
     thread,
 };
@@ -33,7 +34,7 @@ pub struct TerminalPane {
 }
 
 impl TerminalPane {
-    pub fn new(ctx: egui::Context) -> Self {
+    pub fn new(ctx: egui::Context, working_dir: Option<&Path>) -> Self {
         let term = Arc::new(Mutex::new(TerminalState {
             parser: vt100::Parser::new(TERM_ROWS, TERM_COLS, 0),
             pty_updated: true,
@@ -50,8 +51,11 @@ impl TerminalPane {
             pixel_height: 0,
         }) {
             let mut cmd = CommandBuilder::new("cmd.exe");
-            if let Ok(cwd) = std::env::current_dir() {
-                cmd.cwd(cwd);
+            let cwd = working_dir
+                .map(Path::to_path_buf)
+                .or_else(|| std::env::current_dir().ok());
+            if let Some(dir) = cwd {
+                cmd.cwd(dir);
             }
             if let Ok(child) = pair.slave.spawn_command(cmd) {
                 pty_child = Some(child);
@@ -189,7 +193,7 @@ impl TerminalPane {
                         let seq: Option<&[u8]> = match key {
                             egui::Key::Enter => Some(b"\r"),
                             egui::Key::Backspace => Some(b"\x7f"),
-                            egui::Key::Tab => Some(b"\t"),
+                            egui::Key::Tab if !modifiers.ctrl && !modifiers.command => Some(b"\t"),
                             egui::Key::Escape => Some(b"\x1b"),
                             egui::Key::Delete => Some(b"\x1b[3~"),
                             egui::Key::ArrowUp => Some(b"\x1b[A"),
@@ -238,22 +242,19 @@ impl TerminalPane {
         self.handle_terminal_input(ctx, term_focused);
 
         let prev_selecting = self.selecting_in_terminal;
-        let (screen_snapshot, pty_updated) = {
+        let pty_updated = {
             let mut lock = self.term.lock().unwrap();
             let updated = lock.pty_updated || self.term_screen_text.is_empty();
             if updated {
                 lock.pty_updated = false;
-                (Some(lock.parser.screen().clone()), true)
+                self.term_cursor_idx =
+                    render_vt100_screen_into(lock.parser.screen(), &mut self.term_screen_text);
+                self.term_revision = self.term_revision.wrapping_add(1);
+                true
             } else {
-                (None, false)
+                false
             }
         };
-
-        if let Some(screen) = screen_snapshot {
-            self.term_cursor_idx =
-                render_vt100_screen_into(&screen, &mut self.term_screen_text);
-            self.term_revision = self.term_revision.wrapping_add(1);
-        }
 
         if pty_updated {
             self.selecting_in_terminal = false;
@@ -326,7 +327,11 @@ pub fn render_vt100_screen_into(screen: &vt100::Screen, full_text: &mut String) 
 
     for (r, line) in screen.rows(0, cols).enumerate() {
         let r_u16 = r as u16;
-        let line_chars = line.chars().count();
+        let line_chars = line
+            .as_bytes()
+            .iter()
+            .filter(|&&b| (b & 0xC0) != 0x80)
+            .count();
         full_text.push_str(&line);
         total_chars += line_chars;
 
@@ -334,8 +339,12 @@ pub fn render_vt100_screen_into(screen: &vt100::Screen, full_text: &mut String) 
             let target_col = cur_col as usize;
             if target_col > line_chars {
                 let pad = target_col - line_chars;
-                for _ in 0..pad {
-                    full_text.push(' ');
+                const SPACES: &str = "                                                                ";
+                let mut rem = pad;
+                while rem > 0 {
+                    let chunk = rem.min(SPACES.len());
+                    full_text.push_str(&SPACES[..chunk]);
+                    rem -= chunk;
                 }
                 total_chars += pad;
             }

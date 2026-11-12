@@ -192,3 +192,35 @@ fn test_handle_terminal_input_key_mappings() {
     assert!(!pane.selecting_in_terminal, "Typing text should exit selection mode");
     assert_eq!(&take_sent(), b"a");
 }
+
+#[cfg(windows)]
+#[test]
+fn test_terminal_pane_new_starts_in_working_dir() {
+    let temp_dir =
+        std::env::temp_dir().join(format!("rusted_term_cwd_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&temp_dir);
+    std::fs::create_dir_all(&temp_dir).unwrap();
+
+    let ctx = egui::Context::default();
+    let pane = TerminalPane::new(ctx.clone(), Some(&temp_dir));
+
+    // Wait up to 3 seconds for cmd.exe to spawn and print its initial prompt
+    let folder_name = temp_dir.file_name().unwrap().to_string_lossy().to_string();
+    let mut prompt_found = false;
+    for _ in 0..60 {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let lock = pane.term.lock().unwrap();
+        let (screen_text, _) = render_vt100_screen(lock.parser.screen());
+        if screen_text.contains(&folder_name) {
+            prompt_found = true;
+            break;
+        }
+    }
+
+    assert!(
+        prompt_found,
+        "Terminal ConPTY should launch cmd.exe in the provided working directory"
+    );
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}

@@ -300,3 +300,195 @@ fn test_document_close_if_deleted() {
         "External unsaved file should remain intact"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Additional coverage: status labels, dirty tracking, save, metadata
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_format_u32_stack_edge_values() {
+    let mut buf = [0u8; 16];
+    assert_eq!(format_u32_stack(0, &mut buf), "0");
+    assert_eq!(format_u32_stack(9, &mut buf), "9");
+    assert_eq!(format_u32_stack(10, &mut buf), "10");
+    assert_eq!(format_u32_stack(u32::MAX, &mut buf), "4294967295");
+}
+
+#[test]
+fn test_detect_language_name_more_cases() {
+    assert_eq!(detect_language_name(""), "Plain Text");
+    assert_eq!(detect_language_name("notes.txt"), "Plain Text");
+    assert_eq!(detect_language_name("Makefile"), "Text");
+    assert_eq!(detect_language_name("weird.zzz"), "Text");
+    assert_eq!(detect_language_name("a.TSX"), "TypeScript React");
+    assert_eq!(detect_language_name("a.hpp"), "C++");
+    assert_eq!(detect_language_name("dir.d/file"), "Text");
+    assert_eq!(detect_language_name("run.sh"), "Shell Script");
+}
+
+#[test]
+fn test_hash_language_salt_distinguishes_languages() {
+    assert_eq!(hash_language_salt("rs"), hash_language_salt("rs"));
+    assert_ne!(hash_language_salt("rs"), hash_language_salt("py"));
+}
+
+#[test]
+fn test_new_document_defaults() {
+    let doc = Document::new();
+    assert_eq!(doc.file_name, "Untitled");
+    assert_eq!(doc.language_name, "Plain Text");
+    assert_eq!(doc.line_ending, "LF");
+    assert_eq!(doc.line_count, 1);
+    assert!(!doc.is_current_dirty);
+    assert!(!doc.can_save());
+    assert!(!doc.find_open);
+}
+
+#[test]
+fn test_set_text_bumps_revision_and_line_count() {
+    let mut doc = Document::new();
+    let rev = doc.text_revision;
+    doc.set_text("a\nb\nc");
+    assert_eq!(doc.line_count, 3);
+    assert_ne!(doc.text_revision, rev);
+    assert_eq!(doc.line_ending, "LF");
+    doc.set_text("a\r\nb");
+    assert_eq!(doc.line_ending, "CRLF");
+}
+
+#[test]
+fn test_status_file_label_units_and_caching() {
+    let mut doc = Document::new();
+    doc.file_name = "f.rs".to_string();
+    doc.set_text("hi\nthere");
+    assert_eq!(doc.status_file_label(), "f.rs — 2 lines (8 B)");
+
+    doc.set_text("x".repeat(2048));
+    assert_eq!(doc.status_file_label(), "f.rs — 1 lines (2.0 KB)");
+
+    doc.set_text("y".repeat(2 * 1024 * 1024));
+    assert_eq!(doc.status_file_label(), "f.rs — 1 lines (2.0 MB)");
+}
+
+#[test]
+fn test_status_pos_label_with_and_without_selection() {
+    let mut doc = Document::new();
+    doc.cursor_line = 3;
+    doc.cursor_col = 7;
+    assert_eq!(doc.status_pos_label(), "Ln 3, Col 7");
+    doc.selected_chars = 4;
+    assert_eq!(doc.status_pos_label(), "Ln 3, Col 7 (4 selected)");
+    doc.selected_chars = 0;
+    doc.cursor_col = 8;
+    assert_eq!(doc.status_pos_label(), "Ln 3, Col 8");
+}
+
+#[test]
+fn test_refresh_file_metadata_from_path() {
+    let mut doc = Document::new();
+    doc.path = "some/dir/script.py".to_string();
+    doc.refresh_file_metadata();
+    assert_eq!(doc.file_name, "script.py");
+    assert_eq!(doc.language_ext, "py");
+    assert_eq!(doc.language_name, "Python");
+
+    doc.path.clear();
+    doc.refresh_file_metadata();
+    assert_eq!(doc.file_name, "Untitled");
+    assert_eq!(doc.language_ext, "rs");
+}
+
+#[test]
+fn test_can_save_and_is_file_dirty() {
+    let mut doc = Document::new();
+    doc.path = "a.txt".to_string();
+    assert!(!doc.can_save());
+    assert!(!doc.is_file_dirty(Path::new("a.txt")));
+    doc.is_current_dirty = true;
+    assert!(doc.can_save());
+    assert!(doc.is_file_dirty(Path::new("a.txt")));
+    assert!(!doc.is_file_dirty(Path::new("b.txt")));
+}
+
+#[test]
+fn test_save_current_file_writes_and_clears_dirty() {
+    let dir = std::env::temp_dir().join(format!("rusted_doc_save_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("out.txt");
+
+    let mut doc = Document::new();
+    doc.path = file.to_string_lossy().into_owned();
+    doc.set_text("saved\ncontent é");
+    doc.is_current_dirty = true;
+    doc.save_current_file();
+
+    assert!(!doc.is_current_dirty);
+    assert_eq!(doc.saved_revision, doc.text_revision);
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "saved\ncontent é");
+
+    // Clean documents are not rewritten.
+    std::fs::write(&file, "external").unwrap();
+    doc.save_current_file();
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "external");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_save_without_path_is_noop() {
+    let mut doc = Document::new();
+    doc.is_current_dirty = true;
+    doc.save_current_file();
+    assert!(doc.is_current_dirty);
+}
+
+#[test]
+fn test_open_file_loads_from_disk_and_ignores_missing() {
+    let dir = std::env::temp_dir().join(format!("rusted_doc_open_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("hello.rs");
+    std::fs::write(&file, "fn main() {}\n// done").unwrap();
+
+    let ctx = egui::Context::default();
+    let mut doc = Document::new();
+    doc.open_file(&ctx, file.clone());
+    assert_eq!(doc.text, "fn main() {}\n// done");
+    assert_eq!(doc.file_name, "hello.rs");
+    assert_eq!(doc.language_name, "Rust");
+    assert_eq!(doc.line_count, 2);
+    assert!(!doc.is_current_dirty);
+
+    // Reopening the same file and opening a missing one leave state untouched.
+    doc.open_file(&ctx, file.clone());
+    doc.open_file(&ctx, dir.join("missing.rs"));
+    assert_eq!(doc.file_name, "hello.rs");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_open_file_stashes_dirty_buffer_and_restores_it() {
+    let dir = std::env::temp_dir().join(format!("rusted_doc_stash_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (a, b) = (dir.join("a.txt"), dir.join("b.txt"));
+    std::fs::write(&a, "AAA").unwrap();
+    std::fs::write(&b, "BBB").unwrap();
+
+    let ctx = egui::Context::default();
+    let mut doc = Document::new();
+    doc.open_file(&ctx, a.clone());
+    doc.text.insert(3, "-edited");
+    doc.text_revision = doc.text_revision.wrapping_add(1);
+    doc.is_current_dirty = true;
+
+    doc.open_file(&ctx, b.clone());
+    assert_eq!(doc.text, "BBB");
+    assert!(doc.is_file_dirty(&a));
+    assert!(!doc.is_file_dirty(&b));
+
+    doc.open_file(&ctx, a.clone());
+    assert_eq!(doc.text, "AAA-edited");
+    assert!(doc.unsaved_files.is_empty());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

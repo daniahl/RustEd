@@ -1,4 +1,4 @@
-//! Unit and integration tests for the `PieceTable` text buffer.
+﻿//! Unit and integration tests for the `PieceTable` text buffer.
 //!
 //! Validates piece descriptor management, consecutive typing optimization,
 //! insertions/deletions, UTF-8 char-to-byte mapping, and `egui::TextBuffer` trait compliance.
@@ -242,4 +242,307 @@ fn test_piece_table_line_and_range_helpers() {
     let mut buf = String::from("stale");
     pt.extract_char_range(0..5, &mut buf);
     assert_eq!(buf, "alpha");
+}
+
+#[test]
+fn test_piece_table_checkpoints_and_non_flattening_word_delete() {
+    use eframe::egui::text::CCursor;
+    use rusted::editor::EditorBuffer;
+
+    // 120 lines with multibyte UTF-8 characters to exercise 32-line checkpoints
+    let original: String = (0..120).map(|i| format!("line_{i:03}_🦀_café\n")).collect();
+    let mut pt = PieceTable::from_string(original);
+    assert_eq!(pt.line_count(), 121);
+
+    // Each line has "line_XXX_🦀_café\n" = 16 chars
+    for line in [0, 1, 31, 32, 33, 63, 64, 65, 95, 96, 119] {
+        let start = pt.line_to_char(line);
+        assert_eq!(start, line * 16);
+        assert_eq!(pt.char_to_line_col(start + 10), (line, 10));
+        assert_eq!(pt.line_char_range(line), start..start + 15);
+    }
+
+    // Split near line 50 and test non-flattening word deletion
+    let pos = pt.line_to_char(50);
+    pt.insert(pos, "hello world ");
+    let after_insert = pos + 12;
+    let c1 = pt.delete_prev_word(CCursor::new(after_insert));
+    assert_eq!(c1.index, pos + 6);
+    assert_eq!(pt.slice_chars(pos..pos + 6), "hello ");
+
+    let c2 = pt.delete_nxt_word(CCursor::new(pos));
+    assert_eq!(c2.index, pos);
+
+    // Stream via write_to and verify matches build_string
+    let mut streamed = Vec::new();
+    pt.write_to(&mut streamed).unwrap();
+    assert_eq!(String::from_utf8(streamed).unwrap(), pt.build_string());
+}
+
+// ---------------------------------------------------------------------------
+// Additional coverage: delete/locality/snapshot semantics
+// ---------------------------------------------------------------------------
+
+/// Applies the same edit to a `String` model and a `PieceTable`.
+fn model_insert(model: &mut String, pt: &mut PieceTable, char_idx: usize, text: &str) {
+    let byte = model
+        .char_indices()
+        .nth(char_idx)
+        .map_or(model.len(), |(b, _)| b);
+    model.insert_str(byte, text);
+    pt.insert(char_idx, text);
+}
+
+fn model_delete(model: &mut String, pt: &mut PieceTable, start: usize, end: usize) {
+    let b = |i: usize, m: &String| m.char_indices().nth(i).map_or(m.len(), |(b, _)| b);
+    let (bs, be) = (b(start, model), b(end, model));
+    model.replace_range(bs..be, "");
+    pt.delete(start..end);
+}
+
+fn assert_matches_model(pt: &PieceTable, model: &str) {
+    assert_eq!(pt.build_string(), model);
+    assert_eq!(pt.len(), model.len());
+    assert_eq!(pt.char_count(), model.chars().count());
+    assert_eq!(pt.line_count(), model.matches('\n').count() + 1);
+}
+
+#[test]
+fn test_delete_noop_cases() {
+    let mut pt = PieceTable::from_str("abc");
+    pt.delete(1..1);
+    pt.delete(2..1);
+    pt.delete(10..20);
+    assert_eq!(pt, "abc");
+
+    let mut empty = PieceTable::new();
+    empty.delete(0..5);
+    assert!(empty.is_empty());
+}
+
+#[test]
+fn test_delete_range_clamped_to_length() {
+    let mut pt = PieceTable::from_str("hello world");
+    pt.delete(5..1000);
+    assert_eq!(pt, "hello");
+    assert_eq!(pt.char_count(), 5);
+}
+
+#[test]
+fn test_delete_entire_document() {
+    let mut pt = PieceTable::from_str("a\nb\nc");
+    pt.insert(1, "XYZ");
+    pt.delete(0..pt.char_count());
+    assert!(pt.is_empty());
+    assert_eq!(pt.line_count(), 1);
+    assert_eq!(pt.piece_count(), 0);
+    pt.insert(0, "again");
+    assert_eq!(pt, "again");
+}
+
+#[test]
+fn test_delete_spanning_multiple_pieces_updates_totals() {
+    let mut pt = PieceTable::from_str("0123456789");
+    pt.insert(5, "é\n");
+    pt.insert(0, "日");
+    pt.insert(pt.char_count(), "end\n");
+    // "日01234é\n56789end\n"
+    assert_eq!(pt, "日01234é\n56789end\n");
+    pt.delete(3..10);
+    assert_eq!(pt, "日01789end\n");
+    assert_eq!(pt.char_count(), "日01789end\n".chars().count());
+    assert_eq!(pt.len(), "日01789end\n".len());
+    assert_eq!(pt.line_count(), 2);
+}
+
+#[test]
+fn test_delete_inside_single_piece_splits_it() {
+    let mut pt = PieceTable::from_str("abcdef");
+    pt.delete(2..4);
+    assert_eq!(pt, "abef");
+    assert_eq!(pt.piece_count(), 2);
+}
+
+#[test]
+fn test_delete_then_reinsert_restores_text() {
+    let mut pt = PieceTable::from_str("hello world");
+    pt.delete(5..6);
+    assert_eq!(pt, "helloworld");
+    pt.insert(5, " ");
+    assert_eq!(pt, "hello world");
+}
+
+#[test]
+fn test_repeated_backspace_from_end_and_forward_delete() {
+    let mut pt = PieceTable::from_str("abcdefghij");
+    for i in (5..10).rev() {
+        pt.delete(i..i + 1);
+    }
+    assert_eq!(pt, "abcde");
+    for _ in 0..5 {
+        pt.delete(0..1);
+    }
+    assert!(pt.is_empty());
+}
+
+#[test]
+fn test_insert_position_clamped_past_end() {
+    let mut pt = PieceTable::from_str("abc");
+    assert_eq!(pt.insert(99, "Z"), 1);
+    assert_eq!(pt, "abcZ");
+    assert_eq!(pt.insert(0, ""), 0);
+}
+
+#[test]
+fn test_insert_returns_char_count_for_multibyte() {
+    let mut pt = PieceTable::new();
+    assert_eq!(pt.insert(0, "日本語"), 3);
+    assert_eq!(pt.len(), 9);
+    assert_eq!(pt.char_count(), 3);
+}
+
+#[test]
+fn test_locality_hint_survives_jumping_edits() {
+    // Alternate edits far apart so the cached lookup position is repeatedly invalidated.
+    let base = "line\n".repeat(200);
+    let mut model = base.clone();
+    let mut pt = PieceTable::from_string(base);
+    let positions = [0usize, 900, 3, 850, 500, 501, 499, 1000, 0, 700];
+    for (i, &p) in positions.iter().cycle().take(200).enumerate() {
+        let p = p.min(model.chars().count());
+        model_insert(&mut model, &mut pt, p, if i % 3 == 0 { "é" } else { "x\n" });
+        if i % 4 == 0 {
+            let n = model.chars().count();
+            let s = (p * 7 + i) % n;
+            model_delete(&mut model, &mut pt, s, (s + 3).min(n));
+        }
+    }
+    assert_matches_model(&pt, &model);
+}
+
+#[test]
+fn test_randomized_edits_match_string_model() {
+    let mut seed: u64 = 0xDEAD_BEEF;
+    let mut rnd = move || {
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (seed >> 33) as usize
+    };
+    let base = "héllo\nwörld\n日本語\nabc\n".repeat(10);
+    let mut model = base.clone();
+    let mut pt = PieceTable::from_string(base);
+    let snippets = ["x", "é\n", "日本", "ab\ncd", "\n"];
+    for step in 0..3000 {
+        let n = model.chars().count();
+        if rnd() % 2 == 0 {
+            model_insert(&mut model, &mut pt, rnd() % (n + 1), snippets[rnd() % 5]);
+        } else {
+            let a = rnd() % (n + 1);
+            let e = (a + rnd() % 9).min(n);
+            model_delete(&mut model, &mut pt, a, e);
+        }
+        if step % 50 == 0 {
+            assert_matches_model(&pt, &model);
+            let probe = rnd() % (model.chars().count() + 1);
+            let byte = model
+                .char_indices()
+                .nth(probe)
+                .map_or(model.len(), |(b, _)| b);
+            assert_eq!(pt.char_to_byte(probe), byte);
+            assert_eq!(pt.byte_to_char(byte), probe);
+        }
+    }
+    assert_matches_model(&pt, &model);
+}
+
+#[test]
+fn test_snapshot_isolated_from_later_edits() {
+    let mut pt = PieceTable::from_str("alpha beta");
+    pt.insert(5, ",");
+    let snap = pt.snapshot();
+    pt.delete(0..3);
+    pt.insert(0, "ZZ");
+    pt.insert(pt.char_count(), "!");
+    assert_ne!(pt, "alpha, beta");
+    pt.restore_snapshot(&snap);
+    assert_eq!(pt, "alpha, beta");
+    assert_eq!(pt.char_count(), 11);
+    assert_eq!(pt.line_count(), 1);
+}
+
+#[test]
+fn test_snapshot_chain_undo_redo_order() {
+    let mut pt = PieceTable::from_str("a");
+    let mut snaps = vec![pt.snapshot()];
+    for t in ["b", "c\n", "d"] {
+        pt.insert(pt.char_count(), t);
+        snaps.push(pt.snapshot());
+    }
+    let expected = ["a", "ab", "abc\n", "abc\nd"];
+    for i in [3usize, 1, 0, 2, 3] {
+        pt.restore_snapshot(&snaps[i]);
+        assert_eq!(pt, expected[i]);
+        assert_eq!(pt.line_count(), expected[i].matches('\n').count() + 1);
+    }
+}
+
+#[test]
+fn test_clone_is_independent() {
+    let mut a = PieceTable::from_str("shared");
+    a.insert(6, " text");
+    let mut b = a.clone();
+    b.delete(0..6);
+    b.insert(0, "own");
+    assert_eq!(a, "shared text");
+    assert_eq!(b, "own text");
+}
+
+#[test]
+fn test_clear_and_replace_with() {
+    let mut pt = PieceTable::from_str("old\ncontent");
+    pt.insert(3, "!");
+    TextBuffer::replace_with(&mut pt, "new\n日本");
+    assert_eq!(pt, "new\n日本");
+    assert_eq!(pt.line_count(), 2);
+    pt.insert(0, ">");
+    assert_eq!(pt, ">new\n日本");
+    pt.clear();
+    assert!(pt.is_empty());
+    assert_eq!(pt.piece_count(), 0);
+    assert_eq!(TextBuffer::take(&mut PieceTable::from_str("xy")), "xy");
+}
+
+#[test]
+fn test_line_helpers_after_edits() {
+    let mut pt = PieceTable::from_str("one\ntwo\nthree");
+    pt.insert(4, "2.5\n");
+    // "one\n2.5\ntwo\nthree"
+    assert_eq!(pt.line_count(), 4);
+    assert_eq!(pt.line_to_char(1), 4);
+    assert_eq!(pt.line_to_char(2), 8);
+    assert_eq!(pt.line_to_char(99), pt.char_count());
+    assert_eq!(pt.line_char_range(1), 4..7);
+    assert_eq!(pt.line_char_range(3), 12..17);
+    assert_eq!(pt.char_to_line_col(9), (2, 1));
+    assert_eq!(pt.char_to_line_col(0), (0, 0));
+    assert_eq!(pt.slice_chars(4..7), "2.5");
+}
+
+#[test]
+fn test_write_to_streams_all_pieces() {
+    let mut pt = PieceTable::from_str("abc");
+    pt.insert(1, "é");
+    let mut out = Vec::new();
+    pt.write_to(&mut out).unwrap();
+    assert_eq!(String::from_utf8(out).unwrap(), "aébc");
+}
+
+#[test]
+fn test_crlf_detection_across_piece_boundary() {
+    let mut pt = PieceTable::from_str("a\r");
+    pt.insert(2, "\nb");
+    assert!(pt.has_crlf_in_initial_bytes(4096));
+    assert!(!pt.has_crlf_in_initial_bytes(2));
+    assert!(!PieceTable::from_str("a\nb").has_crlf_in_initial_bytes(4096));
 }

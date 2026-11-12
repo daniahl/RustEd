@@ -55,6 +55,7 @@ pub struct Document {
     pub find_open: bool,
     pub find_query: String,
     pub focus_find_input: bool,
+    pub focus_editor: bool,
 }
 
 impl Default for Document {
@@ -88,6 +89,7 @@ impl Document {
             find_open: false,
             find_query: String::new(),
             focus_find_input: false,
+            focus_editor: false,
         }
     }
 
@@ -110,8 +112,11 @@ impl Document {
 
     pub fn save_current_file(&mut self) {
         if !self.path.is_empty() && self.is_current_dirty {
-            if fs::write(&self.path, self.text.as_str()).is_ok() {
-                self.saved_text = self.text.to_string();
+            let write_ok = fs::File::create(&self.path)
+                .and_then(|file| self.text.write_to(std::io::BufWriter::new(file)))
+                .is_ok();
+            if write_ok {
+                self.saved_text.clear();
                 self.saved_revision = self.text_revision;
                 self.is_current_dirty = false;
                 self.unsaved_files.remove(Path::new(&self.path));
@@ -182,9 +187,9 @@ impl Document {
                 });
             }
             IncomingFile::FromDisk(content) => {
-                self.line_count = content.bytes().filter(|&b| b == b'\n').count() + 1;
-                self.saved_text = content.clone();
+                self.saved_text.clear();
                 self.text = PieceTable::from_string(content);
+                self.line_count = self.text.line_count();
                 self.saved_revision = self.text_revision;
                 self.is_current_dirty = false;
                 self.cursor_line = 1;
@@ -373,29 +378,13 @@ impl Document {
                 if range.primary != range.secondary {
                     let [min_c, max_c] = range.sorted();
                     let count = max_c.index - min_c.index;
-                    let mut char_iter = self.text.char_indices();
-                    let start_byte = if min_c.index == 0 {
-                        Some(0)
-                    } else {
-                        char_iter.nth(min_c.index).map(|(b, _)| b)
-                    };
-                    if let Some(sb) = start_byte {
-                        let end_byte = if count == 0 {
-                            Some(sb)
-                        } else {
-                            char_iter
-                                .nth(count - 1)
-                                .map(|(b, c)| b + c.len_utf8())
-                                .or(Some(self.text.len()))
-                        };
-                        if let Some(eb) = end_byte {
-                            let selected = &self.text[sb..eb];
-                            if !selected.is_empty()
-                                && !selected.contains('\n')
-                                && !selected.contains('\r')
-                            {
-                                self.find_query = selected.to_string();
-                            }
+                    if count > 0 && count <= 1024 {
+                        let selected = self.text.slice_chars(min_c.index..max_c.index);
+                        if !selected.is_empty()
+                            && !selected.contains('\n')
+                            && !selected.contains('\r')
+                        {
+                            self.find_query = selected;
                         }
                     }
                 }
@@ -420,28 +409,18 @@ impl Document {
             .map(|r| r.primary.index.max(r.secondary.index))
             .unwrap_or(0);
 
-        let start_byte = if start_char_idx == 0 {
-            0
+        let start_byte = self.text.char_to_byte(start_char_idx);
+        let text_str = self.text.as_str();
+
+        let match_byte = if let Some(rel) = text_str[start_byte..].find(&self.find_query) {
+            start_byte + rel
+        } else if let Some(mb) = text_str.find(&self.find_query) {
+            mb
         } else {
-            self.text
-                .char_indices()
-                .nth(start_char_idx)
-                .map(|(b, _)| b)
-                .unwrap_or(self.text.len())
+            return false;
         };
 
-        let (_match_byte, match_start_char) =
-            if let Some(rel) = self.text[start_byte..].find(&self.find_query) {
-                let mb = start_byte + rel;
-                let mc = start_char_idx + self.text[start_byte..mb].chars().count();
-                (mb, mc)
-            } else if let Some(mb) = self.text.find(&self.find_query) {
-                let mc = self.text[..mb].chars().count();
-                (mb, mc)
-            } else {
-                return false;
-            };
-
+        let match_start_char = self.text.byte_to_char(match_byte);
         let match_end_char = match_start_char + self.find_query.chars().count();
 
         state.cursor.set_char_range(Some(egui::text::CCursorRange::two(
@@ -646,7 +625,13 @@ impl Document {
                         .text_revision(text_revision)
                         .virtualized(is_large);
                         let output = editor.show(ui);
+                        if self.focus_editor {
+                            output.response.request_focus();
+                            self.focus_editor = false;
+                        }
                         editor_text_changed = output.text_changed;
+
+                        const WRAPPED_ROW_FLAG: u32 = 0x8000_0000;
 
                         // Rebuild the row -> line-number table only when the galley changed.
                         let stale = match &self.gutter_cache {
@@ -669,7 +654,7 @@ impl Document {
                                         line_no += 1;
                                         nums.push(line_no);
                                     } else {
-                                        nums.push(0);
+                                        nums.push(line_no | WRAPPED_ROW_FLAG);
                                     }
                                     new_line = row.ends_with_newline;
                                 }
@@ -691,13 +676,7 @@ impl Document {
                                     1
                                 } else {
                                     let end = focus.row.min(nums.len() - 1);
-                                    nums[..=end]
-                                        .iter()
-                                        .rev()
-                                        .copied()
-                                        .find(|&n| n > 0)
-                                        .map(|n| n as usize)
-                                        .unwrap_or(1)
+                                    ((nums[end] & !WRAPPED_ROW_FLAG) as usize).max(1)
                                 }
                             } else {
                                 focus.row + 1
@@ -730,7 +709,7 @@ impl Document {
                                     break;
                                 }
                                 let n = nums.get(row_idx).copied().unwrap_or(0);
-                                if n == 0 {
+                                if n == 0 || (n & WRAPPED_ROW_FLAG) != 0 {
                                     continue;
                                 }
                                 let color = if active_row == Some(row_idx) {
@@ -763,7 +742,6 @@ impl Document {
 
         if editor_text_changed {
             self.text_revision = self.text_revision.wrapping_add(1);
-            self.refresh_line_ending();
             let was_dirty = self.is_current_dirty;
             self.is_current_dirty =
                 !self.path.is_empty() && self.text_revision != self.saved_revision;
