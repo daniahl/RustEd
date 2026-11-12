@@ -1,4 +1,4 @@
-//! Integration tests for the `FastEditor` widget.
+﻿//! Integration tests for the `FastEditor` widget.
 //!
 //! Validates text editing lifecycle, AccessKit node hierarchy, cursor navigation,
 //! clipboard paste scrolling, and layout caching.
@@ -310,6 +310,9 @@ fn test_paste_scrolls_to_caret() {
 #[test]
 fn test_coalesced_relayout_and_long_line_accesskit() {
     let ctx = egui::Context::default();
+    ctx.options_mut(|o| {
+        o.max_passes = std::num::NonZeroUsize::new(2).unwrap();
+    });
     ctx.enable_accesskit();
 
     let mut text = String::new();
@@ -473,4 +476,122 @@ fn test_virtualized_large_file_layout_and_editing() {
     let cur = last_cursor.unwrap().primary;
     assert_eq!(cur.rcursor.row, 1);
     assert_eq!(cur.rcursor.column, 3);
+}
+
+/// Runs Ctrl+A then Delete on a document made of one very long line and returns, after every
+/// frame, `(run_text_len, character_index, caret_bounding_box)`.
+fn long_line_ctrl_a_delete_focus(
+    len: usize,
+    no_spaces: bool,
+    gap_frames: usize,
+) -> Vec<Option<(usize, usize, egui::accesskit::Rect)>> {
+    use rusted::app::TextEditor;
+    let temp_dir = std::env::temp_dir().join(format!(
+        "rusted_ak_{}_{}_{}_{}",
+        len,
+        no_spaces,
+        gap_frames,
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&temp_dir);
+    std::fs::create_dir_all(&temp_dir).unwrap();
+
+    let ctx = egui::Context::default();
+    ctx.options_mut(|o| {
+        o.max_passes = std::num::NonZeroUsize::new(2).unwrap();
+    });
+    ctx.enable_accesskit();
+    let mut app = TextEditor::new_headless(&temp_dir);
+    app.text = if no_spaces {
+        "a".repeat(len).into()
+    } else {
+        "word ".repeat(len / 5).into()
+    };
+    app.text_revision = 1;
+    app.focus_editor_pending = true;
+
+    let key = |k: Key| Event::Key {
+        key: k,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: if k == Key::A {
+            egui::Modifiers::COMMAND
+        } else {
+            egui::Modifiers::NONE
+        },
+    };
+    let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), Vec2::new(900.0, 600.0));
+    let mut tree: Option<accesskit_consumer::Tree> = None;
+    let mut history = Vec::new();
+    let mut frame = |events: Vec<Event>, app: &mut TextEditor| {
+        let input = egui::RawInput {
+            screen_rect: Some(screen),
+            events,
+            ..Default::default()
+        };
+        let out = ctx.run(input, |ctx| app.update_ui(ctx));
+        if let Some(u) = out.platform_output.accesskit_update {
+            match tree.as_mut() {
+                None => tree = Some(accesskit_consumer::Tree::new(u, true)),
+                Some(t) => t.update(u),
+            }
+        }
+        let state = tree.as_ref().unwrap().state();
+        let focus_node = state.focus();
+        let caret_box = focus_node
+            .as_ref()
+            .and_then(|n| n.text_selection())
+            .and_then(|s| s.bounding_boxes().into_iter().next());
+        let focus = focus_node
+            .and_then(|n| n.raw_text_selection().map(|s| s.focus))
+            .and_then(|pos| {
+                let run = state.node_by_id(pos.node)?;
+                let run_len = run.value().map_or(0, |v| v.chars().count());
+                let rect = caret_box?;
+                Some((run_len, pos.character_index, rect))
+            });
+        history.push(focus);
+    };
+    for _ in 0..4 {
+        frame(vec![], &mut app);
+    }
+    frame(vec![key(Key::A)], &mut app);
+    for _ in 0..gap_frames {
+        frame(vec![], &mut app);
+    }
+    frame(vec![key(Key::Delete)], &mut app);
+    for _ in 0..4 {
+        frame(vec![], &mut app);
+    }
+    assert!(app.text.is_empty());
+    let _ = std::fs::remove_dir_all(&temp_dir);
+    history
+}
+
+#[test]
+fn test_accesskit_caret_moves_to_start_after_select_all_delete_on_long_line() {
+    for no_spaces in [false, true] {
+        for gap_frames in [0usize, 1] {
+            for len in [3_000usize, 15_000, 200_000] {
+                let history = long_line_ctrl_a_delete_focus(len, no_spaces, gap_frames);
+                let (_, _, initial_rect) = history[3].expect("initial caret must be exposed");
+                let delete_frame_idx = 5 + gap_frames;
+                for (i, entry) in history[delete_frame_idx..].iter().enumerate() {
+                    let (run_len, idx, rect) = entry
+                        .unwrap_or_else(|| panic!("len={len}: missing caret after Delete ({i})"));
+                    assert_eq!((run_len, idx), (2, 1), "len={len}: caret index mismatch");
+                    assert!(
+                        rect.height() >= 10.0,
+                        "len={len}: post-Delete caret rect must have line height, got {rect:?}"
+                    );
+                    assert!(
+                        (rect.x0 - initial_rect.x0).abs() <= 1.0
+                            && (rect.y0 - initial_rect.y0).abs() <= 3.0,
+                        "len={len}: caret must return to start ({initial_rect:?}), got {rect:?}"
+                    );
+                }
+            }
+        }
+    }
 }

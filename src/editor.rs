@@ -730,9 +730,15 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
         let painter = ui.painter_at(rect);
 
         // Selection & cursor rendering
-        let cursor_box = galley
+        // An empty galley has a zero-height row; give the caret box full line height so
+        // scroll_to_rect, cursor_in_view, and caret painting use consistent bounds.
+        let line_height = ui.text_style_height(&egui::TextStyle::Monospace);
+        let mut cursor_box = galley
             .pos_from_cursor(&cursor_range.primary)
             .translate(galley_pos.to_vec2());
+        if cursor_box.height() < line_height {
+            cursor_box.max.y = cursor_box.min.y + line_height;
+        }
         let cursor_moved = state.cursor.char_range() != prev_cursor_range;
 
         if has_focus && (text_changed || cursor_moved) {
@@ -793,18 +799,12 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
 
         if has_focus {
             let now = ui.input(|i| i.time);
-            let mut primary_cursor_rect = cursor_box;
-            // An empty galley has a zero-height row, which would render only a sliver of the caret.
-            let line_height = ui.text_style_height(&egui::TextStyle::Monospace);
-            if primary_cursor_rect.height() < line_height {
-                primary_cursor_rect.max.y = primary_cursor_rect.min.y + line_height;
-            }
             // Use the full visible clip rect so the caret is never cut off at the edges.
             let cursor_painter = ui.painter().with_clip_rect(ui.clip_rect());
             paint_text_cursor(
                 ui,
                 &cursor_painter,
-                primary_cursor_rect,
+                cursor_box,
                 now - state.last_interaction_time,
             );
         }
@@ -1383,7 +1383,7 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
             None
         };
 
-        let cursor_box = if let Some(lp) = local_primary {
+        let mut cursor_box = if let Some(lp) = local_primary {
             galley
                 .pos_from_cursor(&lp)
                 .translate(window_galley_pos.to_vec2())
@@ -1392,6 +1392,9 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
             let y = base_pos.y + cur_line as f32 * line_height;
             Rect::from_min_size(Pos2::new(x, y), Vec2::new(1.0, line_height))
         };
+        if cursor_box.height() < line_height {
+            cursor_box.max.y = cursor_box.min.y + line_height;
+        }
 
         let cursor_moved = ccursor_range != prev_ccursor_range;
         if has_focus && (text_changed || cursor_moved) {
@@ -1456,15 +1459,11 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
 
         if has_focus {
             let now = ui.input(|i| i.time);
-            let mut primary_cursor_rect = cursor_box;
-            if primary_cursor_rect.height() < line_height {
-                primary_cursor_rect.max.y = primary_cursor_rect.min.y + line_height;
-            }
             let cursor_painter = ui.painter().with_clip_rect(ui.clip_rect());
             paint_text_cursor(
                 ui,
                 &cursor_painter,
-                primary_cursor_rect,
+                cursor_box,
                 now - state.last_interaction_time,
             );
         }
@@ -1642,8 +1641,12 @@ fn update_accesskit(
             });
         }
 
+        let line_height = ui.text_style_height(&egui::TextStyle::Monospace);
         let mut row_min = galley_pos + row.rect.min.to_vec2();
         let mut row_max = galley_pos + row.rect.max.to_vec2();
+        if row_max.y - row_min.y < line_height {
+            row_max.y = row_min.y + line_height;
+        }
 
         row_min.y = row_min.y.clamp(text_clip_rect.min.y, text_clip_rect.max.y);
         row_max.y = row_max.y.clamp(row_min.y, text_clip_rect.max.y);
