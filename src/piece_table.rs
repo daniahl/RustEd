@@ -1166,12 +1166,16 @@ impl eframe::egui::TextBuffer for PieceTable {
         self.as_str()
     }
 
-    fn insert_text(&mut self, text: &str, char_index: usize) -> usize {
-        self.insert(char_index, text)
+    fn insert_text(&mut self, text: &str, char_index: eframe::egui::text::CharIndex) -> usize {
+        self.insert(char_index.0, text)
     }
 
-    fn delete_char_range(&mut self, char_range: Range<usize>) {
-        self.delete(char_range);
+    fn delete_char_range(&mut self, char_range: Range<eframe::egui::text::CharIndex>) {
+        self.delete(char_range.start.0..char_range.end.0);
+    }
+
+    fn type_id(&self) -> std::any::TypeId {
+        std::any::TypeId::of::<Self>()
     }
 
     fn clear(&mut self) {

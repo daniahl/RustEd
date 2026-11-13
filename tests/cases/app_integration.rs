@@ -11,6 +11,16 @@ use rusted::{
 };
 use std::{fs, path::Path};
 
+fn run_ui(
+    ctx: &egui::Context,
+    input: egui::RawInput,
+    f: impl FnMut(&mut egui::Ui),
+) -> egui::FullOutput {
+    let mut out = ctx.run_ui(input, f);
+    out.textures_delta.clear();
+    out
+}
+
 #[test]
 fn test_find_dialog_ctrl_f_and_f3_find_next() {
     let temp_dir =
@@ -28,8 +38,8 @@ fn test_find_dialog_ctrl_f_and_f3_find_next() {
     app.text_revision = 1;
 
     // Render initial frame
-    let _ = ctx.run(egui::RawInput::default(), |ctx| {
-        app.update_ui(ctx);
+    let _ = run_ui(&ctx, egui::RawInput::default(), |ui| {
+        app.update_ui(ui);
     });
     assert!(!app.find_open);
 
@@ -42,12 +52,12 @@ fn test_find_dialog_ctrl_f_and_f3_find_next() {
         repeat: false,
         modifiers: egui::Modifiers::CTRL,
     });
-    let _ = ctx.run(ctrl_f_input, |ctx| {
-        app.update_ui(ctx);
+    let _ = run_ui(&ctx, ctrl_f_input, |ui| {
+        app.update_ui(ui);
     });
     assert!(app.find_open, "Ctrl+F should open the Find dialog");
     assert!(
-        ctx.memory(|m| m.has_focus(egui::Id::new("find_query_input"))),
+        ctx.memory(|m| m.has_focus(egui::Id::unique("find_query_input"))),
         "Find input should have focus immediately on the first Ctrl+F"
     );
 
@@ -63,8 +73,8 @@ fn test_find_dialog_ctrl_f_and_f3_find_next() {
         repeat: false,
         modifiers: egui::Modifiers::NONE,
     });
-    let out_enter = ctx.run(type_and_enter, |ctx| {
-        app.update_ui(ctx);
+    let out_enter = run_ui(&ctx, type_and_enter, |ui| {
+        app.update_ui(ui);
     });
     assert!(!app.find_open, "Pressing Enter in Find dialog should close it");
     assert_eq!(
@@ -72,14 +82,14 @@ fn test_find_dialog_ctrl_f_and_f3_find_next() {
         "Pressing Enter in Find dialog should not insert a newline into the editor"
     );
 
-    let editor_id = egui::Id::new("code_editor");
+    let editor_id = egui::Id::unique("code_editor");
     assert!(
         ctx.memory(|m| m.has_focus(editor_id)),
         "Editor should have focus after Find"
     );
     // Run the immediate follow-up repaint frame that synchronizes the AccessKit text selection
-    let out_sync = ctx.run(egui::RawInput::default(), |ctx| {
-        app.update_ui(ctx);
+    let out_sync = run_ui(&ctx, egui::RawInput::default(), |ui| {
+        app.update_ui(ui);
     });
     let editor_ak_id: egui::accesskit::NodeId = editor_id.value().into();
     let ak_enter = out_enter.platform_output.accesskit_update.unwrap();
@@ -100,8 +110,8 @@ fn test_find_dialog_ctrl_f_and_f3_find_next() {
     let get_sel = |ctx: &egui::Context| -> Option<(usize, usize)> {
         let st = ctx.data_mut(|d| d.get_temp::<FastEditorState>(editor_id))?;
         let r = st.cursor.char_range()?;
-        let [min_c, max_c] = r.sorted();
-        Some((min_c.index, max_c.index))
+        let [min_c, max_c] = r.sorted_cursors();
+        Some((min_c.index.0, max_c.index.0))
     };
 
     assert_eq!(get_sel(&ctx), Some((0, 5)), "Find should select first 'alpha'");
@@ -115,8 +125,8 @@ fn test_find_dialog_ctrl_f_and_f3_find_next() {
         repeat: false,
         modifiers: egui::Modifiers::NONE,
     });
-    let _ = ctx.run(esc_input, |ctx| {
-        app.update_ui(ctx);
+    let _ = run_ui(&ctx, esc_input, |ui| {
+        app.update_ui(ui);
     });
     let focused_after_esc = ctx.memory(|m| m.focused());
     assert_eq!(
@@ -140,20 +150,20 @@ fn test_find_dialog_ctrl_f_and_f3_find_next() {
     });
 
     // Press F3 -> second occurrence at char index 11..16
-    let _ = ctx.run(f3_input.clone(), |ctx| {
-        app.update_ui(ctx);
+    let _ = run_ui(&ctx, f3_input.clone(), |ui| {
+        app.update_ui(ui);
     });
     assert_eq!(get_sel(&ctx), Some((11, 16)), "Second F3 should select second 'alpha'");
 
     // Press F3 again -> third occurrence at char index 23..28
-    let _ = ctx.run(f3_input.clone(), |ctx| {
-        app.update_ui(ctx);
+    let _ = run_ui(&ctx, f3_input.clone(), |ui| {
+        app.update_ui(ui);
     });
     assert_eq!(get_sel(&ctx), Some((23, 28)), "Third F3 should select third 'alpha'");
 
     // Press F3 again -> wraps around to first occurrence at 0..5
-    let _ = ctx.run(f3_input, |ctx| {
-        app.update_ui(ctx);
+    let _ = run_ui(&ctx, f3_input, |ui| {
+        app.update_ui(ui);
     });
     assert_eq!(get_sel(&ctx), Some((0, 5)), "Fourth F3 should wrap around to first 'alpha'");
 
@@ -184,16 +194,16 @@ fn test_unsaved_state_asterisk_and_file_switching() {
     assert!(!app.is_file_dirty(&file_a));
 
     // Focus editor in frame 1
-    let _ = ctx.run(egui::RawInput::default(), |ctx| {
-        app.update_ui(ctx);
-        ctx.memory_mut(|m| m.request_focus(egui::Id::new("code_editor")));
+    let _ = run_ui(&ctx, egui::RawInput::default(), |ui| {
+        app.update_ui(ui);
+        ui.ctx().memory_mut(|m| m.request_focus(egui::Id::unique("code_editor")));
     });
 
     // 3. Edit file_a in frame 2
     let mut input = egui::RawInput::default();
     input.events.push(egui::Event::Text("// edited\n".to_string()));
-    let _ = ctx.run(input, |ctx| {
-        app.update_ui(ctx);
+    let _ = run_ui(&ctx, input, |ui| {
+        app.update_ui(ui);
     });
 
     assert_eq!(app.text, "// edited\nfn a() {}\n");
@@ -283,8 +293,8 @@ fn test_tree_new_folder_new_file_rename_and_f2() {
         repeat: false,
         modifiers: egui::Modifiers::NONE,
     });
-    let _ = ctx.run(f2_input, |ctx| {
-        app.update_ui(ctx);
+    let _ = run_ui(&ctx, f2_input, |ui| {
+        app.update_ui(ui);
     });
 
     assert!(
@@ -308,8 +318,8 @@ fn test_tree_new_folder_new_file_rename_and_f2() {
         repeat: false,
         modifiers: egui::Modifiers::NONE,
     });
-    let _ = ctx.run(enter_input, |ctx| {
-        app.update_ui(ctx);
+    let _ = run_ui(&ctx, enter_input, |ui| {
+        app.update_ui(ui);
     });
 
     let renamed_file = nested_dir.join("lib.rs");
@@ -368,11 +378,11 @@ fn test_switch_to_terminal_and_back_to_editor() {
     let mut app = TextEditor::new_headless(&temp_dir);
 
     let editor_row_id: egui::accesskit::NodeId =
-        egui::Id::new("code_editor").with(0usize).value().into();
+        egui::Id::unique("code_editor").with(0usize).value().into();
 
     // Frame 1: Editor tab (initial render)
-    let out1 = ctx.run(egui::RawInput::default(), |ctx| {
-        app.update_ui(ctx);
+    let out1 = run_ui(&ctx, egui::RawInput::default(), |ui| {
+        app.update_ui(ui);
     });
     let u1 = out1.platform_output.accesskit_update.unwrap();
     assert!(
@@ -381,8 +391,8 @@ fn test_switch_to_terminal_and_back_to_editor() {
     );
 
     // Frame 2: Consecutive idle editor frame -> TextRun should NOT be rebuilt
-    let out2 = ctx.run(egui::RawInput::default(), |ctx| {
-        app.update_ui(ctx);
+    let out2 = run_ui(&ctx, egui::RawInput::default(), |ui| {
+        app.update_ui(ui);
     });
     let u2 = out2.platform_output.accesskit_update.unwrap();
     assert!(
@@ -392,15 +402,15 @@ fn test_switch_to_terminal_and_back_to_editor() {
 
     // Frame 3: Switch to Terminal tab -> Editor removed, Terminal shown
     app.tab = rusted::app::Tab::Terminal;
-    let out3 = ctx.run(egui::RawInput::default(), |ctx| {
-        app.update_ui(ctx);
+    let out3 = run_ui(&ctx, egui::RawInput::default(), |ui| {
+        app.update_ui(ui);
     });
     let u3 = out3.platform_output.accesskit_update.unwrap();
 
     // Frame 4: Switch back to Editor tab -> Editor re-shown after being hidden
     app.tab = rusted::app::Tab::Editor;
-    let out4 = ctx.run(egui::RawInput::default(), |ctx| {
-        app.update_ui(ctx);
+    let out4 = run_ui(&ctx, egui::RawInput::default(), |ui| {
+        app.update_ui(ui);
     });
     let u4 = out4.platform_output.accesskit_update.unwrap();
     assert!(
@@ -410,15 +420,15 @@ fn test_switch_to_terminal_and_back_to_editor() {
 
     // Frame 5: Switch to Terminal tab again
     app.tab = rusted::app::Tab::Terminal;
-    let out5 = ctx.run(egui::RawInput::default(), |ctx| {
-        app.update_ui(ctx);
+    let out5 = run_ui(&ctx, egui::RawInput::default(), |ui| {
+        app.update_ui(ui);
     });
     let u5 = out5.platform_output.accesskit_update.unwrap();
 
     // Frame 6: Switch back to Editor tab again
     app.tab = rusted::app::Tab::Editor;
-    let out6 = ctx.run(egui::RawInput::default(), |ctx| {
-        app.update_ui(ctx);
+    let out6 = run_ui(&ctx, egui::RawInput::default(), |ui| {
+        app.update_ui(ui);
     });
     let u6 = out6.platform_output.accesskit_update.unwrap();
     assert!(
@@ -427,12 +437,29 @@ fn test_switch_to_terminal_and_back_to_editor() {
     );
 
     // Feed all updates into accesskit consumer Tree to ensure no panics occur
+    struct NoOpHandler;
+    impl accesskit_consumer::TreeChangeHandler for NoOpHandler {
+        fn node_added(&mut self, _node: &accesskit_consumer::NodeRef) {}
+        fn node_updated(
+            &mut self,
+            _old_node: &accesskit_consumer::NodeRef,
+            _new_node: &accesskit_consumer::NodeRef,
+        ) {
+        }
+        fn focus_moved(
+            &mut self,
+            _old_node: Option<&accesskit_consumer::NodeRef>,
+            _new_node: Option<&accesskit_consumer::NodeRef>,
+        ) {
+        }
+        fn node_removed(&mut self, _node: &accesskit_consumer::NodeRef) {}
+    }
     let mut tree = accesskit_consumer::Tree::new(u1, false);
-    tree.update(u2);
-    tree.update(u3);
-    tree.update(u4);
-    tree.update(u5);
-    tree.update(u6);
+    tree.update_and_process_changes(u2, &mut NoOpHandler);
+    tree.update_and_process_changes(u3, &mut NoOpHandler);
+    tree.update_and_process_changes(u4, &mut NoOpHandler);
+    tree.update_and_process_changes(u5, &mut NoOpHandler);
+    tree.update_and_process_changes(u6, &mut NoOpHandler);
 
     let _ = fs::remove_dir_all(&temp_dir);
 }
@@ -452,20 +479,20 @@ fn test_editor_has_focus_on_startup_when_requested() {
     app.focus_editor_pending = true;
 
     for _ in 0..2 {
-        let _ = ctx.run(egui::RawInput::default(), |ctx| app.update_ui(ctx));
+        let _ = run_ui(&ctx, egui::RawInput::default(), |ui| app.update_ui(ui));
     }
     assert!(!app.focus_editor_pending, "request is consumed once");
     assert!(
-        ctx.memory(|m| m.has_focus(egui::Id::new("code_editor"))),
+        ctx.memory(|m| m.has_focus(egui::Id::unique("code_editor"))),
         "editor should hold keyboard focus (active caret) after the first frames"
     );
 
     // Focus is not forcibly re-grabbed after the user moves it elsewhere.
-    ctx.memory_mut(|m| m.surrender_focus(egui::Id::new("code_editor")));
+    ctx.memory_mut(|m| m.surrender_focus(egui::Id::unique("code_editor")));
     for _ in 0..2 {
-        let _ = ctx.run(egui::RawInput::default(), |ctx| app.update_ui(ctx));
+        let _ = run_ui(&ctx, egui::RawInput::default(), |ui| app.update_ui(ui));
     }
-    assert!(!ctx.memory(|m| m.has_focus(egui::Id::new("code_editor"))));
+    assert!(!ctx.memory(|m| m.has_focus(egui::Id::unique("code_editor"))));
 
     let _ = fs::remove_dir_all(&temp_dir);
 }
@@ -516,7 +543,7 @@ fn test_sidebar_lists_startup_folder_contents() {
     let mut app = TextEditor::new_with_folder(ctx.clone(), Some(dir.clone()));
     let mut labels = Vec::new();
     for _ in 0..2 {
-        let out = ctx.run(egui::RawInput::default(), |ctx| app.update_ui(ctx));
+        let out = run_ui(&ctx, egui::RawInput::default(), |ui| app.update_ui(ui));
         if let Some(u) = out.platform_output.accesskit_update {
             labels.extend(u.nodes.iter().filter_map(|(_, n)| n.label().map(str::to_string)));
         }
@@ -554,8 +581,8 @@ fn test_ctrl_tab_switches_tabs_between_editor_and_terminal() {
     assert_eq!(app.tab, rusted::app::Tab::Editor);
 
     // Initial render
-    let _ = ctx.run(egui::RawInput::default(), |ctx| {
-        app.update_ui(ctx);
+    let _ = run_ui(&ctx, egui::RawInput::default(), |ui| {
+        app.update_ui(ui);
     });
 
     // Press Ctrl+Tab -> Should switch to Terminal
@@ -567,12 +594,12 @@ fn test_ctrl_tab_switches_tabs_between_editor_and_terminal() {
         repeat: false,
         modifiers: egui::Modifiers::CTRL,
     });
-    let _ = ctx.run(ctrl_tab_input, |ctx| {
-        app.update_ui(ctx);
+    let _ = run_ui(&ctx, ctrl_tab_input, |ui| {
+        app.update_ui(ui);
     });
     assert_eq!(app.tab, rusted::app::Tab::Terminal, "Ctrl+Tab should switch from Editor to Terminal");
     assert!(
-        ctx.memory(|m| m.has_focus(egui::Id::new("conpty_terminal"))),
+        ctx.memory(|m| m.has_focus(egui::Id::unique("conpty_terminal"))),
         "Switching to Terminal should give focus to the terminal"
     );
 
@@ -585,12 +612,12 @@ fn test_ctrl_tab_switches_tabs_between_editor_and_terminal() {
         repeat: false,
         modifiers: egui::Modifiers::CTRL,
     });
-    let _ = ctx.run(ctrl_tab_input2, |ctx| {
-        app.update_ui(ctx);
+    let _ = run_ui(&ctx, ctrl_tab_input2, |ui| {
+        app.update_ui(ui);
     });
     assert_eq!(app.tab, rusted::app::Tab::Editor, "Ctrl+Tab should switch from Terminal to Editor");
     assert!(
-        ctx.memory(|m| m.has_focus(egui::Id::new("code_editor"))),
+        ctx.memory(|m| m.has_focus(egui::Id::unique("code_editor"))),
         "Switching to Editor should give focus to the code editor"
     );
 
@@ -607,8 +634,8 @@ fn test_ctrl_tab_switches_tabs_between_editor_and_terminal() {
             ..Default::default()
         },
     });
-    let _ = ctx.run(ctrl_shift_tab_input, |ctx| {
-        app.update_ui(ctx);
+    let _ = run_ui(&ctx, ctrl_shift_tab_input, |ui| {
+        app.update_ui(ui);
     });
     assert_eq!(app.tab, rusted::app::Tab::Terminal, "Ctrl+Shift+Tab should switch between tabs");
 
@@ -625,4 +652,51 @@ fn test_app_icon_assets_valid() {
     let ico = include_bytes!("../../assets/rusted.ico");
     assert!(ico.len() > 22);
     assert_eq!(&ico[0..6], &[0, 0, 1, 0, 4, 0]);
+}
+
+#[test]
+fn test_ctrl_s_saves_dirty_file_in_editor() {
+    let temp_dir =
+        std::env::temp_dir().join(format!("rusted_ctrl_s_test_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+    let file_path = temp_dir.join("notes.txt");
+    fs::write(&file_path, "initial").unwrap();
+
+    let ctx = egui::Context::default();
+    let mut app = TextEditor::new_headless(&temp_dir);
+    app.doc.open_file(&ctx, file_path.clone());
+
+    // Edit the file so it becomes dirty
+    app.doc.text = "updated content".into();
+    app.doc.text_revision = app.doc.text_revision.wrapping_add(1);
+    app.doc.is_current_dirty = true;
+    assert!(app.doc.can_save());
+
+    // Render one frame, then press Ctrl+S
+    let _ = run_ui(&ctx, egui::RawInput::default(), |ui| {
+        app.update_ui(ui);
+    });
+
+    let mut ctrl_s_input = egui::RawInput::default();
+    ctrl_s_input.events.push(egui::Event::Key {
+        key: egui::Key::S,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: egui::Modifiers::CTRL,
+    });
+    let _ = run_ui(&ctx, ctrl_s_input, |ui| {
+        app.update_ui(ui);
+    });
+
+    assert!(!app.doc.is_current_dirty, "Ctrl+S should clear dirty state");
+    assert!(!app.doc.can_save(), "Ctrl+S should disable Save after saving");
+    assert_eq!(
+        fs::read_to_string(&file_path).unwrap(),
+        "updated content",
+        "Ctrl+S should write updated buffer to disk"
+    );
+
+    let _ = fs::remove_dir_all(&temp_dir);
 }

@@ -36,7 +36,11 @@ pub struct TerminalPane {
 impl TerminalPane {
     pub fn new(ctx: egui::Context, working_dir: Option<&Path>) -> Self {
         let term = Arc::new(Mutex::new(TerminalState {
-            parser: vt100::Parser::new(TERM_ROWS, TERM_COLS, 0),
+            parser: vt100::Parser::new(
+                std::num::NonZeroU16::new(TERM_ROWS).unwrap(),
+                std::num::NonZeroU16::new(TERM_COLS).unwrap(),
+                0,
+            ),
             pty_updated: true,
         }));
         let mut pty_writer = None;
@@ -57,8 +61,15 @@ impl TerminalPane {
             if let Some(dir) = cwd {
                 cmd.cwd(dir);
             }
-            if let Ok(child) = pair.slave.spawn_command(cmd) {
-                pty_child = Some(child);
+            match pair.slave.spawn_command(cmd) {
+                Ok(child) => {
+                    pty_child = Some(child);
+                }
+                Err(e) => {
+                    let mut lock = term.lock().unwrap();
+                    lock.parser
+                        .process(format!("Failed to spawn shell: {e}\r\n").as_bytes());
+                }
             }
             drop(pair.slave);
 
@@ -75,6 +86,7 @@ impl TerminalPane {
 
             if let Ok(mut reader) = pair.master.try_clone_reader() {
                 let term_clone = Arc::clone(&term);
+                let dsr_writer = pty_writer.clone();
                 thread::spawn(move || {
                     let mut buf = [0u8; 4096];
                     while let Ok(n) = reader.read(&mut buf) {
@@ -83,8 +95,15 @@ impl TerminalPane {
                         }
                         let mut lock = term_clone.lock().unwrap();
                         lock.parser.process(&buf[..n]);
+                        let cpr_reply = buf[..n].windows(4).any(|w| w == b"\x1b[6n").then(|| {
+                            let (row, col) = lock.parser.screen().cursor_position();
+                            format!("\x1b[{};{}R", row + 1, col + 1).into_bytes()
+                        });
                         let was_updated = std::mem::replace(&mut lock.pty_updated, true);
                         drop(lock);
+                        if let (Some(tx), Some(reply)) = (&dsr_writer, cpr_reply) {
+                            let _ = tx.send(reply);
+                        }
                         if !was_updated {
                             ctx.request_repaint();
                         }
@@ -114,7 +133,11 @@ impl TerminalPane {
     pub fn new_headless() -> Self {
         Self {
             term: Arc::new(Mutex::new(TerminalState {
-                parser: vt100::Parser::new(TERM_ROWS, TERM_COLS, 0),
+                parser: vt100::Parser::new(
+                    std::num::NonZeroU16::new(TERM_ROWS).unwrap(),
+                    std::num::NonZeroU16::new(TERM_COLS).unwrap(),
+                    0,
+                ),
                 pty_updated: false,
             })),
             term_screen_text: String::new(),
@@ -132,6 +155,19 @@ impl TerminalPane {
         "120x30"
     }
 
+    /// Terminates the current PTY session (if any) and spawns a fresh terminal in `working_dir`.
+    pub fn restart(&mut self, ctx: &egui::Context, working_dir: Option<&Path>) {
+        let next_revision = self.term_revision.wrapping_add(1);
+        if let Some(mut child) = self._pty_child.take() {
+            let _ = child.kill();
+        }
+        self.pty_writer = None;
+        self._pty_master = None;
+        *self = Self::new(ctx.clone(), working_dir);
+        self.term_revision = next_revision;
+        self.focus_terminal = true;
+    }
+
     pub fn write_to_pty(&mut self, bytes: &[u8]) {
         if let Some(writer) = &self.pty_writer {
             let _ = writer.send(bytes.to_vec());
@@ -144,20 +180,19 @@ impl TerminalPane {
         }
 
         let mut to_send: Vec<u8> = Vec::new();
-        let mut exit_selection_mode = false;
-        let mut entered_selection_mode = false;
+        let mut clear_selection = false;
 
         ctx.input_mut(|i| {
             i.events.retain(|event| {
                 match event {
                     egui::Event::Text(text) => {
                         to_send.extend_from_slice(text.as_bytes());
-                        exit_selection_mode = true;
+                        clear_selection = true;
                         false
                     }
                     egui::Event::Paste(text) => {
                         to_send.extend_from_slice(text.as_bytes());
-                        exit_selection_mode = true;
+                        clear_selection = true;
                         false
                     }
                     egui::Event::Cut => false,
@@ -175,19 +210,8 @@ impl TerminalPane {
                         modifiers,
                         ..
                     } => {
-                        if modifiers.shift
-                            && matches!(
-                                key,
-                                egui::Key::ArrowLeft
-                                    | egui::Key::ArrowRight
-                                    | egui::Key::ArrowUp
-                                    | egui::Key::ArrowDown
-                                    | egui::Key::Home
-                                    | egui::Key::End
-                            )
-                        {
-                            entered_selection_mode = true;
-                            return true;
+                        if *key == egui::Key::C && modifiers.ctrl && self.selecting_in_terminal {
+                            return false;
                         }
 
                         let seq: Option<&[u8]> = match key {
@@ -213,7 +237,7 @@ impl TerminalPane {
 
                         if let Some(bytes) = seq {
                             to_send.extend_from_slice(bytes);
-                            exit_selection_mode = true;
+                            clear_selection = true;
                             false
                         } else {
                             true
@@ -224,24 +248,34 @@ impl TerminalPane {
             });
         });
 
-        if entered_selection_mode {
-            self.selecting_in_terminal = true;
-        }
-        if exit_selection_mode {
+        if clear_selection {
             self.selecting_in_terminal = false;
+            ctx.data_mut(|d| {
+                if let Some(mut state) = d.get_temp::<FastEditorState>(egui::Id::unique("conpty_terminal")) {
+                    state.mouse_selection = None;
+                    d.insert_temp(egui::Id::unique("conpty_terminal"), state);
+                }
+            });
         }
         if !to_send.is_empty() {
             self.write_to_pty(&to_send);
         }
     }
 
-    pub fn show(&mut self, ctx: &egui::Context, panel_frame: egui::Frame) {
-        let term_id = egui::Id::new("conpty_terminal");
+    pub fn show(&mut self, ui: &mut egui::Ui, panel_frame: egui::Frame) {
+        let ctx = ui.ctx().clone();
+        let ctx = &ctx;
+        let term_id = egui::Id::unique("conpty_terminal");
         let term_focused = ctx.memory(|m| m.has_focus(term_id));
+
+        self.selecting_in_terminal = ctx.data(|d| {
+            d.get_temp::<FastEditorState>(term_id)
+                .and_then(|s| s.mouse_selection)
+                .is_some_and(|r| r.primary != r.secondary)
+        });
 
         self.handle_terminal_input(ctx, term_focused);
 
-        let prev_selecting = self.selecting_in_terminal;
         let pty_updated = {
             let mut lock = self.term.lock().unwrap();
             let updated = lock.pty_updated || self.term_screen_text.is_empty();
@@ -258,11 +292,9 @@ impl TerminalPane {
 
         if pty_updated {
             self.selecting_in_terminal = false;
-        }
-
-        if !self.selecting_in_terminal && (pty_updated || prev_selecting) {
             ctx.data_mut(|d| {
                 let mut state = d.get_temp::<FastEditorState>(term_id).unwrap_or_default();
+                state.mouse_selection = None;
                 let target_range =
                     egui::text::CCursorRange::one(egui::text::CCursor::new(self.term_cursor_idx));
                 if state.cursor.char_range() != Some(target_range) {
@@ -277,7 +309,7 @@ impl TerminalPane {
         let term_revision = self.term_revision;
         let focus_terminal = &mut self.focus_terminal;
 
-        egui::CentralPanel::default().frame(panel_frame).show(ctx, |ui| {
+        egui::CentralPanel::default().frame(panel_frame).show(ui, |ui| {
             let font_id = egui::TextStyle::Monospace.resolve(ui.style());
             let text_color = ui.visuals().widgets.inactive.text_color();
             let mut layouter = |ui: &egui::Ui, text: &str, _wrap_width: f32| {
@@ -287,7 +319,7 @@ impl TerminalPane {
                     text_color,
                     f32::INFINITY,
                 );
-                ui.fonts(|f| f.layout_job(job))
+                ui.fonts_mut(|f| f.layout_job(job))
             };
 
             let available_size = ui.available_size();
@@ -298,6 +330,7 @@ impl TerminalPane {
                     let output =
                         FastEditor::new(term_id, screen_text, available_size, &mut layouter)
                             .text_revision(term_revision)
+                            .pointer_moves_caret(false)
                             .show(ui);
 
                     if *focus_terminal {
@@ -311,6 +344,8 @@ impl TerminalPane {
 
 pub fn render_vt100_screen(screen: &vt100::Screen) -> (String, usize) {
     let (rows, cols) = screen.size();
+    let rows = rows.get();
+    let cols = cols.get();
     let mut full_text = String::with_capacity((rows as usize) * (cols as usize + 1));
     let cursor_char_idx = render_vt100_screen_into(screen, &mut full_text);
     (full_text, cursor_char_idx)
@@ -318,6 +353,8 @@ pub fn render_vt100_screen(screen: &vt100::Screen) -> (String, usize) {
 
 pub fn render_vt100_screen_into(screen: &vt100::Screen, full_text: &mut String) -> usize {
     let (rows, cols) = screen.size();
+    let rows = rows.get();
+    let cols = cols.get();
     let (cur_row, cur_col) = screen.cursor_position();
 
     full_text.clear();

@@ -131,10 +131,10 @@ fn test_egui_text_buffer_trait() {
 
     // Check trait methods
     assert_eq!(TextBuffer::as_str(&pt), "Line 1\nLine 2");
-    assert_eq!(pt.insert_text("Inserted ", 7), 9);
+    assert_eq!(pt.insert_text("Inserted ", eframe::egui::text::CharIndex(7)), 9);
     assert_eq!(pt.as_str(), "Line 1\nInserted Line 2");
 
-    pt.delete_char_range(7..16);
+    pt.delete_char_range(eframe::egui::text::CharIndex(7)..eframe::egui::text::CharIndex(16));
     assert_eq!(pt.as_str(), "Line 1\nLine 2");
 
     pt.replace_with("Replaced");
@@ -267,11 +267,11 @@ fn test_piece_table_checkpoints_and_non_flattening_word_delete() {
     pt.insert(pos, "hello world ");
     let after_insert = pos + 12;
     let c1 = pt.delete_prev_word(CCursor::new(after_insert));
-    assert_eq!(c1.index, pos + 6);
+    assert_eq!(c1.index.0, pos + 6);
     assert_eq!(pt.slice_chars(pos..pos + 6), "hello ");
 
     let c2 = pt.delete_nxt_word(CCursor::new(pos));
-    assert_eq!(c2.index, pos);
+    assert_eq!(c2.index.0, pos);
 
     // Stream via write_to and verify matches build_string
     let mut streamed = Vec::new();

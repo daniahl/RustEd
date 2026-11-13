@@ -6,15 +6,9 @@
 use crate::piece_table::{PieceTable, PieceTableSnapshot};
 use eframe::egui::{
     self,
-    epaint::text::{
-        cursor::{Cursor, PCursor, RCursor},
-        Galley,
-    },
+    epaint::text::Galley,
     text::{CCursor, LayoutJob},
-    text_selection::{
-        visuals::paint_text_cursor,
-        CCursorRange, CursorRange, TextCursorState,
-    },
+    text_selection::{visuals::paint_text_cursor, CCursorRange, TextCursorState},
     Color32, Event, Id, Key, Pos2, Rect, Response, Sense, Ui, Vec2,
 };
 use std::{
@@ -161,7 +155,7 @@ impl EditorBuffer for PieceTable {
     }
 
     fn delete_prev_word(&mut self, ccursor: CCursor) -> CCursor {
-        let end = ccursor.index.min(self.char_count());
+        let end = ccursor.index.0.min(self.char_count());
         if end == 0 {
             return CCursor::new(0);
         }
@@ -172,8 +166,8 @@ impl EditorBuffer for PieceTable {
             self.extract_char_range(start..end, &mut buf);
             let local_len = end - start;
             let new_local = egui::TextBuffer::delete_previous_word(&mut buf, CCursor::new(local_len));
-            if new_local.index > 0 || start == 0 {
-                let target_start = start + new_local.index;
+            if new_local.index.0 > 0 || start == 0 {
+                let target_start = start + new_local.index.0;
                 self.delete(target_start..end);
                 return CCursor::new(target_start);
             }
@@ -183,7 +177,7 @@ impl EditorBuffer for PieceTable {
 
     fn delete_nxt_word(&mut self, ccursor: CCursor) -> CCursor {
         let total = self.char_count();
-        let start = ccursor.index.min(total);
+        let start = ccursor.index.0.min(total);
         if start >= total {
             return CCursor::new(total);
         }
@@ -210,6 +204,8 @@ type Undoer = egui::util::undoer::Undoer<(CCursorRange, UndoSnapshot)>;
 #[derive(Clone, Default)]
 pub struct FastEditorState {
     pub cursor: TextCursorState,
+    /// Mouse-only selection range used when `pointer_moves_caret` is `false` (terminal mode).
+    pub mouse_selection: Option<CCursorRange>,
     pub undoer: Arc<Mutex<Undoer>>,
     pub last_undo_snapshot: Option<UndoSnapshot>,
     pub last_interaction_time: f64,
@@ -266,7 +262,7 @@ pub struct EditorOutput {
     pub galley: Arc<Galley>,
     pub galley_pos: Pos2,
     pub text_clip_rect: Rect,
-    pub cursor_range: Option<CursorRange>,
+    pub cursor_range: Option<CCursorRange>,
     pub text_changed: bool,
     pub first_line: usize,
     pub virtualized: bool,
@@ -294,6 +290,7 @@ pub struct FastEditor<'a, T: EditorBuffer = String> {
     cache_salt: u64,
     text_revision: Option<u64>,
     virtualized: bool,
+    pointer_moves_caret: bool,
 }
 
 impl<'a, T: EditorBuffer> FastEditor<'a, T> {
@@ -311,6 +308,7 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
             cache_salt: 0,
             text_revision: None,
             virtualized: false,
+            pointer_moves_caret: true,
         }
     }
 
@@ -328,12 +326,21 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
             cache_salt: 0,
             text_revision: None,
             virtualized: false,
+            pointer_moves_caret: true,
         }
     }
 
     /// Enables line-windowed virtualized layout (no word-wrap, only visible lines laid out).
     pub fn virtualized(mut self, enabled: bool) -> Self {
         self.virtualized = enabled;
+        self
+    }
+
+    /// Controls whether pointer clicks and drags move the text caret.
+    ///
+    /// Set to `false` for terminal views where the caret position is controlled by the PTY.
+    pub fn pointer_moves_caret(mut self, enabled: bool) -> Self {
+        self.pointer_moves_caret = enabled;
         self
     }
 
@@ -412,28 +419,70 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
         let prev_cursor_range = state.cursor.char_range();
         let mut cursor_range = state
             .cursor
-            .range(&galley)
-            .unwrap_or_else(|| CursorRange::one(galley.begin()));
+            .char_range()
+            .unwrap_or_else(|| CCursorRange::one(galley.begin()));
 
         // Pointer interaction (mouse click & drag)
-        if let Some(pointer_pos) = ui.ctx().pointer_interact_pos() {
-            if response.hovered() || response.dragged() || response.clicked() {
-                let is_being_dragged = ui.ctx().is_being_dragged(self.id);
-                let cursor_at_pointer = galley.cursor_from_pos(pointer_pos - galley_pos);
-                let did_interact = state.cursor.pointer_interaction(
-                    ui,
-                    &response,
-                    cursor_at_pointer,
-                    &galley,
-                    is_being_dragged,
-                );
-                if did_interact || response.clicked() {
-                    response.request_focus();
-                    state.last_interaction_time = ui.input(|i| i.time);
-                    if let Some(r) = state.cursor.range(&galley) {
-                        cursor_range = r;
+        if self.pointer_moves_caret {
+            if let Some(pointer_pos) = ui.ctx().pointer_interact_pos() {
+                if response.hovered() || response.dragged() || response.clicked() {
+                    let is_being_dragged = ui.ctx().is_being_dragged(self.id);
+                    let cursor_at_pointer = galley.cursor_from_pos(pointer_pos - galley_pos);
+                    let did_interact = state.cursor.pointer_interaction(
+                        ui,
+                        &response,
+                        cursor_at_pointer,
+                        &galley,
+                        is_being_dragged,
+                    );
+                    if did_interact || response.clicked() {
+                        response.request_focus();
+                        state.last_interaction_time = ui.input(|i| i.time);
+                        if let Some(r) = state.cursor.range(&galley) {
+                            cursor_range = r;
+                        }
                     }
                 }
+            }
+        } else {
+            if response.clicked() || response.secondary_clicked() {
+                response.request_focus();
+                state.last_interaction_time = ui.input(|i| i.time);
+            }
+            if response.secondary_clicked() {
+                if let Some(sel) = state.mouse_selection.take() {
+                    if sel.primary != sel.secondary {
+                        let [min_c, max_c] = sel.sorted_cursors();
+                        let total = self.text.char_count();
+                        let start = min_c.index.0.min(total);
+                        let end = max_c.index.0.min(total);
+                        if start < end {
+                            ui.ctx().copy_text(self.text.slice_chars(start..end));
+                        }
+                    }
+                }
+            } else if let Some(pointer_pos) = ui.ctx().pointer_interact_pos() {
+                let primary_pressed = ui.input(|i| i.pointer.primary_pressed());
+                let primary_down = ui.input(|i| i.pointer.primary_down());
+                if response.hovered() && primary_pressed {
+                    response.request_focus();
+                    let c = galley.cursor_from_pos(pointer_pos - galley_pos);
+                    state.mouse_selection = Some(CCursorRange::one(c));
+                } else if response.dragged_by(egui::PointerButton::Primary)
+                    || (ui.ctx().is_being_dragged(self.id) && primary_down)
+                {
+                    if let Some(sel) = &mut state.mouse_selection {
+                        let c = galley.cursor_from_pos(pointer_pos - galley_pos);
+                        sel.primary = c;
+                    }
+                }
+            }
+            if response.clicked()
+                && state
+                    .mouse_selection
+                    .is_some_and(|sel| sel.primary == sel.secondary)
+            {
+                state.mouse_selection = None;
             }
         }
 
@@ -442,7 +491,7 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
         let mut text_changed = false;
 
         if has_focus
-            || (!ui.memory(|m| m.any_popup_open())
+            || (!ui.ctx().any_popup_open()
                 && ui.input(|i| i.key_pressed(Key::Escape)))
         {
             // Keep editor focus if Escape was pressed while editor had focus on the previous frame
@@ -468,7 +517,7 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
                             s
                         }
                     };
-                    undoer.feed_state(now, &(cursor_range.as_ccursor_range(), snap));
+                    undoer.feed_state(now, &(cursor_range, snap));
                 }
             }
 
@@ -513,14 +562,9 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
                         }
                     )
                 {
-                    let ccursor_range = cursor_range.as_ccursor_range();
                     galley = self.layouter.layout(ui, self.text, wrap_width);
                     layout_dirty = true;
                     pending_relayout = false;
-                    cursor_range = CursorRange {
-                        primary: galley.from_ccursor(ccursor_range.primary),
-                        secondary: galley.from_ccursor(ccursor_range.secondary),
-                    };
                 }
 
                 // Navigation & selection events (arrows, home, end, ctrl+a, etc.)
@@ -537,8 +581,10 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
                         ..
                     } => {
                         let rows_to_jump = 25;
+                        let mut h_pos = None;
                         for _ in 0..rows_to_jump {
-                            cursor_range.primary = galley.cursor_up_one_row(&cursor_range.primary);
+                            (cursor_range.primary, h_pos) =
+                                galley.cursor_up_one_row(&cursor_range.primary, h_pos);
                         }
                         if !modifiers.shift {
                             cursor_range.secondary = cursor_range.primary;
@@ -553,9 +599,10 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
                         ..
                     } => {
                         let rows_to_jump = 25;
+                        let mut h_pos = None;
                         for _ in 0..rows_to_jump {
-                            cursor_range.primary =
-                                galley.cursor_down_one_row(&cursor_range.primary);
+                            (cursor_range.primary, h_pos) =
+                                galley.cursor_down_one_row(&cursor_range.primary, h_pos);
                         }
                         if !modifiers.shift {
                             cursor_range.secondary = cursor_range.primary;
@@ -564,15 +611,24 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
                         continue;
                     }
                     Event::Copy => {
-                        if !cursor_range.is_empty() {
-                            let [min_c, max_c] = cursor_range.as_ccursor_range().sorted();
-                            ui.ctx().copy_text(self.text.slice_chars(min_c.index..max_c.index));
+                        let copy_range = if !self.pointer_moves_caret {
+                            state.mouse_selection
+                        } else {
+                            Some(cursor_range)
+                        };
+                        if let Some(range) = copy_range.filter(|r| r.primary != r.secondary) {
+                            let [min_c, max_c] = range.sorted_cursors();
+                            let total = self.text.char_count();
+                            ui.ctx().copy_text(
+                                self.text
+                                    .slice_chars(min_c.index.0.min(total)..max_c.index.0.min(total)),
+                            );
                         }
                     }
                     Event::Cut => {
                         if !cursor_range.is_empty() {
-                            let [min_c, max_c] = cursor_range.as_ccursor_range().sorted();
-                            ui.ctx().copy_text(self.text.slice_chars(min_c.index..max_c.index));
+                            let [min_c, max_c] = cursor_range.sorted_cursors();
+                            ui.ctx().copy_text(self.text.slice_chars(min_c.index.0..max_c.index.0));
                             let ccursor = self.text.delete_selected(&cursor_range);
                             mutated = Some(CCursorRange::one(ccursor));
                         }
@@ -622,9 +678,9 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
                     } => {
                         let ccursor = if let Some(cursor) = cursor_range.single() {
                             if modifiers.ctrl {
-                                self.text.delete_prev_word(cursor.ccursor)
+                                self.text.delete_prev_word(cursor)
                             } else {
-                                self.text.delete_previous_char(cursor.ccursor)
+                                self.text.delete_previous_char(cursor)
                             }
                         } else {
                             self.text.delete_selected(&cursor_range)
@@ -639,9 +695,9 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
                     } => {
                         let ccursor = if let Some(cursor) = cursor_range.single() {
                             if modifiers.ctrl {
-                                self.text.delete_nxt_word(cursor.ccursor)
+                                self.text.delete_nxt_word(cursor)
                             } else {
-                                self.text.delete_next_char(cursor.ccursor)
+                                self.text.delete_next_char(cursor)
                             }
                         } else {
                             self.text.delete_selected(&cursor_range)
@@ -662,7 +718,7 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
                             .undoer
                             .lock()
                             .unwrap()
-                            .undo(&(cursor_range.as_ccursor_range(), current_snap))
+                            .undo(&(cursor_range, current_snap))
                             .cloned();
                         if let Some((undo_range, undo_snap)) = undo_target {
                             self.text.restore_undo_snapshot(&undo_snap);
@@ -684,7 +740,7 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
                             .undoer
                             .lock()
                             .unwrap()
-                            .redo(&(cursor_range.as_ccursor_range(), current_snap))
+                            .redo(&(cursor_range, current_snap))
                             .cloned();
                         if let Some((redo_range, redo_snap)) = redo_target {
                             self.text.restore_undo_snapshot(&redo_snap);
@@ -698,30 +754,24 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
                 if let Some(new_ccursor_range) = mutated {
                     text_changed = true;
                     state.last_interaction_time = now;
-                    cursor_range.primary.ccursor = new_ccursor_range.primary;
-                    cursor_range.secondary.ccursor = new_ccursor_range.secondary;
+                    cursor_range = new_ccursor_range;
                     pending_relayout = true;
                 }
             }
 
             if pending_relayout {
-                let ccursor_range = cursor_range.as_ccursor_range();
                 galley = self.layouter.layout(ui, self.text, wrap_width);
                 layout_dirty = true;
-                cursor_range = CursorRange {
-                    primary: galley.from_ccursor(ccursor_range.primary),
-                    secondary: galley.from_ccursor(ccursor_range.secondary),
-                };
             }
         }
 
-        state.cursor.set_range(Some(cursor_range));
+        state.cursor.set_char_range(Some(cursor_range));
 
         if text_changed {
             let snap = self.text.undo_snapshot();
             state.undoer.lock().unwrap().feed_state(
                 ui.input(|i| i.time),
-                &(cursor_range.as_ccursor_range(), snap.clone()),
+                &(cursor_range, snap.clone()),
             );
             state.last_undo_snapshot = Some(snap);
         }
@@ -734,7 +784,7 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
         // scroll_to_rect, cursor_in_view, and caret painting use consistent bounds.
         let line_height = ui.text_style_height(&egui::TextStyle::Monospace);
         let mut cursor_box = galley
-            .pos_from_cursor(&cursor_range.primary)
+            .pos_from_cursor(cursor_range.primary)
             .translate(galley_pos.to_vec2());
         if cursor_box.height() < line_height {
             cursor_box.max.y = cursor_box.min.y + line_height;
@@ -749,15 +799,34 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
             ui.scroll_to_rect(cursor_box, None);
         }
 
-        if !cursor_range.is_empty() {
+        let selection_range = if !self.pointer_moves_caret {
+            state
+                .mouse_selection
+                .filter(|r| r.primary != r.secondary)
+                .map(|r| {
+                    let total = self.text.char_count();
+                    CCursorRange::two(
+                        CCursor::new(r.secondary.index.0.min(total)),
+                        CCursor::new(r.primary.index.0.min(total)),
+                    )
+                })
+        } else if !cursor_range.is_empty() {
+            Some(cursor_range)
+        } else {
+            None
+        };
+
+        if let Some(sel_range) = selection_range {
             // Paint selection rects directly for visible rows instead of calling
             // `paint_text_selection` on `galley`, which would deep-clone the entire
             // Galley via `Arc::make_mut` every frame.
-            let [min_cursor, max_cursor] = cursor_range.sorted_cursors();
-            let min_row = min_cursor.rcursor.row;
-            let max_row = max_cursor.rcursor.row.min(galley.rows.len().saturating_sub(1));
+            let [min_c, max_c] = sel_range.sorted_cursors();
+            let min_cursor = galley.layout_from_cursor(min_c);
+            let max_cursor = galley.layout_from_cursor(max_c);
+            let min_row = min_cursor.row;
+            let max_row = max_cursor.row.min(galley.rows.len().saturating_sub(1));
             let top = text_clip_rect.min.y - galley_pos.y;
-            let first_vis = galley.rows.partition_point(|r| r.rect.max.y < top);
+            let first_vis = galley.rows.partition_point(|r| r.rect().max.y < top);
             let start_row = min_row.max(first_vis);
             let bg_fill = ui.visuals().selection.bg_fill;
 
@@ -767,28 +836,28 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
                     .enumerate()
                     .map(|(i, r)| (start_row + i, r))
                 {
-                    let row_top_y = galley_pos.y + row.rect.min.y;
+                    let row_top_y = galley_pos.y + row.rect().min.y;
                     if row_top_y > text_clip_rect.max.y {
                         break;
                     }
                     let left = if row_idx == min_row {
-                        row.x_offset(min_cursor.rcursor.column)
+                        row.x_offset(min_cursor.column)
                     } else {
                         0.0
                     };
-                    let right = if row_idx == max_cursor.rcursor.row {
-                        row.x_offset(max_cursor.rcursor.column)
+                    let right = if row_idx == max_cursor.row {
+                        row.x_offset(max_cursor.column)
                     } else {
                         let newline_extra = if row.ends_with_newline {
-                            row.rect.height() * 0.5
+                            row.rect().height() * 0.5
                         } else {
                             0.0
                         };
-                        row.rect.width() + newline_extra
+                        row.rect().width() + newline_extra
                     };
                     let sel_rect = Rect::from_min_max(
-                        galley_pos + Vec2::new(left, row.rect.min.y),
-                        galley_pos + Vec2::new(right, row.rect.max.y),
+                        galley_pos + Vec2::new(left, row.rect().min.y),
+                        galley_pos + Vec2::new(right, row.rect().max.y),
                     );
                     painter.rect_filled(sel_rect, 0.0, bg_fill);
                 }
@@ -823,7 +892,7 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
             ui.ctx().request_repaint();
         }
 
-        let focus = cursor_range.primary.rcursor;
+        let focus = galley.layout_from_cursor(cursor_range.primary);
         update_accesskit(
             ui,
             self.id,
@@ -836,7 +905,7 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
             cursor_in_view,
             focus.row,
             focus.row,
-            focus.column,
+            focus.column.0,
         );
 
         if !ui.ctx().will_discard() {
@@ -888,8 +957,8 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
 
         let font_id = egui::TextStyle::Monospace.resolve(ui.style());
         let text_color = ui.visuals().widgets.inactive.text_color();
-        let line_height = ui.fonts(|f| f.row_height(&font_id)).max(1.0);
-        let char_width = ui.fonts(|f| f.glyph_width(&font_id, ' ')).max(1.0);
+        let line_height = ui.fonts_mut(|f| f.row_height(&font_id)).max(1.0);
+        let char_width = ui.fonts_mut(|f| f.glyph_width(&font_id, ' ')).max(1.0);
 
         let mut state = ui
             .ctx()
@@ -968,7 +1037,7 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
                         text_color,
                         f32::INFINITY,
                     );
-                    let g = ui.fonts(|f| f.layout_job(job));
+                    let g = ui.fonts_mut(|f| f.layout_job(job));
                     (g, ws, we, true)
                 }
             };
@@ -982,61 +1051,68 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
             .char_range()
             .unwrap_or_else(|| CCursorRange::one(CCursor::new(0)));
         let mut ccursor_range = CCursorRange::two(
-            CCursor::new(prev_ccursor_range.secondary.index.min(total_chars)),
-            CCursor::new(prev_ccursor_range.primary.index.min(total_chars)),
+            CCursor::new(prev_ccursor_range.secondary.index.0.min(total_chars)),
+            CCursor::new(prev_ccursor_range.primary.index.0.min(total_chars)),
         );
 
         // Pointer interaction inside the visible window
-        if let Some(pointer_pos) = ui.ctx().pointer_interact_pos() {
-            if response.hovered() || response.dragged() || response.clicked() {
-                let is_being_dragged = ui.ctx().is_being_dragged(self.id);
-                let cursor_at_pointer = galley.cursor_from_pos(pointer_pos - window_galley_pos);
+        if self.pointer_moves_caret {
+            if let Some(pointer_pos) = ui.ctx().pointer_interact_pos() {
+                if response.hovered() || response.dragged() || response.clicked() {
+                    let is_being_dragged = ui.ctx().is_being_dragged(self.id);
+                    let cursor_at_pointer = galley.cursor_from_pos(pointer_pos - window_galley_pos);
 
-                let mut local_cursor_state = state.cursor.clone();
-                let clamped_local = CCursorRange::two(
-                    CCursor::new(
-                        ccursor_range
-                            .secondary
-                            .index
-                            .saturating_sub(window_start_char)
-                            .min(window_end_char - window_start_char),
-                    ),
-                    CCursor::new(
-                        ccursor_range
-                            .primary
-                            .index
-                            .saturating_sub(window_start_char)
-                            .min(window_end_char - window_start_char),
-                    ),
-                );
-                local_cursor_state.set_char_range(Some(clamped_local));
+                    let mut local_cursor_state = state.cursor.clone();
+                    let clamped_local = CCursorRange::two(
+                        CCursor::new(
+                            ccursor_range
+                                .secondary
+                                .index
+                                .0
+                                .saturating_sub(window_start_char)
+                                .min(window_end_char - window_start_char),
+                        ),
+                        CCursor::new(
+                            ccursor_range
+                                .primary
+                                .index
+                                .0
+                                .saturating_sub(window_start_char)
+                                .min(window_end_char - window_start_char),
+                        ),
+                    );
+                    local_cursor_state.set_char_range(Some(clamped_local));
 
-                let did_interact = local_cursor_state.pointer_interaction(
-                    ui,
-                    &response,
-                    cursor_at_pointer,
-                    &galley,
-                    is_being_dragged,
-                );
-                if did_interact || response.clicked() {
-                    response.request_focus();
-                    state.last_interaction_time = ui.input(|i| i.time);
-                    if let Some(r) = local_cursor_state.char_range() {
-                        ccursor_range = CCursorRange::two(
-                            CCursor::new((window_start_char + r.secondary.index).min(total_chars)),
-                            CCursor::new((window_start_char + r.primary.index).min(total_chars)),
-                        );
+                    let did_interact = local_cursor_state.pointer_interaction(
+                        ui,
+                        &response,
+                        cursor_at_pointer,
+                        &galley,
+                        is_being_dragged,
+                    );
+                    if did_interact || response.clicked() {
+                        response.request_focus();
+                        state.last_interaction_time = ui.input(|i| i.time);
+                        if let Some(r) = local_cursor_state.char_range() {
+                            ccursor_range = CCursorRange::two(
+                                CCursor::new((window_start_char + r.secondary.index.0).min(total_chars)),
+                                CCursor::new((window_start_char + r.primary.index.0).min(total_chars)),
+                            );
+                        }
+                        state.cursor = local_cursor_state;
                     }
-                    state.cursor = local_cursor_state;
                 }
             }
+        } else if response.clicked() || response.secondary_clicked() {
+            response.request_focus();
+            state.last_interaction_time = ui.input(|i| i.time);
         }
 
         let has_focus = response.has_focus();
         let mut text_changed = false;
 
         if has_focus
-            || (!ui.memory(|m| m.any_popup_open())
+            || (!ui.ctx().any_popup_open()
                 && ui.input(|i| i.key_pressed(Key::Escape)))
         {
             if ui.memory(|m| m.had_focus_last_frame(self.id) && m.focused().is_none()) {
@@ -1114,7 +1190,7 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
                         modifiers,
                         ..
                     } => {
-                        let next = (ccursor_range.primary.index + 1).min(cur_total);
+                        let next = (ccursor_range.primary.index.0 + 1).min(cur_total);
                         ccursor_range.primary = CCursor::new(next);
                         if !modifiers.shift {
                             ccursor_range.secondary = ccursor_range.primary;
@@ -1127,7 +1203,7 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
                         modifiers,
                         ..
                     } => {
-                        let (line, col) = self.text.char_to_line_col(ccursor_range.primary.index);
+                        let (line, col) = self.text.char_to_line_col(ccursor_range.primary.index.0);
                         let lines_total = self.text.line_count().max(1);
                         let target_line = match key {
                             Key::ArrowUp => line.saturating_sub(1),
@@ -1153,7 +1229,7 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
                         let next = if modifiers.ctrl {
                             0
                         } else {
-                            let (line, _) = self.text.char_to_line_col(ccursor_range.primary.index);
+                            let (line, _) = self.text.char_to_line_col(ccursor_range.primary.index.0);
                             self.text.line_char_range(line).start
                         };
                         ccursor_range.primary = CCursor::new(next);
@@ -1171,7 +1247,7 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
                         let next = if modifiers.ctrl {
                             cur_total
                         } else {
-                            let (line, _) = self.text.char_to_line_col(ccursor_range.primary.index);
+                            let (line, _) = self.text.char_to_line_col(ccursor_range.primary.index.0);
                             self.text.line_char_range(line).end
                         };
                         ccursor_range.primary = CCursor::new(next);
@@ -1182,21 +1258,21 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
                     }
                     Event::Copy => {
                         if ccursor_range.primary != ccursor_range.secondary {
-                            let [min_c, max_c] = ccursor_range.sorted();
-                            ui.ctx().copy_text(self.text.slice_chars(min_c.index..max_c.index));
+                            let [min_c, max_c] = ccursor_range.sorted_cursors();
+                            ui.ctx().copy_text(self.text.slice_chars(min_c.index.0..max_c.index.0));
                         }
                     }
                     Event::Cut => {
                         if ccursor_range.primary != ccursor_range.secondary {
-                            let [min_c, max_c] = ccursor_range.sorted();
-                            ui.ctx().copy_text(self.text.slice_chars(min_c.index..max_c.index));
+                            let [min_c, max_c] = ccursor_range.sorted_cursors();
+                            ui.ctx().copy_text(self.text.slice_chars(min_c.index.0..max_c.index.0));
                             self.text.delete_char_range(min_c.index..max_c.index);
                             mutated = Some(CCursorRange::one(min_c));
                         }
                     }
                     Event::Paste(text_to_insert) => {
                         if !text_to_insert.is_empty() {
-                            let [min_c, max_c] = ccursor_range.sorted();
+                            let [min_c, max_c] = ccursor_range.sorted_cursors();
                             if min_c.index < max_c.index {
                                 self.text.delete_char_range(min_c.index..max_c.index);
                             }
@@ -1210,7 +1286,7 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
                             && text_to_insert != "\n"
                             && text_to_insert != "\r"
                         {
-                            let [min_c, max_c] = ccursor_range.sorted();
+                            let [min_c, max_c] = ccursor_range.sorted_cursors();
                             if min_c.index < max_c.index {
                                 self.text.delete_char_range(min_c.index..max_c.index);
                             }
@@ -1224,7 +1300,7 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
                         pressed: true,
                         ..
                     } => {
-                        let [min_c, max_c] = ccursor_range.sorted();
+                        let [min_c, max_c] = ccursor_range.sorted_cursors();
                         if min_c.index < max_c.index {
                             self.text.delete_char_range(min_c.index..max_c.index);
                         }
@@ -1238,7 +1314,7 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
                         modifiers,
                         ..
                     } if !modifiers.ctrl && !modifiers.command => {
-                        let [min_c, max_c] = ccursor_range.sorted();
+                        let [min_c, max_c] = ccursor_range.sorted_cursors();
                         if min_c.index < max_c.index {
                             self.text.delete_char_range(min_c.index..max_c.index);
                         }
@@ -1252,7 +1328,7 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
                         modifiers,
                         ..
                     } => {
-                        let [min_c, max_c] = ccursor_range.sorted();
+                        let [min_c, max_c] = ccursor_range.sorted_cursors();
                         let c = if min_c.index < max_c.index {
                             self.text.delete_char_range(min_c.index..max_c.index);
                             min_c
@@ -1269,7 +1345,7 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
                         modifiers,
                         ..
                     } => {
-                        let [min_c, max_c] = ccursor_range.sorted();
+                        let [min_c, max_c] = ccursor_range.sorted_cursors();
                         let c = if min_c.index < max_c.index {
                             self.text.delete_char_range(min_c.index..max_c.index);
                             min_c
@@ -1337,8 +1413,8 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
 
         let total_lines_after = self.text.line_count().max(1);
         let total_chars_after = self.text.char_count();
-        ccursor_range.primary.index = ccursor_range.primary.index.min(total_chars_after);
-        ccursor_range.secondary.index = ccursor_range.secondary.index.min(total_chars_after);
+        ccursor_range.primary.index.0 = ccursor_range.primary.index.0.min(total_chars_after);
+        ccursor_range.secondary.index.0 = ccursor_range.secondary.index.0.min(total_chars_after);
 
         if text_changed {
             let ws = self.text.line_to_char(first_line);
@@ -1356,7 +1432,7 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
                 text_color,
                 f32::INFINITY,
             );
-            galley = ui.fonts(|f| f.layout_job(job));
+            galley = ui.fonts_mut(|f| f.layout_job(job));
             window_start_char = ws;
             window_end_char = we;
             layout_dirty = true;
@@ -1373,19 +1449,19 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
             state.last_undo_snapshot = Some(snap);
         }
 
-        let (cur_line, cur_col) = self.text.char_to_line_col(ccursor_range.primary.index);
-        let cursor_in_window = ccursor_range.primary.index >= window_start_char
-            && ccursor_range.primary.index <= window_end_char;
+        let (cur_line, cur_col) = self.text.char_to_line_col(ccursor_range.primary.index.0);
+        let cursor_in_window = ccursor_range.primary.index.0 >= window_start_char
+            && ccursor_range.primary.index.0 <= window_end_char;
 
         let local_primary = if cursor_in_window {
-            Some(galley.from_ccursor(CCursor::new(ccursor_range.primary.index - window_start_char)))
+            Some(galley.layout_from_cursor(CCursor::new(ccursor_range.primary.index.0 - window_start_char)))
         } else {
             None
         };
 
         let mut cursor_box = if let Some(lp) = local_primary {
             galley
-                .pos_from_cursor(&lp)
+                .pos_from_layout_cursor(&lp)
                 .translate(window_galley_pos.to_vec2())
         } else {
             let x = base_pos.x + cur_col as f32 * char_width;
@@ -1409,14 +1485,14 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
 
         // Paint selection rects for visible rows inside the window
         if ccursor_range.primary != ccursor_range.secondary {
-            let [min_c, max_c] = ccursor_range.sorted();
-            if max_c.index > window_start_char && min_c.index < window_end_char {
-                let clamped_min = min_c.index.max(window_start_char) - window_start_char;
-                let clamped_max = max_c.index.min(window_end_char) - window_start_char;
-                let min_cur = galley.from_ccursor(CCursor::new(clamped_min));
-                let max_cur = galley.from_ccursor(CCursor::new(clamped_max));
-                let min_row = min_cur.rcursor.row;
-                let max_row = max_cur.rcursor.row.min(galley.rows.len().saturating_sub(1));
+            let [min_c, max_c] = ccursor_range.sorted_cursors();
+            if max_c.index.0 > window_start_char && min_c.index.0 < window_end_char {
+                let clamped_min = min_c.index.0.max(window_start_char) - window_start_char;
+                let clamped_max = max_c.index.0.min(window_end_char) - window_start_char;
+                let min_cur = galley.layout_from_cursor(CCursor::new(clamped_min));
+                let max_cur = galley.layout_from_cursor(CCursor::new(clamped_max));
+                let min_row = min_cur.row;
+                let max_row = max_cur.row.min(galley.rows.len().saturating_sub(1));
                 let bg_fill = ui.visuals().selection.bg_fill;
 
                 for (row_idx, row) in galley.rows[min_row..=max_row]
@@ -1424,31 +1500,31 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
                     .enumerate()
                     .map(|(i, r)| (min_row + i, r))
                 {
-                    let row_top_y = window_galley_pos.y + row.rect.min.y;
+                    let row_top_y = window_galley_pos.y + row.rect().min.y;
                     if row_top_y > text_clip_rect.max.y {
                         break;
                     }
-                    if window_galley_pos.y + row.rect.max.y < text_clip_rect.min.y {
+                    if window_galley_pos.y + row.rect().max.y < text_clip_rect.min.y {
                         continue;
                     }
-                    let left = if row_idx == min_row && min_c.index >= window_start_char {
-                        row.x_offset(min_cur.rcursor.column)
+                    let left = if row_idx == min_row && min_c.index.0 >= window_start_char {
+                        row.x_offset(min_cur.column)
                     } else {
                         0.0
                     };
-                    let right = if row_idx == max_row && max_c.index <= window_end_char {
-                        row.x_offset(max_cur.rcursor.column)
+                    let right = if row_idx == max_row && max_c.index.0 <= window_end_char {
+                        row.x_offset(max_cur.column)
                     } else {
                         let newline_extra = if row.ends_with_newline {
-                            row.rect.height() * 0.5
+                            row.rect().height() * 0.5
                         } else {
                             0.0
                         };
-                        row.rect.width() + newline_extra
+                        row.rect().width() + newline_extra
                     };
                     let sel_rect = Rect::from_min_max(
-                        window_galley_pos + Vec2::new(left, row.rect.min.y),
-                        window_galley_pos + Vec2::new(right, row.rect.max.y),
+                        window_galley_pos + Vec2::new(left, row.rect().min.y),
+                        window_galley_pos + Vec2::new(right, row.rect().max.y),
                     );
                     painter.rect_filled(sel_rect, 0.0, bg_fill);
                 }
@@ -1479,7 +1555,7 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
         }
 
         let local_row = cur_line.saturating_sub(first_line);
-        let local_col = local_primary.map(|lp| lp.rcursor.column).unwrap_or(cur_col);
+        let local_col = local_primary.map(|lp| lp.column.0).unwrap_or(cur_col);
         update_accesskit(
             ui,
             self.id,
@@ -1530,40 +1606,12 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
             });
         }
 
-        let p_cur = Cursor {
-            ccursor: ccursor_range.primary,
-            rcursor: RCursor {
-                row: cur_line,
-                column: cur_col,
-            },
-            pcursor: PCursor {
-                paragraph: cur_line,
-                offset: cur_col,
-                prefer_next_row: false,
-            },
-        };
-        let s_cur = Cursor {
-            ccursor: ccursor_range.secondary,
-            rcursor: RCursor {
-                row: cur_line,
-                column: cur_col,
-            },
-            pcursor: PCursor {
-                paragraph: cur_line,
-                offset: cur_col,
-                prefer_next_row: false,
-            },
-        };
-
         EditorOutput {
             response,
             galley,
             galley_pos: window_galley_pos,
             text_clip_rect,
-            cursor_range: Some(CursorRange {
-                primary: p_cur,
-                secondary: s_cur,
-            }),
+            cursor_range: Some(ccursor_range),
             text_changed,
             first_line,
             virtualized: true,
@@ -1573,7 +1621,7 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
 
 #[allow(clippy::too_many_arguments)]
 fn update_accesskit(
-    ui: &Ui,
+    ui: &mut Ui,
     id: Id,
     state: &mut FastEditorState,
     galley: &Arc<Galley>,
@@ -1642,8 +1690,8 @@ fn update_accesskit(
         }
 
         let line_height = ui.text_style_height(&egui::TextStyle::Monospace);
-        let mut row_min = galley_pos + row.rect.min.to_vec2();
-        let mut row_max = galley_pos + row.rect.max.to_vec2();
+        let mut row_min = galley_pos + row.rect().min.to_vec2();
+        let mut row_max = galley_pos + row.rect().max.to_vec2();
         if row_max.y - row_min.y < line_height {
             row_max.y = row_min.y + line_height;
         }
@@ -1672,56 +1720,61 @@ fn update_accesskit(
         };
 
         if row_unchanged {
-            ui.ctx().accesskit_node_builder(id, |builder| {
-                builder.push_child(row_accesskit_id);
+            let sub_ui = ui.new_child(
+                egui::UiBuilder::new()
+                    .id_salt(("accesskit_row", row_id))
+                    .accessibility_parent(id),
+            );
+            let container_id = sub_ui.unique_id();
+            sub_ui.ctx().accesskit_node_builder(container_id, |builder| {
+                if !builder.children().contains(&row_accesskit_id) {
+                    builder.push_child(row_accesskit_id);
+                }
             });
         } else if !ui.ctx().will_discard() {
             let mut built_row = false;
-            ui.ctx().with_accessibility_parent(id, || {
-                ui.ctx().accesskit_node_builder(row_id, |builder| {
-                    built_row = true;
-                    builder.set_role(egui::accesskit::Role::TextRun);
-                    builder.set_text_direction(egui::accesskit::TextDirection::LeftToRight);
-                    builder.set_bounds(row_bounds);
+            let sub_ui = ui.new_child(
+                egui::UiBuilder::new()
+                    .id_salt(("accesskit_row", row_id))
+                    .accessibility_parent(id),
+            );
+            sub_ui.interact(egui::Rect::NOTHING, row_id, egui::Sense::empty());
+            sub_ui.ctx().accesskit_node_builder(row_id, |builder| {
+                built_row = true;
+                builder.set_role(egui::accesskit::Role::TextRun);
+                builder.set_text_direction(egui::accesskit::TextDirection::LeftToRight);
+                builder.set_bounds(row_bounds);
 
-                    let glyph_count = row.glyphs.len();
-                    let mut value = String::with_capacity(glyph_count + 2);
-                    let mut character_lengths = Vec::<u8>::with_capacity(glyph_count + 2);
-                    let mut character_positions = Vec::<f32>::with_capacity(glyph_count + 2);
-                    let mut character_widths = Vec::<f32>::with_capacity(glyph_count + 2);
+                let glyph_count = row.glyphs.len();
+                let mut value = String::with_capacity(glyph_count + 2);
+                let mut character_lengths = Vec::<u8>::with_capacity(glyph_count + 2);
+                let mut character_positions = Vec::<f32>::with_capacity(glyph_count + 2);
+                let mut character_widths = Vec::<f32>::with_capacity(glyph_count + 2);
 
-                    value.push(' ');
-                    character_lengths.push(1);
-                    character_positions.push(0.0);
-                    character_widths.push(1.0);
+                value.push(' ');
+                character_lengths.push(1);
+                character_positions.push(0.0);
+                character_widths.push(1.0);
 
-                    for glyph in &row.glyphs {
-                        let old_len = value.len();
-                        value.push(glyph.chr);
-                        character_lengths.push((value.len() - old_len) as u8);
-                        character_positions.push(glyph.pos.x - row.rect.min.x);
-                        character_widths.push(glyph.advance_width.max(1.0));
-                    }
+                for glyph in &row.glyphs {
+                    let old_len = value.len();
+                    value.push(glyph.chr);
+                    character_lengths.push((value.len() - old_len) as u8);
+                    character_positions.push(glyph.pos.x - row.rect().min.x);
+                    character_widths.push(glyph.advance_width.max(1.0));
+                }
 
-                    let end_x = row.rect.width();
-                    value.push(if row.ends_with_newline { '\n' } else { ' ' });
-                    character_lengths.push(1);
-                    character_positions.push(end_x);
-                    character_widths.push(1.0);
+                let end_x = row.rect().width();
+                value.push(if row.ends_with_newline { '\n' } else { ' ' });
+                character_lengths.push(1);
+                character_positions.push(end_x);
+                character_widths.push(1.0);
 
-                    let mut remaining = character_lengths.len();
-                    let mut word_lengths = Vec::with_capacity((remaining / 255) + 1);
-                    while remaining > 0 {
-                        let chunk = remaining.min(u8::MAX as usize);
-                        word_lengths.push(chunk as u8);
-                        remaining -= chunk;
-                    }
-                    builder.set_value(value);
-                    builder.set_character_lengths(character_lengths);
-                    builder.set_character_positions(character_positions);
-                    builder.set_character_widths(character_widths);
-                    builder.set_word_lengths(word_lengths);
-                });
+                builder.set_value(value);
+                builder.set_character_lengths(character_lengths);
+                builder.set_character_positions(character_positions);
+                builder.set_character_widths(character_widths);
+                builder.set_word_starts(vec![0]);
             });
             if built_row {
                 state.accesskit_row_cache = Some(AccessKitRowCache {

@@ -442,7 +442,8 @@ fn run_sidebar_frame(
         events,
         ..Default::default()
     };
-    let out = ctx.run(input, |ctx| explorer.show_sidebar(ctx, doc));
+    let mut out = ctx.run_ui(input, |ui| explorer.show_sidebar(ui, doc));
+    out.textures_delta.clear();
     if let Some(update) = out.platform_output.accesskit_update {
         for (_, node) in update.nodes {
             if let Some(label) = node.label() {

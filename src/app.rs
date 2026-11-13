@@ -54,7 +54,7 @@ impl TextEditor {
     /// Creates the app showing older (or the current directory when None).
     pub fn new_with_folder(ctx: egui::Context, folder: Option<PathBuf>) -> Self {
         ctx.set_zoom_factor(1.2);
-        ctx.style_mut(|s| {
+        ctx.global_style_mut(|s| {
             s.scroll_animation = egui::style::ScrollAnimation::none();
         });
         ctx.options_mut(|o| {
@@ -164,7 +164,9 @@ impl TextEditor {
         }
     }
 
-    pub fn update_ui(&mut self, ctx: &egui::Context) {
+    pub fn update_ui(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        let ctx = &ctx;
         self.poll_watcher(ctx);
         let ctrl_tab = ctx.input_mut(|i| {
             let ctrl = i.consume_key(egui::Modifiers::CTRL, egui::Key::Tab)
@@ -200,12 +202,17 @@ impl TextEditor {
         }
 
         if self.tab == Tab::Editor {
-            let (ctrl_f, f3) = ctx.input_mut(|i| {
+            let (ctrl_s, ctrl_f, f3) = ctx.input_mut(|i| {
+                let ctrl_s = i.consume_key(egui::Modifiers::COMMAND, egui::Key::S)
+                    || i.consume_key(egui::Modifiers::CTRL, egui::Key::S);
                 let ctrl_f = i.consume_key(egui::Modifiers::COMMAND, egui::Key::F)
                     || i.consume_key(egui::Modifiers::CTRL, egui::Key::F);
                 let f3 = i.consume_key(egui::Modifiers::NONE, egui::Key::F3);
-                (ctrl_f, f3)
+                (ctrl_s, ctrl_f, f3)
             });
+            if ctrl_s && self.doc.can_save() {
+                self.doc.save_current_file();
+            }
             if ctrl_f {
                 self.doc.open_find_dialog(ctx);
             }
@@ -218,7 +225,7 @@ impl TextEditor {
             }
         }
 
-        egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
+        egui::Panel::top("top_bar").show(ui, |ui| {
             ui.horizontal(|ui| {
                 let prev_tab = self.tab;
                 ui.selectable_value(&mut self.tab, Tab::Editor, "Editor");
@@ -251,7 +258,11 @@ impl TextEditor {
                         }
                     }
 
-                    if ui.add_enabled(self.doc.can_save(), egui::Button::new("Save")).clicked() {
+                    if ui
+                        .add_enabled(self.doc.can_save(), egui::Button::new("Save"))
+                        .on_hover_text("Save (Ctrl+S)")
+                        .clicked()
+                    {
                         self.doc.save_current_file();
                     }
 
@@ -260,21 +271,22 @@ impl TextEditor {
                     }
                 } else if self.tab == Tab::Terminal {
                     ui.separator();
-                    if ui.button("Clear (cls)").clicked() {
-                        self.terminal.write_to_pty(b"cls\r");
-                        self.terminal.focus_terminal = true;
-                    }
-                    if ui.button("Ctrl+C").clicked() {
-                        self.terminal.write_to_pty(b"\x03");
-                        self.terminal.focus_terminal = true;
+                    if ui
+                        .button("Restart")
+                        .on_hover_text("Restart the active terminal")
+                        .clicked()
+                    {
+                        let cwd = Path::new(&self.explorer.folder_path);
+                        let working_dir = if cwd.is_dir() { Some(cwd) } else { None };
+                        self.terminal.restart(ctx, working_dir);
                     }
                 }
             });
         });
 
-        egui::TopBottomPanel::bottom("status_bar")
-            .exact_height(22.0)
-            .show(ctx, |ui| {
+        egui::Panel::bottom("status_bar")
+            .exact_size(22.0)
+            .show(ui, |ui| {
                 ui.style_mut().override_text_style = Some(egui::TextStyle::Small);
                 ui.style_mut().spacing.item_spacing = egui::vec2(6.0, 0.0);
                 ui.horizontal_centered(|ui| {
@@ -320,17 +332,17 @@ impl TextEditor {
                 });
             });
 
-        let panel_frame = egui::Frame::central_panel(&ctx.style())
+        let panel_frame = egui::Frame::central_panel(&ctx.global_style())
             .inner_margin(4.0)
-            .fill(ctx.style().visuals.extreme_bg_color);
+            .fill(ctx.global_style().visuals.extreme_bg_color);
 
         match self.tab {
             Tab::Editor => {
-                self.explorer.show_sidebar(ctx, &mut self.doc);
+                self.explorer.show_sidebar(ui, &mut self.doc);
                 if self.focus_editor_pending {
                     self.focus_editor_pending = false;
                     self.doc.focus_editor = true;
-                    let editor_id = egui::Id::new("code_editor");
+                    let editor_id = egui::Id::unique("code_editor");
                     ctx.memory_mut(|m| {
                         m.request_focus(editor_id);
                         m.set_focus_lock_filter(
@@ -345,10 +357,10 @@ impl TextEditor {
                     });
                 }
                 self.doc.show_find_dialog(ctx);
-                self.doc.show_editor(ctx, panel_frame);
+                self.doc.show_editor(ui, panel_frame);
             }
             Tab::Terminal => {
-                self.terminal.show(ctx, panel_frame);
+                self.terminal.show(ui, panel_frame);
             }
         }
         self.sync_watcher();
@@ -385,7 +397,7 @@ fn pick_folder(start_dir: &str) -> Option<PathBuf> {
 }
 
 impl eframe::App for TextEditor {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.update_ui(ctx);
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.update_ui(ui);
     }
 }

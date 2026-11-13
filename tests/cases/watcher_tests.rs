@@ -37,7 +37,7 @@ fn run_frame(ctx: &egui::Context, app: &mut TextEditor) {
         )),
         ..Default::default()
     };
-    let _ = ctx.run(input, |ctx| app.update_ui(ctx));
+    ctx.run_ui(input, |ui| app.update_ui(ui)).textures_delta.clear();
 }
 
 fn pump_until<F>(ctx: &egui::Context, app: &mut TextEditor, timeout: Duration, mut pred: F) -> bool
@@ -147,7 +147,7 @@ fn test_clean_reload_preserves_clamped_caret_and_dirty_conflict_protects_edits()
     app.open_file(&ctx, file_path.clone());
 
     // Put caret at char index 8 inside clean buffer
-    let editor_id = egui::Id::new("code_editor");
+    let editor_id = egui::Id::unique("code_editor");
     ctx.data_mut(|d| {
         let mut st = d.get_temp::<FastEditorState>(editor_id).unwrap_or_default();
         st.cursor
@@ -164,7 +164,7 @@ fn test_clean_reload_preserves_clamped_caret_and_dirty_conflict_protects_edits()
     let caret_after = ctx.data_mut(|d| {
         d.get_temp::<FastEditorState>(editor_id)
             .and_then(|s| s.cursor.char_range())
-            .map(|r| r.primary.index)
+            .map(|r| r.primary.index.0)
     });
     assert_eq!(caret_after, Some(5));
 

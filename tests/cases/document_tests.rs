@@ -140,12 +140,12 @@ fn test_find_next_unicode_and_wraparound() {
     doc.text = "🦀 Rust café 🦀 Rust café 🦀".into();
     doc.text_revision = 1;
 
-    let editor_id = egui::Id::new("code_editor");
+    let editor_id = egui::Id::unique("code_editor");
     let get_sel = |ctx: &egui::Context| -> Option<(usize, usize)> {
         let st = ctx.data_mut(|d| d.get_temp::<rusted::editor::FastEditorState>(editor_id))?;
         let r = st.cursor.char_range()?;
-        let [min_c, max_c] = r.sorted();
-        Some((min_c.index, max_c.index))
+        let [min_c, max_c] = r.sorted_cursors();
+        Some((min_c.index.0, max_c.index.0))
     };
 
     // 1. Empty query returns false

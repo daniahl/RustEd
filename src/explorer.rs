@@ -308,7 +308,7 @@ pub fn render_inline_tree_edit(
     edit: &mut PendingTreeEdit,
     edit_outcome: &mut Option<TreeEditOutcome>,
 ) {
-    let edit_id = egui::Id::new("tree_inline_editor");
+    let edit_id = egui::Id::unique("tree_inline_editor");
     if !edit.had_focus {
         ui.memory_mut(|m| m.request_focus(edit_id));
         let mut state = egui::text_edit::TextEditState::load(ui.ctx(), edit_id).unwrap_or_default();
@@ -454,11 +454,11 @@ fn render_file_node_with_buf(
                     *selected_node = Some((node.path.clone(), true));
                     if ui.button("New Folder").clicked() {
                         *tree_action = Some(TreeAction::StartNewFolder(node.path.clone()));
-                        ui.close_menu();
+                        ui.close();
                     }
                     if ui.button("New File").clicked() {
                         *tree_action = Some(TreeAction::StartNewFile(node.path.clone()));
-                        ui.close_menu();
+                        ui.close();
                     }
                     if ui.button("Rename").clicked() {
                         *tree_action = Some(TreeAction::StartRename {
@@ -466,14 +466,14 @@ fn render_file_node_with_buf(
                             current_name: node.name.clone(),
                             is_dir: true,
                         });
-                        ui.close_menu();
+                        ui.close();
                     }
                     if ui.button("Delete").clicked() {
                         *tree_action = Some(TreeAction::DeleteNode {
                             path: node.path.clone(),
                             is_dir: true,
                         });
-                        ui.close_menu();
+                        ui.close();
                     }
                 });
             });
@@ -557,14 +557,14 @@ fn render_file_node_with_buf(
                         current_name: node.name.clone(),
                         is_dir: false,
                     });
-                    ui.close_menu();
+                    ui.close();
                 }
                 if ui.button("Delete").clicked() {
                     *tree_action = Some(TreeAction::DeleteNode {
                         path: node.path.clone(),
                         is_dir: false,
                     });
-                    ui.close_menu();
+                    ui.close();
                 }
             });
         });
@@ -879,12 +879,14 @@ impl FileExplorer {
         }
     }
 
-    pub fn show_sidebar(&mut self, ctx: &egui::Context, doc: &mut Document) {
-        egui::SidePanel::left("explorer_sidebar")
+    pub fn show_sidebar(&mut self, ui: &mut egui::Ui, doc: &mut Document) {
+        let ctx = ui.ctx().clone();
+        let ctx = &ctx;
+        egui::Panel::left("explorer_sidebar")
             .resizable(true)
-            .default_width(220.0)
-            .min_width(140.0)
-            .show(ctx, |ui| {
+            .default_size(220.0)
+            .min_size(140.0)
+            .show(ui, |ui| {
                 if self.pending_tree_edit.is_none() && ui.input(|i| i.key_pressed(egui::Key::F2)) {
                     self.start_rename_selected();
                 }
@@ -951,11 +953,11 @@ impl FileExplorer {
                             empty.context_menu(|ui| {
                                 if ui.button("New Folder").clicked() {
                                     tree_action = Some(TreeAction::StartNewFolder(root_path.clone()));
-                                    ui.close_menu();
+                                    ui.close();
                                 }
                                 if ui.button("New File").clicked() {
                                     tree_action = Some(TreeAction::StartNewFile(root_path.clone()));
-                                    ui.close_menu();
+                                    ui.close();
                                 }
                             });
                         }

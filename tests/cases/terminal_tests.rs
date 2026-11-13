@@ -4,12 +4,19 @@
 //! ANSI escape code processing, and keyboard/control-sequence input mapping.
 
 use eframe::egui;
-use rusted::terminal::{render_vt100_screen, TerminalPane};
+use rusted::{
+    editor::FastEditorState,
+    terminal::{render_vt100_screen, TerminalPane},
+};
 use std::sync::mpsc;
 
 #[test]
 fn test_render_vt100_screen_plain_text_and_cursor() {
-    let mut parser = vt100::Parser::new(5, 20, 0);
+    let mut parser = vt100::Parser::new(
+        std::num::NonZeroU16::new(5).unwrap(),
+        std::num::NonZeroU16::new(20).unwrap(),
+        0,
+    );
 
     // Write text to parser: "Hello, World!"
     parser.process(b"Hello, World!");
@@ -25,7 +32,11 @@ fn test_render_vt100_screen_plain_text_and_cursor() {
 
 #[test]
 fn test_render_vt100_screen_cursor_padding_past_line_end() {
-    let mut parser = vt100::Parser::new(5, 40, 0);
+    let mut parser = vt100::Parser::new(
+        std::num::NonZeroU16::new(5).unwrap(),
+        std::num::NonZeroU16::new(40).unwrap(),
+        0,
+    );
 
     // Write "abc" then move cursor forward 10 positions via escape code \x1b[10C
     parser.process(b"abc\x1b[10C");
@@ -42,7 +53,11 @@ fn test_render_vt100_screen_cursor_padding_past_line_end() {
 
 #[test]
 fn test_render_vt100_screen_ansi_codes_stripped() {
-    let mut parser = vt100::Parser::new(5, 40, 0);
+    let mut parser = vt100::Parser::new(
+        std::num::NonZeroU16::new(5).unwrap(),
+        std::num::NonZeroU16::new(40).unwrap(),
+        0,
+    );
 
     // Process ANSI codes: red text, reset, bold text, reset
     parser.process(b"\x1b[31mRed\x1b[0m \x1b[1mBold\x1b[0m");
@@ -63,9 +78,11 @@ fn test_handle_terminal_input_key_mappings() {
     let send_event = |pane: &mut TerminalPane, ctx: &egui::Context, event: egui::Event, focused: bool| {
         let mut raw = egui::RawInput::default();
         raw.events.push(event);
-        let _ = ctx.run(raw, |ctx| {
-            pane.handle_terminal_input(ctx, focused);
-        });
+        ctx.run_ui(raw, |ui| {
+            pane.handle_terminal_input(ui.ctx(), focused);
+        })
+        .textures_delta
+        .clear();
     };
 
     let take_sent = || {
@@ -170,7 +187,7 @@ fn test_handle_terminal_input_key_mappings() {
     send_event(&mut pane, &ctx, egui::Event::Text("cargo test".to_string()), true);
     assert_eq!(&take_sent(), b"cargo test");
 
-    // 8. Shift+ArrowLeft enters selection mode without sending bytes
+    // 8. Shift+ArrowLeft does NOT enter buffer selection mode; it forwards to the PTY
     assert!(!pane.selecting_in_terminal);
     send_event(
         &mut pane,
@@ -184,13 +201,15 @@ fn test_handle_terminal_input_key_mappings() {
         },
         true,
     );
-    assert!(pane.selecting_in_terminal, "Shift+Arrow should activate selection mode");
-    assert!(take_sent().is_empty(), "Shift+Arrow should not send bytes to PTY");
-
-    // 9. Subsequent text input exits selection mode
-    send_event(&mut pane, &ctx, egui::Event::Text("a".to_string()), true);
-    assert!(!pane.selecting_in_terminal, "Typing text should exit selection mode");
-    assert_eq!(&take_sent(), b"a");
+    assert!(
+        !pane.selecting_in_terminal,
+        "Shift+Arrow should not activate buffer selection mode"
+    );
+    assert_eq!(
+        &take_sent(),
+        b"\x1b[D",
+        "Shift+Arrow should forward to PTY instead of selecting in the buffer"
+    );
 }
 
 #[cfg(windows)]
@@ -223,4 +242,318 @@ fn test_terminal_pane_new_starts_in_working_dir() {
     );
 
     let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+#[cfg(windows)]
+#[test]
+fn test_terminal_pane_restart_spawns_fresh_session() {
+    let temp_dir =
+        std::env::temp_dir().join(format!("rusted_term_restart_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&temp_dir);
+    std::fs::create_dir_all(&temp_dir).unwrap();
+
+    let ctx = egui::Context::default();
+    let mut pane = TerminalPane::new(ctx.clone(), Some(&temp_dir));
+    let folder_name = temp_dir.file_name().unwrap().to_string_lossy().to_string();
+
+    let wait_for_prompt = |pane: &TerminalPane| -> bool {
+        for _ in 0..60 {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            let lock = pane.term.lock().unwrap();
+            let (screen_text, _) = render_vt100_screen(lock.parser.screen());
+            if screen_text.contains(&folder_name) {
+                return true;
+            }
+        }
+        false
+    };
+
+    assert!(wait_for_prompt(&pane), "Initial terminal prompt should appear");
+
+    // Exit the shell, then restart the terminal pane
+    pane.write_to_pty(b"exit\r");
+    std::thread::sleep(std::time::Duration::from_millis(200));
+
+    let prev_revision = pane.term_revision;
+    pane.restart(&ctx, Some(&temp_dir));
+
+    assert!(pane.focus_terminal, "Restart should request focus on the terminal");
+    assert!(
+        pane.term_revision > prev_revision,
+        "Restart should advance term_revision"
+    );
+    assert!(
+        wait_for_prompt(&pane),
+        "Restarted terminal should spawn a fresh cmd.exe prompt in the working directory"
+    );
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_terminal_clicking_does_not_move_caret() {
+    let ctx = egui::Context::default();
+    let mut pane = TerminalPane::new_headless();
+    {
+        let mut lock = pane.term.lock().unwrap();
+        lock.parser.process(b"line one\r\nC:\\>hello");
+        lock.pty_updated = true;
+    }
+
+    let term_id = egui::Id::unique("conpty_terminal");
+    let run_frame = |pane: &mut TerminalPane, events: Vec<egui::Event>| {
+        let mut raw = egui::RawInput::default();
+        raw.screen_rect = Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::Vec2::new(800.0, 600.0),
+        ));
+        raw.events = events;
+        let mut out = ctx.run_ui(raw, |ui| {
+            pane.show(ui, egui::Frame::default());
+        });
+        out.textures_delta.clear();
+        out
+        .textures_delta
+        .clear();
+    };
+
+    // Initial frame renders the PTY buffer and sets the caret to the PTY cursor position.
+    run_frame(&mut pane, Vec::new());
+    let expected_cursor = pane.term_cursor_idx;
+    assert!(
+        expected_cursor > 9,
+        "Expected PTY cursor on the second line, got {expected_cursor}"
+    );
+
+    let read_caret = || {
+        ctx.data(|d| {
+            d.get_temp::<FastEditorState>(term_id)
+                .and_then(|s| s.cursor.char_range())
+        })
+    };
+    assert_eq!(
+        read_caret(),
+        Some(egui::text::CCursorRange::one(egui::text::CCursor::new(
+            expected_cursor
+        )))
+    );
+
+    // Left-click near the top-left of the terminal (on "line one", far from expected_cursor).
+    let click_pos = egui::Pos2::new(12.0, 8.0);
+    run_frame(
+        &mut pane,
+        vec![
+            egui::Event::PointerMoved(click_pos),
+            egui::Event::PointerButton {
+                pos: click_pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ],
+    );
+    run_frame(
+        &mut pane,
+        vec![egui::Event::PointerButton {
+            pos: click_pos,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        }],
+    );
+
+    assert!(
+        ctx.memory(|m| m.has_focus(term_id)),
+        "Left-clicking the terminal should focus it"
+    );
+    assert_eq!(
+        read_caret(),
+        Some(egui::text::CCursorRange::one(egui::text::CCursor::new(
+            expected_cursor
+        ))),
+        "Left-clicking in the terminal should not move the caret"
+    );
+
+    // Right-click near the top-left of the terminal.
+    run_frame(
+        &mut pane,
+        vec![
+            egui::Event::PointerMoved(click_pos),
+            egui::Event::PointerButton {
+                pos: click_pos,
+                button: egui::PointerButton::Secondary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ],
+    );
+    run_frame(
+        &mut pane,
+        vec![egui::Event::PointerButton {
+            pos: click_pos,
+            button: egui::PointerButton::Secondary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        }],
+    );
+
+    assert_eq!(
+        read_caret(),
+        Some(egui::text::CCursorRange::one(egui::text::CCursor::new(
+            expected_cursor
+        ))),
+        "Right-clicking in the terminal should not move the caret"
+    );
+}
+
+#[test]
+fn test_terminal_mouse_drag_select_and_copy_without_moving_caret() {
+    let ctx = egui::Context::default();
+    let mut pane = TerminalPane::new_headless();
+    let (tx, rx) = mpsc::channel();
+    pane.pty_writer = Some(tx);
+    {
+        let mut lock = pane.term.lock().unwrap();
+        lock.parser.process(b"hello world\r\nC:\\>cmd");
+        lock.pty_updated = true;
+    }
+
+    let term_id = egui::Id::unique("conpty_terminal");
+    let run_frame = |pane: &mut TerminalPane, events: Vec<egui::Event>| {
+        let mut raw = egui::RawInput::default();
+        raw.screen_rect = Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::Vec2::new(800.0, 600.0),
+        ));
+        raw.events = events;
+        let mut out = ctx.run_ui(raw, |ui| {
+            pane.show(ui, egui::Frame::default());
+        });
+        out.textures_delta.clear();
+        out
+    };
+
+    run_frame(&mut pane, Vec::new());
+    let expected_cursor = pane.term_cursor_idx;
+
+    // Drag across the first line ("hello world")
+    let start_pos = egui::Pos2::new(8.0, 8.0);
+    let end_pos = egui::Pos2::new(120.0, 8.0);
+    run_frame(
+        &mut pane,
+        vec![
+            egui::Event::PointerMoved(start_pos),
+            egui::Event::PointerButton {
+                pos: start_pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ],
+    );
+    run_frame(
+        &mut pane,
+        vec![egui::Event::PointerMoved(end_pos)],
+    );
+    run_frame(
+        &mut pane,
+        vec![egui::Event::PointerButton {
+            pos: end_pos,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        }],
+    );
+
+    let (caret_after_drag, mouse_sel) = ctx.data(|d| {
+        let st = d.get_temp::<FastEditorState>(term_id).unwrap();
+        (st.cursor.char_range(), st.mouse_selection)
+    });
+    assert_eq!(
+        caret_after_drag,
+        Some(egui::text::CCursorRange::one(egui::text::CCursor::new(
+            expected_cursor
+        ))),
+        "Dragging to select text must not move the terminal caret"
+    );
+    assert!(
+        mouse_sel.is_some_and(|r| r.primary != r.secondary),
+        "Dragging with primary button should create a non-empty mouse selection"
+    );
+
+    // Ctrl+C (Event::Copy + Key::C) should copy the selection and NOT send 0x03 to PTY
+    let out = run_frame(
+        &mut pane,
+        vec![
+            egui::Event::Copy,
+            egui::Event::Key {
+                key: egui::Key::C,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::CTRL,
+            },
+        ],
+    );
+    let copied = out.platform_output.commands.iter().find_map(|cmd| {
+        if let egui::OutputCommand::CopyText(text) = cmd {
+            Some(text.clone())
+        } else {
+            None
+        }
+    });
+    assert!(
+        copied.as_deref().is_some_and(|s| s.contains("hello")),
+        "Ctrl+C should copy the mouse-selected text, got {copied:?}"
+    );
+    assert!(
+        rx.try_recv().is_err(),
+        "Ctrl+C with an active selection should not send 0x03 to PTY"
+    );
+
+    // Right-clicking with an active selection should also copy it and clear selection without moving caret
+    let out_rc = run_frame(
+        &mut pane,
+        vec![
+            egui::Event::PointerMoved(start_pos),
+            egui::Event::PointerButton {
+                pos: start_pos,
+                button: egui::PointerButton::Secondary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+            egui::Event::PointerButton {
+                pos: start_pos,
+                button: egui::PointerButton::Secondary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ],
+    );
+    let copied_rc = out_rc.platform_output.commands.iter().find_map(|cmd| {
+        if let egui::OutputCommand::CopyText(text) = cmd {
+            Some(text.clone())
+        } else {
+            None
+        }
+    });
+    assert!(
+        copied_rc.as_deref().is_some_and(|s| s.contains("hello")),
+        "Right-click with selection should copy the selected text, got {copied_rc:?}"
+    );
+    let (caret_after_rc, sel_after_rc) = ctx.data(|d| {
+        let st = d.get_temp::<FastEditorState>(term_id).unwrap();
+        (st.cursor.char_range(), st.mouse_selection)
+    });
+    assert_eq!(
+        caret_after_rc,
+        Some(egui::text::CCursorRange::one(egui::text::CCursor::new(
+            expected_cursor
+        ))),
+        "Right-clicking to copy must not move the terminal caret"
+    );
+    assert!(
+        sel_after_rc.is_none(),
+        "Right-clicking to copy should clear the selection"
+    );
 }

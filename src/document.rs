@@ -208,7 +208,7 @@ impl Document {
             return;
         };
 
-        let editor_id = egui::Id::new("code_editor");
+        let editor_id = egui::Id::unique("code_editor");
         if !self.path.is_empty() && self.is_current_dirty {
             let mut prev_state = ctx.data_mut(|d| d.get_temp::<editor::FastEditorState>(editor_id));
             if let Some(ref mut st) = prev_state {
@@ -364,7 +364,7 @@ impl Document {
         self.external_conflict = None;
         self.refresh_file_metadata();
 
-        let editor_id = egui::Id::new("code_editor");
+        let editor_id = egui::Id::unique("code_editor");
         let total_chars = self.text.char_count();
         let mut st = ctx
             .data_mut(|d| d.get_temp::<editor::FastEditorState>(editor_id))
@@ -373,8 +373,8 @@ impl Document {
             .cursor
             .char_range()
             .unwrap_or_else(|| egui::text::CCursorRange::one(egui::text::CCursor::new(0)));
-        let primary_idx = prev_range.primary.index.min(total_chars);
-        let secondary_idx = prev_range.secondary.index.min(total_chars);
+        let primary_idx = prev_range.primary.index.0.min(total_chars);
+        let secondary_idx = prev_range.secondary.index.0.min(total_chars);
         st.cursor.set_char_range(Some(egui::text::CCursorRange::two(
             egui::text::CCursor::new(secondary_idx),
             egui::text::CCursor::new(primary_idx),
@@ -417,7 +417,7 @@ impl Document {
                 self.external_conflict = None;
                 self.refresh_file_metadata();
 
-                let editor_id = egui::Id::new("code_editor");
+                let editor_id = egui::Id::unique("code_editor");
                 ctx.data_mut(|d| {
                     d.insert_temp(editor_id, editor::FastEditorState::default());
                 });
@@ -557,14 +557,14 @@ impl Document {
     }
 
     pub fn open_find_dialog(&mut self, ctx: &egui::Context) {
-        let editor_id = egui::Id::new("code_editor");
+        let editor_id = egui::Id::unique("code_editor");
         if let Some(state) = ctx.data_mut(|d| d.get_temp::<editor::FastEditorState>(editor_id)) {
             if let Some(range) = state.cursor.char_range() {
                 if range.primary != range.secondary {
-                    let [min_c, max_c] = range.sorted();
-                    let count = max_c.index - min_c.index;
+                    let [min_c, max_c] = range.sorted_cursors();
+                    let count = max_c.index.0 - min_c.index.0;
                     if count > 0 && count <= 1024 {
-                        let selected = self.text.slice_chars(min_c.index..max_c.index);
+                        let selected = self.text.slice_chars(min_c.index.0..max_c.index.0);
                         if !selected.is_empty()
                             && !selected.contains('\n')
                             && !selected.contains('\r')
@@ -583,7 +583,7 @@ impl Document {
         if self.find_query.is_empty() || self.text.is_empty() {
             return false;
         }
-        let editor_id = egui::Id::new("code_editor");
+        let editor_id = egui::Id::unique("code_editor");
         let mut state = ctx
             .data_mut(|d| d.get_temp::<editor::FastEditorState>(editor_id))
             .unwrap_or_default();
@@ -591,7 +591,7 @@ impl Document {
         let start_char_idx = state
             .cursor
             .char_range()
-            .map(|r| r.primary.index.max(r.secondary.index))
+            .map(|r| r.primary.index.0.max(r.secondary.index.0))
             .unwrap_or(0);
 
         let start_byte = self.text.char_to_byte(start_char_idx);
@@ -646,7 +646,7 @@ impl Document {
             .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-16.0, 36.0))
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    let find_id = egui::Id::new("find_query_input");
+                    let find_id = egui::Id::unique("find_query_input");
                     if self.focus_find_input {
                         ui.memory_mut(|m| m.request_focus(find_id));
                         let mut st = egui::text_edit::TextEditState::load(ui.ctx(), find_id)
@@ -710,7 +710,7 @@ impl Document {
 
         if close_dialog {
             open = false;
-            let editor_id = egui::Id::new("code_editor");
+            let editor_id = egui::Id::unique("code_editor");
             ctx.memory_mut(|m| {
                 m.request_focus(editor_id);
                 m.set_focus_lock_filter(
@@ -742,9 +742,11 @@ impl Document {
         }
     }
 
-    pub fn show_editor(&mut self, ctx: &egui::Context, panel_frame: egui::Frame) {
+    pub fn show_editor(&mut self, ui: &mut egui::Ui, panel_frame: egui::Frame) {
+        let ctx = ui.ctx().clone();
+        let ctx = &ctx;
         let mut editor_text_changed = false;
-        egui::CentralPanel::default().frame(panel_frame).show(ctx, |ui| {
+        egui::CentralPanel::default().frame(panel_frame).show(ui, |ui| {
             if let Some(conflict) = self.external_conflict {
                 let mut do_reload = false;
                 let mut do_close = false;
@@ -817,7 +819,7 @@ impl Document {
                         wrap_width,
                     )
                 };
-                ui.fonts(|f| f.layout_job(layout_job))
+                ui.fonts_mut(|f| f.layout_job(layout_job))
             };
 
             let available_size = ui.available_size();
@@ -845,7 +847,7 @@ impl Document {
 
                         let is_large = self.text.len() > MAX_HIGHLIGHT_BYTES;
                         let editor = FastEditor::new_with_buffer(
-                            egui::Id::new("code_editor"),
+                            egui::Id::unique("code_editor"),
                             &mut self.text,
                             editor_min_size,
                             &mut layouter,
@@ -896,44 +898,51 @@ impl Document {
                             self.gutter_cache = Some((Arc::clone(&output.galley), nums));
                         }
 
-                        if let Some(cursor_range) = output.cursor_range {
-                            let focus = cursor_range.primary.rcursor;
-                            self.cursor_line = if output.virtualized {
-                                focus.row + 1
-                            } else if let Some((_, nums)) = &self.gutter_cache {
-                                if nums.is_empty() {
-                                    1
-                                } else {
-                                    let end = focus.row.min(nums.len() - 1);
-                                    ((nums[end] & !WRAPPED_ROW_FLAG) as usize).max(1)
-                                }
+                        let active_row = if let Some(cursor_range) = output.cursor_range {
+                            let (line, col, active_row) = if output.virtualized {
+                                let (line, col) = self.text.char_to_line_col(cursor_range.primary.index.0);
+                                (line + 1, col + 1, line)
                             } else {
-                                focus.row + 1
+                                let focus = output.galley.layout_from_cursor(cursor_range.primary);
+                                let line = if let Some((_, nums)) = &self.gutter_cache {
+                                    if nums.is_empty() {
+                                        1
+                                    } else {
+                                        let end = focus.row.min(nums.len() - 1);
+                                        ((nums[end] & !WRAPPED_ROW_FLAG) as usize).max(1)
+                                    }
+                                } else {
+                                    focus.row + 1
+                                };
+                                (line, focus.column.0 + 1, focus.row)
                             };
-                            self.cursor_col = focus.column + 1;
+                            self.cursor_line = line;
+                            self.cursor_col = col;
                             self.selected_chars = if cursor_range.is_empty() {
                                 0
                             } else {
                                 cursor_range
                                     .primary
-                                    .ccursor
                                     .index
-                                    .abs_diff(cursor_range.secondary.ccursor.index)
+                                    .0
+                                    .abs_diff(cursor_range.secondary.index.0)
                             };
-                        }
+                            Some(active_row)
+                        } else {
+                            None
+                        };
 
                         let clip_rect = ui.clip_rect();
                         let painter = ui.painter();
-                        let active_row = output.cursor_range.map(|c| c.primary.rcursor.row);
                         if let Some((_, nums)) = &self.gutter_cache {
                             let rows = &output.galley.rows;
                             // Binary-search the first visible row; draw only visible rows.
                             let top = clip_rect.min.y - output.galley_pos.y;
-                            let first = rows.partition_point(|r| r.rect.max.y < top);
+                            let first = rows.partition_point(|r| r.rect().max.y < top);
                             let mut num_buf = [0u8; 16];
                             for row_idx in first..rows.len() {
                                 let row = &rows[row_idx];
-                                let y = output.galley_pos.y + row.rect.min.y;
+                                let y = output.galley_pos.y + row.rect().min.y;
                                 if y > clip_rect.max.y {
                                     break;
                                 }

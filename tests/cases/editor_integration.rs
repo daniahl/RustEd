@@ -14,13 +14,13 @@ fn test_editor_full_lifecycle() {
     ctx.enable_accesskit();
 
     let mut text = String::new();
-    let id = Id::new("test_editor");
-    let font_id = egui::TextStyle::Monospace.resolve(&ctx.style());
+    let id = Id::unique("test_editor");
+    let font_id = egui::TextStyle::Monospace.resolve(&ctx.global_style());
 
     let run_frame = |ctx: &egui::Context, text: &mut String, raw_input: egui::RawInput| {
         let font_id = font_id.clone();
-        ctx.run(raw_input, |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
+        let mut out = ctx.run_ui(raw_input, |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
                 let mut layouter = |ui: &Ui, text: &str, wrap_width: f32| {
                     let job = LayoutJob::simple(
                         text.to_owned(),
@@ -28,19 +28,23 @@ fn test_editor_full_lifecycle() {
                         Color32::WHITE,
                         wrap_width,
                     );
-                    ui.fonts(|f| f.layout_job(job))
+                    ui.fonts_mut(|f| f.layout_job(job))
                 };
                 let editor = FastEditor::new(id, text, Vec2::new(100.0, 100.0), &mut layouter);
                 let output = editor.show(ui);
                 output.response.request_focus();
             });
-        })
+        });
+        out.textures_delta.clear();
+        out
     };
 
     // Frame 1: Empty text, focus
     let out = run_frame(&ctx, &mut text, Default::default());
     let u = out.platform_output.accesskit_update.unwrap();
-    assert_eq!(u.nodes.len(), 3); // Window, MultilineTextInput (self.id), and active TextRun child
+    assert!(u.nodes.iter().any(|(_, n)| n.role() == egui::accesskit::Role::Window));
+    assert!(u.nodes.iter().any(|(_, n)| n.role() == egui::accesskit::Role::MultilineTextInput));
+    assert!(u.nodes.iter().any(|(_, n)| n.role() == egui::accesskit::Role::TextRun));
 
     // Frame 2: Type "First Line"
     let mut input = egui::RawInput::default();
@@ -153,15 +157,15 @@ fn test_arrow_keys() {
     let ctx = egui::Context::default();
 
     let mut text = "Line 1\nLine 2".to_string();
-    let id = Id::new("test_editor_arrows");
-    let font_id = egui::TextStyle::Monospace.resolve(&ctx.style());
+    let id = Id::unique("test_editor_arrows");
+    let font_id = egui::TextStyle::Monospace.resolve(&ctx.global_style());
 
     let run_frame = |ctx: &egui::Context, text: &mut String, raw_input: egui::RawInput| {
         let font_id = font_id.clone();
         let mut last_cursor = None;
         let mut last_focus = false;
-        let full_output = ctx.run(raw_input, |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
+        let mut full_output = ctx.run_ui(raw_input, |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
                 let mut layouter = |ui: &Ui, text: &str, wrap_width: f32| {
                     let job = LayoutJob::simple(
                         text.to_owned(),
@@ -169,7 +173,7 @@ fn test_arrow_keys() {
                         Color32::WHITE,
                         wrap_width,
                     );
-                    ui.fonts(|f| f.layout_job(job))
+                    ui.fonts_mut(|f| f.layout_job(job))
                 };
                 let editor = FastEditor::new(id, text, Vec2::new(100.0, 100.0), &mut layouter);
                 let output = editor.show(ui);
@@ -180,6 +184,7 @@ fn test_arrow_keys() {
                 last_focus = output.response.has_focus();
             });
         });
+        full_output.textures_delta.clear();
         (last_cursor, last_focus, full_output.platform_output.cursor_icon)
     };
 
@@ -206,9 +211,21 @@ fn test_arrow_keys() {
         });
         last_out = run_frame(&ctx, &mut text, input);
     }
+    let row_col = |idx: usize, text: &str| {
+        let mut row = 0;
+        let mut col = 0;
+        for ch in text.chars().take(idx) {
+            if ch == '\n' {
+                row += 1;
+                col = 0;
+            } else {
+                col += 1;
+            }
+        }
+        (row, col)
+    };
     let cur = last_out.0.unwrap().primary;
-    assert_eq!(cur.rcursor.row, 1);
-    assert_eq!(cur.rcursor.column, 0);
+    assert_eq!(row_col(cur.index.0, &text), (1, 0));
 
     // Frame 4: Press ArrowLeft -> should land on row 0, column 6
     let mut input = egui::RawInput::default();
@@ -221,8 +238,7 @@ fn test_arrow_keys() {
     });
     let out = run_frame(&ctx, &mut text, input);
     let cur = out.0.unwrap().primary;
-    assert_eq!(cur.rcursor.row, 0);
-    assert_eq!(cur.rcursor.column, 6);
+    assert_eq!(row_col(cur.index.0, &text), (0, 6));
 
     // Frame 5: Press ArrowDown -> should land on row 1, column 6
     let mut input = egui::RawInput::default();
@@ -235,8 +251,7 @@ fn test_arrow_keys() {
     });
     let out = run_frame(&ctx, &mut text, input);
     let cur = out.0.unwrap().primary;
-    assert_eq!(cur.rcursor.row, 1);
-    assert_eq!(cur.rcursor.column, 6);
+    assert_eq!(row_col(cur.index.0, &text), (1, 6));
 
     // Frame 6: Press ArrowUp -> should land back on row 0, column 6
     let mut input = egui::RawInput::default();
@@ -249,16 +264,15 @@ fn test_arrow_keys() {
     });
     let out = run_frame(&ctx, &mut text, input);
     let cur = out.0.unwrap().primary;
-    assert_eq!(cur.rcursor.row, 0);
-    assert_eq!(cur.rcursor.column, 6);
+    assert_eq!(row_col(cur.index.0, &text), (0, 6));
 }
 
 #[test]
 fn test_paste_scrolls_to_caret() {
     let ctx = egui::Context::default();
     let mut text = String::new();
-    let id = Id::new("test_editor_paste");
-    let font_id = egui::TextStyle::Monospace.resolve(&ctx.style());
+    let id = Id::unique("test_editor_paste");
+    let font_id = egui::TextStyle::Monospace.resolve(&ctx.global_style());
     let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), Vec2::new(400.0, 300.0));
 
     let mut caret_visible = false;
@@ -267,8 +281,8 @@ fn test_paste_scrolls_to_caret() {
         input.screen_rect = Some(screen);
         input.events = events;
         let font_id = font_id.clone();
-        let _ = ctx.run(input, |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
+        let mut out = ctx.run_ui(input, |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .animated(false)
@@ -280,7 +294,7 @@ fn test_paste_scrolls_to_caret() {
                                 Color32::WHITE,
                                 wrap_width,
                             );
-                            ui.fonts(|f| f.layout_job(job))
+                            ui.fonts_mut(|f| f.layout_job(job))
                         };
                         let editor = FastEditor::new(id, text, Vec2::new(100.0, 100.0), &mut layouter);
                         let output = editor.show(ui);
@@ -288,13 +302,14 @@ fn test_paste_scrolls_to_caret() {
                         if let Some(c) = output.cursor_range {
                             let r = output
                                 .galley
-                                .pos_from_cursor(&c.primary)
+                                .pos_from_cursor(c.primary)
                                 .translate(output.galley_pos.to_vec2());
                             caret_visible = ui.clip_rect().contains(r.center());
                         }
                     });
             });
         });
+        out.textures_delta.clear();
     };
 
     run_frame(&ctx, &mut text, vec![]);
@@ -317,8 +332,8 @@ fn test_coalesced_relayout_and_long_line_accesskit() {
 
     let mut text = String::new();
     let mut rev = 1u64;
-    let id = Id::new("test_editor_perf");
-    let font_id = egui::TextStyle::Monospace.resolve(&ctx.style());
+    let id = Id::unique("test_editor_perf");
+    let font_id = egui::TextStyle::Monospace.resolve(&ctx.global_style());
     let layout_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
     let run_frame = |ctx: &egui::Context,
@@ -329,8 +344,8 @@ fn test_coalesced_relayout_and_long_line_accesskit() {
         input.events = events;
         let font_id = font_id.clone();
         let layout_calls = std::sync::Arc::clone(&layout_calls);
-        ctx.run(input, |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
+        let mut out = ctx.run_ui(input, |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
                 let mut layouter = |ui: &Ui, text: &str, wrap_width: f32| {
                     layout_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     let job = LayoutJob::simple(
@@ -339,7 +354,7 @@ fn test_coalesced_relayout_and_long_line_accesskit() {
                         Color32::WHITE,
                         wrap_width,
                     );
-                    ui.fonts(|f| f.layout_job(job))
+                    ui.fonts_mut(|f| f.layout_job(job))
                 };
                 let output = FastEditor::new(id, text, Vec2::new(400.0, 200.0), &mut layouter)
                     .text_revision(*rev)
@@ -349,7 +364,9 @@ fn test_coalesced_relayout_and_long_line_accesskit() {
                     *rev += 1;
                 }
             });
-        })
+        });
+        out.textures_delta.clear();
+        out
     };
 
     // Frame 1: Initial layout + focus -> emits Window, MultilineTextInput, and active TextRun
@@ -397,8 +414,11 @@ fn test_coalesced_relayout_and_long_line_accesskit() {
         .find(|(_, n)| n.role() == egui::accesskit::Role::TextRun)
         .map(|(_, n)| n)
         .expect("Expected active TextRun node");
-    let total_word_len: usize = text_run.word_lengths().iter().map(|&w| w as usize).sum();
-    assert_eq!(total_word_len, text_run.character_lengths().len());
+    assert!(!text_run.word_starts().is_empty());
+    assert!(text_run
+        .word_starts()
+        .iter()
+        .all(|&s| (s as usize) < text_run.character_lengths().len()));
 }
 
 #[test]
@@ -408,7 +428,7 @@ fn test_virtualized_large_file_layout_and_editing() {
     let ctx = egui::Context::default();
     let mut pt = PieceTable::from_string((0..5000).map(|i| format!("line {i:04}\n")).collect());
     let mut rev = 1u64;
-    let id = Id::new("test_virtualized_editor");
+    let id = Id::unique("test_virtualized_editor");
     let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), Vec2::new(600.0, 300.0));
 
     let run_frame = |pt: &mut PieceTable, rev: &mut u64, events: Vec<Event>| {
@@ -418,8 +438,8 @@ fn test_virtualized_large_file_layout_and_editing() {
         let mut last_rows = 0usize;
         let mut last_first_line = 0usize;
         let mut last_cursor = None;
-        let _ = ctx.run(input, |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
+        let mut out = ctx.run_ui(input, |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .animated(false)
@@ -446,6 +466,7 @@ fn test_virtualized_large_file_layout_and_editing() {
                     });
             });
         });
+        out.textures_delta.clear();
         (last_rows, last_first_line, last_cursor)
     };
 
@@ -474,8 +495,9 @@ fn test_virtualized_large_file_layout_and_editing() {
     );
     assert_eq!(pt.slice_chars(0..12), "ABCline 0000");
     let cur = last_cursor.unwrap().primary;
-    assert_eq!(cur.rcursor.row, 1);
-    assert_eq!(cur.rcursor.column, 3);
+    let (row, col) = pt.char_to_line_col(cur.index.0);
+    assert_eq!(row, 1);
+    assert_eq!(col, 3);
 }
 
 /// Runs Ctrl+A then Delete on a document made of one very long line and returns, after every
@@ -530,11 +552,29 @@ fn long_line_ctrl_a_delete_focus(
             events,
             ..Default::default()
         };
-        let out = ctx.run(input, |ctx| app.update_ui(ctx));
+        let mut out = ctx.run_ui(input, |ui| app.update_ui(ui));
+        out.textures_delta.clear();
+        struct NoOpHandler;
+        impl accesskit_consumer::TreeChangeHandler for NoOpHandler {
+            fn node_added(&mut self, _node: &accesskit_consumer::NodeRef) {}
+            fn node_updated(
+                &mut self,
+                _old_node: &accesskit_consumer::NodeRef,
+                _new_node: &accesskit_consumer::NodeRef,
+            ) {
+            }
+            fn focus_moved(
+                &mut self,
+                _old_node: Option<&accesskit_consumer::NodeRef>,
+                _new_node: Option<&accesskit_consumer::NodeRef>,
+            ) {
+            }
+            fn node_removed(&mut self, _node: &accesskit_consumer::NodeRef) {}
+        }
         if let Some(u) = out.platform_output.accesskit_update {
             match tree.as_mut() {
                 None => tree = Some(accesskit_consumer::Tree::new(u, true)),
-                Some(t) => t.update(u),
+                Some(t) => t.update_and_process_changes(u, &mut NoOpHandler),
             }
         }
         let state = tree.as_ref().unwrap().state();
@@ -546,7 +586,7 @@ fn long_line_ctrl_a_delete_focus(
         let focus = focus_node
             .and_then(|n| n.raw_text_selection().map(|s| s.focus))
             .and_then(|pos| {
-                let run = state.node_by_id(pos.node)?;
+                let run = state.node_by_tree_local_id(pos.node, egui::accesskit::TreeId::ROOT)?;
                 let run_len = run.value().map_or(0, |v| v.chars().count());
                 let rect = caret_box?;
                 Some((run_len, pos.character_index, rect))
