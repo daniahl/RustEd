@@ -7,7 +7,7 @@
 use eframe::egui;
 use std::{
     borrow::Cow,
-    collections::VecDeque,
+    collections::{HashSet, VecDeque},
     path::{Component, Path, PathBuf},
     sync::{Arc, Mutex},
     time::Duration,
@@ -47,14 +47,39 @@ fn normalize_verbatim(path: &Path) -> Cow<'_, Path> {
 fn component_eq(a: Component<'_>, b: Component<'_>) -> bool {
     #[cfg(target_os = "windows")]
     {
-        a.as_os_str()
-            .to_string_lossy()
-            .to_lowercase()
-            == b.as_os_str().to_string_lossy().to_lowercase()
+        let sa = a.as_os_str().to_string_lossy();
+        let sb = b.as_os_str().to_string_lossy();
+        if sa.is_ascii() && sb.is_ascii() {
+            sa.eq_ignore_ascii_case(&sb)
+        } else {
+            sa.to_lowercase() == sb.to_lowercase()
+        }
     }
     #[cfg(not(target_os = "windows"))]
     {
         a == b
+    }
+}
+
+/// Produces a normalized key for $O(1)$ path deduplication in sets.
+fn path_dedup_key(path: &Path) -> PathBuf {
+    let norm = normalize_verbatim(path);
+    #[cfg(target_os = "windows")]
+    {
+        let mut out = PathBuf::new();
+        for comp in norm.components() {
+            let s = comp.as_os_str().to_string_lossy();
+            if s.is_ascii() {
+                out.push(s.to_ascii_lowercase());
+            } else {
+                out.push(s.to_lowercase());
+            }
+        }
+        out
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        norm.into_owned()
     }
 }
 
@@ -100,6 +125,7 @@ pub fn path_strip_prefix(path: &Path, base: &Path) -> Option<PathBuf> {
 #[derive(Default)]
 struct SharedQueue {
     batch: WatchBatch,
+    seen: HashSet<PathBuf>,
 }
 
 impl SharedQueue {
@@ -111,12 +137,15 @@ impl SharedQueue {
         if rescan_all {
             self.batch.rescan_all = true;
             self.batch.paths.clear();
+            self.seen.clear();
         } else if !self.batch.rescan_all {
             for p in paths {
-                if !self.batch.paths.iter().any(|existing| paths_equal(existing, &p)) {
+                let key = path_dedup_key(&p);
+                if self.seen.insert(key) {
                     if self.batch.paths.len() >= MAX_QUEUED_PATHS {
                         self.batch.rescan_all = true;
                         self.batch.paths.clear();
+                        self.seen.clear();
                         break;
                     }
                     self.batch.paths.push(p);
@@ -132,6 +161,7 @@ impl SharedQueue {
         if self.batch.is_empty() {
             None
         } else {
+            self.seen.clear();
             Some(std::mem::take(&mut self.batch))
         }
     }
@@ -146,6 +176,7 @@ pub struct FileWatcher {
     root_watch: Option<DirWatchGuard>,
     extra_dir: Option<PathBuf>,
     extra_watch: Option<DirWatchGuard>,
+    last_extra_file: Option<PathBuf>,
     pending_retries: VecDeque<(PathBuf, std::time::Instant, u8)>,
 }
 
@@ -158,6 +189,7 @@ impl FileWatcher {
             root_watch: None,
             extra_dir: None,
             extra_watch: None,
+            last_extra_file: None,
             pending_retries: VecDeque::new(),
         };
         watcher.watch_root(root);
@@ -173,6 +205,7 @@ impl FileWatcher {
         }
         self.root_watch = None;
         self.root_dir = Some(root.to_path_buf());
+        self.last_extra_file = None;
         if root.is_dir() {
             self.root_watch = DirWatchGuard::spawn(
                 self.ctx.clone(),
@@ -186,15 +219,25 @@ impl FileWatcher {
     /// Ensures the active file's parent directory is watched non-recursively when it lies outside
     /// the project root.
     pub fn watch_extra_file(&mut self, active_file: Option<&Path>) {
+        match (&self.last_extra_file, active_file) {
+            (Some(prev), Some(next)) if paths_equal(prev, next) => return,
+            (None, None) if self.extra_dir.is_none() => return,
+            _ => {}
+        }
+        self.last_extra_file = active_file.map(Path::to_path_buf);
+
         let needed_dir = active_file.and_then(|file| {
             let parent = file.parent()?;
-            if parent.as_os_str().is_empty() || !parent.is_dir() {
+            if parent.as_os_str().is_empty() {
                 return None;
             }
             if let Some(ref root) = self.root_dir {
                 if path_starts_with(parent, root) {
                     return None;
                 }
+            }
+            if !parent.is_dir() {
+                return None;
             }
             Some(parent.to_path_buf())
         });
@@ -236,7 +279,12 @@ impl FileWatcher {
 
     /// Drains any debounced filesystem notifications and due retry paths.
     pub fn poll(&mut self) -> Option<(WatchBatch, Vec<(PathBuf, u8)>)> {
-        let mut batch = self.shared.lock().unwrap().take().unwrap_or_default();
+        let mut batch = self
+            .shared
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+            .unwrap_or_default();
         let now = std::time::Instant::now();
         let mut due_retries = Vec::new();
         while let Some((_, when, _)) = self.pending_retries.front() {
@@ -274,7 +322,7 @@ struct DirWatchGuard {
 
 #[cfg(target_os = "windows")]
 #[derive(Clone, Copy)]
-struct SendHandle(*mut std::ffi::c_void);
+struct SendHandle(windows::Win32::Foundation::HANDLE);
 
 #[cfg(target_os = "windows")]
 unsafe impl Send for SendHandle {}
@@ -283,13 +331,13 @@ unsafe impl Send for SendHandle {}
 impl Drop for DirWatchGuard {
     fn drop(&mut self) {
         unsafe {
-            win32::SetEvent(self.stop_event.0);
+            let _ = windows::Win32::System::Threading::SetEvent(self.stop_event.0);
         }
         if let Some(handle) = self.thread.take() {
             let _ = handle.join();
         }
         unsafe {
-            win32::CloseHandle(self.stop_event.0);
+            let _ = windows::Win32::Foundation::CloseHandle(self.stop_event.0);
         }
     }
 }
@@ -302,10 +350,10 @@ impl DirWatchGuard {
         recursive: bool,
         shared: Arc<Mutex<SharedQueue>>,
     ) -> Option<Self> {
-        let stop_raw = unsafe { win32::CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
-        if stop_raw.is_null() {
-            return None;
+        let stop_raw = unsafe {
+            windows::Win32::System::Threading::CreateEventW(None, true, false, None)
         }
+        .ok()?;
         let stop_event = SendHandle(stop_raw);
         let thread = std::thread::Builder::new()
             .name("rusted-fs-watcher".to_string())
@@ -315,7 +363,7 @@ impl DirWatchGuard {
             .ok();
         if thread.is_none() {
             unsafe {
-                win32::CloseHandle(stop_raw);
+                let _ = windows::Win32::Foundation::CloseHandle(stop_raw);
             }
             return None;
         }
@@ -332,82 +380,98 @@ fn run_windows_watch_loop(
     shared: Arc<Mutex<SharedQueue>>,
 ) {
     use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::{
+        CloseHandle, GetLastError, ERROR_NOTIFY_ENUM_DIR, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    };
+    use windows::Win32::Storage::FileSystem::{
+        CreateFileW, ReadDirectoryChangesW, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OVERLAPPED,
+        FILE_LIST_DIRECTORY, FILE_NOTIFY_CHANGE_DIR_NAME, FILE_NOTIFY_CHANGE_FILE_NAME,
+        FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_CHANGE_SIZE, FILE_SHARE_DELETE,
+        FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+    use windows::Win32::System::Threading::{
+        CreateEventW, ResetEvent, WaitForMultipleObjects, INFINITE,
+    };
+    use windows::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
+
+    const WAIT_OBJECT_1: u32 = WAIT_OBJECT_0.0 + 1;
 
     let wide: Vec<u16> = dir.as_os_str().encode_wide().chain([0]).collect();
-    let dir_handle = unsafe {
-        win32::CreateFileW(
-            wide.as_ptr(),
-            win32::FILE_LIST_DIRECTORY,
-            win32::FILE_SHARE_READ | win32::FILE_SHARE_WRITE | win32::FILE_SHARE_DELETE,
-            std::ptr::null(),
-            win32::OPEN_EXISTING,
-            win32::FILE_FLAG_BACKUP_SEMANTICS | win32::FILE_FLAG_OVERLAPPED,
-            std::ptr::null_mut(),
+    let Ok(dir_handle) = (unsafe {
+        CreateFileW(
+            PCWSTR(wide.as_ptr()),
+            FILE_LIST_DIRECTORY.0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED,
+            None,
         )
-    };
-    if dir_handle == win32::INVALID_HANDLE_VALUE {
+    }) else {
         return;
-    }
+    };
 
-    let io_event = unsafe { win32::CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
-    if io_event.is_null() {
+    let Ok(io_event) = (unsafe { CreateEventW(None, true, false, None) }) else {
         unsafe {
-            win32::CloseHandle(dir_handle);
+            let _ = CloseHandle(dir_handle);
         }
         return;
-    }
+    };
 
     // 32 KiB 4-byte aligned buffer works reliably on both local NTFS and SMB network shares.
     let mut buffer = vec![0u32; 8192];
-    let mut overlapped = win32::Overlapped {
-        internal: 0,
-        internal_high: 0,
-        offset: 0,
-        offset_high: 0,
-        h_event: io_event,
+    let mut overlapped = OVERLAPPED {
+        hEvent: io_event,
+        ..Default::default()
     };
 
-    let issue_read = |buf: &mut [u32], ov: &mut win32::Overlapped| -> bool {
+    let issue_read = |buf: &mut [u32], ov: &mut OVERLAPPED| -> bool {
         unsafe {
-            win32::ResetEvent(io_event);
+            let _ = ResetEvent(io_event);
         }
-        ov.internal = 0;
-        ov.internal_high = 0;
-        ov.offset = 0;
-        ov.offset_high = 0;
-        ov.h_event = io_event;
-        let ok = unsafe {
-            win32::ReadDirectoryChangesW(
+        *ov = OVERLAPPED {
+            hEvent: io_event,
+            ..Default::default()
+        };
+        unsafe {
+            ReadDirectoryChangesW(
                 dir_handle,
                 buf.as_mut_ptr().cast(),
                 std::mem::size_of_val(buf) as u32,
-                i32::from(recursive),
-                win32::FILE_NOTIFY_CHANGE_FILE_NAME
-                    | win32::FILE_NOTIFY_CHANGE_DIR_NAME
-                    | win32::FILE_NOTIFY_CHANGE_SIZE
-                    | win32::FILE_NOTIFY_CHANGE_LAST_WRITE,
-                std::ptr::null_mut(),
-                ov,
-                std::ptr::null(),
+                recursive,
+                FILE_NOTIFY_CHANGE_FILE_NAME
+                    | FILE_NOTIFY_CHANGE_DIR_NAME
+                    | FILE_NOTIFY_CHANGE_SIZE
+                    | FILE_NOTIFY_CHANGE_LAST_WRITE,
+                None,
+                Some(ov),
+                None,
             )
-        };
-        ok != 0
+            .is_ok()
+        }
     };
 
     let mut io_pending = issue_read(&mut buffer, &mut overlapped);
     let mut pending_paths: Vec<PathBuf> = Vec::new();
+    let mut pending_seen: HashSet<PathBuf> = HashSet::new();
     let mut pending_rescan = false;
     let mut first_event_at: Option<std::time::Instant> = None;
     let mut last_event_at: Option<std::time::Instant> = None;
 
     let flush_pending = |paths: &mut Vec<PathBuf>,
+                         seen: &mut HashSet<PathBuf>,
                          rescan: &mut bool,
                          first_at: &mut Option<std::time::Instant>,
                          last_at: &mut Option<std::time::Instant>| {
         if !paths.is_empty() || *rescan {
             let drained = std::mem::take(paths);
+            seen.clear();
             let rescan_flag = std::mem::take(rescan);
-            shared.lock().unwrap().push_paths(drained, rescan_flag, &ctx);
+            shared
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push_paths(drained, rescan_flag, &ctx);
         }
         *first_at = None;
         *last_at = None;
@@ -424,41 +488,44 @@ fn run_windows_watch_loop(
                 target.duration_since(now).as_millis().max(1) as u32
             }
         } else {
-            win32::INFINITE
+            INFINITE
         };
 
-        let wait_res = unsafe { win32::WaitForMultipleObjects(2, handles.as_ptr(), 0, wait_ms) };
-        match wait_res {
-            win32::WAIT_OBJECT_0 => {
+        let wait_res = unsafe { WaitForMultipleObjects(&handles, false, wait_ms) };
+        match wait_res.0 {
+            x if x == WAIT_OBJECT_0.0 => {
                 unsafe {
-                    win32::CancelIoEx(dir_handle, &mut overlapped);
+                    let _ = CancelIoEx(dir_handle, Some(&overlapped));
                     let mut cancelled_bytes = 0u32;
-                    win32::GetOverlappedResult(dir_handle, &mut overlapped, &mut cancelled_bytes, 1);
+                    let _ = GetOverlappedResult(dir_handle, &overlapped, &mut cancelled_bytes, true);
                 }
                 break;
             }
-            win32::WAIT_TIMEOUT => {
+            x if x == WAIT_TIMEOUT.0 => {
                 flush_pending(
                     &mut pending_paths,
+                    &mut pending_seen,
                     &mut pending_rescan,
                     &mut first_event_at,
                     &mut last_event_at,
                 );
             }
-            win32::WAIT_OBJECT_1 => {
+            WAIT_OBJECT_1 => {
                 let mut bytes_transferred = 0u32;
-                let ok = unsafe {
-                    win32::GetOverlappedResult(dir_handle, &mut overlapped, &mut bytes_transferred, 0)
+                let res = unsafe {
+                    GetOverlappedResult(dir_handle, &overlapped, &mut bytes_transferred, false)
                 };
-                if ok == 0 {
-                    let err = unsafe { win32::GetLastError() };
-                    if err == win32::ERROR_NOTIFY_ENUM_OVERFLOW {
+                if res.is_err() {
+                    let err = unsafe { GetLastError() };
+                    if err == ERROR_NOTIFY_ENUM_DIR {
                         pending_rescan = true;
                         pending_paths.clear();
+                        pending_seen.clear();
                     } else {
                         pending_rescan = true;
                         flush_pending(
                             &mut pending_paths,
+                            &mut pending_seen,
                             &mut pending_rescan,
                             &mut first_event_at,
                             &mut last_event_at,
@@ -468,6 +535,7 @@ fn run_windows_watch_loop(
                 } else if bytes_transferred == 0 {
                     pending_rescan = true;
                     pending_paths.clear();
+                    pending_seen.clear();
                 } else {
                     let byte_slice = unsafe {
                         std::slice::from_raw_parts(
@@ -494,13 +562,12 @@ fn run_windows_watch_loop(
                             }
                             let rel = std::ffi::OsString::from_wide(&wide_name);
                             let full_path = dir.join(rel);
-                            if !pending_paths
-                                .iter()
-                                .any(|existing| paths_equal(existing, &full_path))
-                            {
+                            let key = path_dedup_key(&full_path);
+                            if pending_seen.insert(key) {
                                 if pending_paths.len() >= MAX_QUEUED_PATHS {
                                     pending_rescan = true;
                                     pending_paths.clear();
+                                    pending_seen.clear();
                                 } else {
                                     pending_paths.push(full_path);
                                 }
@@ -522,6 +589,7 @@ fn run_windows_watch_loop(
                     if now.duration_since(first_at) >= MAX_COALESCE_WINDOW {
                         flush_pending(
                             &mut pending_paths,
+                            &mut pending_seen,
                             &mut pending_rescan,
                             &mut first_event_at,
                             &mut last_event_at,
@@ -537,94 +605,15 @@ fn run_windows_watch_loop(
 
     flush_pending(
         &mut pending_paths,
+        &mut pending_seen,
         &mut pending_rescan,
         &mut first_event_at,
         &mut last_event_at,
     );
 
     unsafe {
-        win32::CloseHandle(io_event);
-        win32::CloseHandle(dir_handle);
-    }
-}
-
-#[cfg(target_os = "windows")]
-mod win32 {
-    use std::ffi::c_void;
-
-    pub const FILE_LIST_DIRECTORY: u32 = 0x0001;
-    pub const FILE_SHARE_READ: u32 = 0x0001;
-    pub const FILE_SHARE_WRITE: u32 = 0x0002;
-    pub const FILE_SHARE_DELETE: u32 = 0x0004;
-    pub const OPEN_EXISTING: u32 = 3;
-    pub const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
-    pub const FILE_FLAG_OVERLAPPED: u32 = 0x4000_0000;
-    pub const INVALID_HANDLE_VALUE: *mut c_void = -1isize as *mut c_void;
-
-    pub const FILE_NOTIFY_CHANGE_FILE_NAME: u32 = 0x0000_0001;
-    pub const FILE_NOTIFY_CHANGE_DIR_NAME: u32 = 0x0000_0002;
-    pub const FILE_NOTIFY_CHANGE_SIZE: u32 = 0x0000_0008;
-    pub const FILE_NOTIFY_CHANGE_LAST_WRITE: u32 = 0x0000_0010;
-
-    pub const INFINITE: u32 = 0xFFFF_FFFF;
-    pub const WAIT_OBJECT_0: u32 = 0;
-    pub const WAIT_OBJECT_1: u32 = 1;
-    pub const WAIT_TIMEOUT: u32 = 258;
-    pub const ERROR_NOTIFY_ENUM_OVERFLOW: u32 = 1022;
-
-    #[repr(C)]
-    pub struct Overlapped {
-        pub internal: usize,
-        pub internal_high: usize,
-        pub offset: u32,
-        pub offset_high: u32,
-        pub h_event: *mut c_void,
-    }
-
-    #[link(name = "kernel32")]
-    extern "system" {
-        pub fn CreateFileW(
-            lp_file_name: *const u16,
-            dw_desired_access: u32,
-            dw_share_mode: u32,
-            lp_security_attributes: *const c_void,
-            dw_creation_disposition: u32,
-            dw_flags_and_attributes: u32,
-            h_template_file: *mut c_void,
-        ) -> *mut c_void;
-        pub fn CreateEventW(
-            lp_event_attributes: *const c_void,
-            b_manual_reset: i32,
-            b_initial_state: i32,
-            lp_name: *const u16,
-        ) -> *mut c_void;
-        pub fn SetEvent(h_event: *mut c_void) -> i32;
-        pub fn ResetEvent(h_event: *mut c_void) -> i32;
-        pub fn CloseHandle(h_object: *mut c_void) -> i32;
-        pub fn WaitForMultipleObjects(
-            n_count: u32,
-            lp_handles: *const *mut c_void,
-            b_wait_all: i32,
-            dw_milliseconds: u32,
-        ) -> u32;
-        pub fn ReadDirectoryChangesW(
-            h_directory: *mut c_void,
-            lp_buffer: *mut c_void,
-            n_buffer_length: u32,
-            b_watch_subtree: i32,
-            dw_notify_filter: u32,
-            lp_bytes_returned: *mut u32,
-            lp_overlapped: *mut Overlapped,
-            lp_completion_routine: *const c_void,
-        ) -> i32;
-        pub fn GetOverlappedResult(
-            h_file: *mut c_void,
-            lp_overlapped: *mut Overlapped,
-            lp_number_of_bytes_transferred: *mut u32,
-            b_wait: i32,
-        ) -> i32;
-        pub fn CancelIoEx(h_file: *mut c_void, lp_overlapped: *mut Overlapped) -> i32;
-        pub fn GetLastError() -> u32;
+        let _ = CloseHandle(io_event);
+        let _ = CloseHandle(dir_handle);
     }
 }
 

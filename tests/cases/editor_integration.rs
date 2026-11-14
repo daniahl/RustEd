@@ -785,3 +785,117 @@ fn test_accesskit_selection_resyncs_after_window_refocus() {
     assert_ne!(selections[4], selections[5], "regaining focus must change selection: {selections:?}");
     assert_eq!(selections[4], selections[6], "selection must settle back on the caret: {selections:?}");
 }
+
+#[test]
+fn test_enter_auto_indent_shift_tab_and_ctrl_shift_z_redo() {
+    use rusted::PieceTable;
+    let ctx = egui::Context::default();
+    let editor_id = egui::Id::unique("test_edit_ergonomics");
+    let mut text = PieceTable::from_str("    hello");
+    let mut rev = 1u64;
+
+    let run_frame = |text: &mut PieceTable, rev: &mut u64, events: Vec<Event>| {
+        let mut raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                Vec2::new(600.0, 400.0),
+            )),
+            events,
+            ..Default::default()
+        };
+        raw.time = Some(ctx.input(|i| i.time) + 2.0);
+        let mut out = ctx.run_ui(raw, |ui| {
+            let mut layouter = |ui: &egui::Ui, buf: &PieceTable, wrap: f32| {
+                let font = egui::TextStyle::Monospace.resolve(ui.style());
+                let color = ui.visuals().widgets.inactive.text_color();
+                let job = egui::text::LayoutJob::simple(buf.build_string(), font, color, wrap);
+                ui.fonts_mut(|f| f.layout_job(job))
+            };
+            let output = FastEditor::new_with_buffer(
+                editor_id,
+                text,
+                Vec2::new(500.0, 300.0),
+                &mut layouter,
+            )
+            .text_revision(*rev)
+            .show(ui);
+            output.response.request_focus();
+            if output.text_changed {
+                *rev = rev.wrapping_add(1);
+            }
+        });
+        out.textures_delta.clear();
+    };
+
+    // Frame 0: acquire focus
+    run_frame(&mut text, &mut rev, vec![]);
+
+    // Frame 1: move caret to end
+    run_frame(
+        &mut text,
+        &mut rev,
+        vec![Event::Key {
+            key: Key::End,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::NONE,
+        }],
+    );
+
+    // Frame 2: Enter should auto-indent with 4 spaces
+    run_frame(
+        &mut text,
+        &mut rev,
+        vec![Event::Key {
+            key: Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::NONE,
+        }],
+    );
+    assert_eq!(text.build_string(), "    hello\n    ");
+
+    // Frame 3: Shift+Tab should unindent the current line
+    run_frame(
+        &mut text,
+        &mut rev,
+        vec![Event::Key {
+            key: Key::Tab,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::SHIFT,
+        }],
+    );
+    assert_eq!(text.build_string(), "    hello\n");
+
+    // Frame 4: Ctrl+Z undoes Shift+Tab
+    run_frame(
+        &mut text,
+        &mut rev,
+        vec![Event::Key {
+            key: Key::Z,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::COMMAND,
+        }],
+    );
+    assert_eq!(text.build_string(), "    hello\n    ");
+
+    // Frame 5: Ctrl+Shift+Z redoes Shift+Tab
+    run_frame(
+        &mut text,
+        &mut rev,
+        vec![Event::Key {
+            key: Key::Z,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::COMMAND | Modifiers::SHIFT,
+        }],
+    );
+    assert_eq!(text.build_string(), "    hello\n");
+}

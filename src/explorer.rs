@@ -45,31 +45,11 @@ pub enum TreeAction {
 #[cfg(target_os = "windows")]
 pub fn move_to_trash(path: &Path) -> bool {
     use std::os::windows::ffi::OsStrExt;
-
-    #[allow(clippy::upper_case_acronyms)]
-    #[cfg_attr(target_arch = "x86", repr(C, packed))]
-    #[cfg_attr(not(target_arch = "x86"), repr(C))]
-    struct SHFILEOPSTRUCTW {
-        hwnd: *mut std::ffi::c_void,
-        w_func: u32,
-        p_from: *const u16,
-        p_to: *const u16,
-        f_flags: u16,
-        f_any_operations_aborted: i32,
-        h_name_mappings: *mut std::ffi::c_void,
-        lpsz_progress_title: *const u16,
-    }
-
-    #[link(name = "shell32")]
-    extern "system" {
-        fn SHFileOperationW(lp_file_op: *mut SHFILEOPSTRUCTW) -> i32;
-    }
-
-    const FO_DELETE: u32 = 0x0003;
-    const FOF_SILENT: u16 = 0x0004;
-    const FOF_NOCONFIRMATION: u16 = 0x0010;
-    const FOF_ALLOWUNDO: u16 = 0x0040;
-    const FOF_NOERRORUI: u16 = 0x0400;
+    use windows::core::PCWSTR;
+    use windows::Win32::UI::Shell::{
+        SHFileOperationW, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_SILENT, FO_DELETE,
+        SHFILEOPSTRUCTW,
+    };
 
     let abs_path = if path.is_absolute() {
         path.to_path_buf()
@@ -87,24 +67,24 @@ pub fn move_to_trash(path: &Path) -> bool {
         path_str.pop();
     }
 
-    let mut wide: Vec<u16> = std::ffi::OsStr::new(&path_str)
+    let wide: Vec<u16> = std::ffi::OsStr::new(&path_str)
         .encode_wide()
         .chain([0, 0])
         .collect();
 
     let mut file_op = SHFILEOPSTRUCTW {
-        hwnd: std::ptr::null_mut(),
-        w_func: FO_DELETE,
-        p_from: wide.as_mut_ptr(),
-        p_to: std::ptr::null(),
-        f_flags: FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_SILENT,
-        f_any_operations_aborted: 0,
-        h_name_mappings: std::ptr::null_mut(),
-        lpsz_progress_title: std::ptr::null(),
+        hwnd: Default::default(),
+        wFunc: FO_DELETE,
+        pFrom: PCWSTR(wide.as_ptr()),
+        pTo: PCWSTR::null(),
+        fFlags: (FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_SILENT).0 as u16,
+        fAnyOperationsAborted: false.into(),
+        hNameMappings: std::ptr::null_mut(),
+        lpszProgressTitle: PCWSTR::null(),
     };
 
     let ret = unsafe { SHFileOperationW(&mut file_op) };
-    ret == 0 && file_op.f_any_operations_aborted == 0
+    ret == 0 && !file_op.fAnyOperationsAborted.as_bool()
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -577,6 +557,7 @@ pub struct FileExplorer {
     pub tree_root: Option<FileNode>,
     pub selected_node: Option<(PathBuf, bool)>,
     pub pending_tree_edit: Option<PendingTreeEdit>,
+    pub last_fs_error: Option<String>,
     label_buf: String,
 }
 
@@ -589,6 +570,7 @@ impl FileExplorer {
             tree_root,
             selected_node: None,
             pending_tree_edit: None,
+            last_fs_error: None,
             label_buf: String::with_capacity(64),
         }
     }
@@ -596,6 +578,7 @@ impl FileExplorer {
     pub fn open_folder(&mut self, path: PathBuf) {
         self.pending_tree_edit = None;
         self.selected_node = None;
+        self.last_fs_error = None;
         self.folder_path = path.to_string_lossy().into_owned();
         self.tree_root = Some(FileNode::new_root(path));
     }
@@ -724,8 +707,10 @@ impl FileExplorer {
         is_dir: bool,
     ) -> bool {
         if !move_to_trash(path) {
+            self.last_fs_error = Some(format!("Failed to delete {}", path.display()));
             return false;
         }
+        self.last_fs_error = None;
 
         if let Some((ref sel_path, _)) = self.selected_node {
             if paths_equal(sel_path, path) || (is_dir && path_starts_with(sel_path, path)) {
@@ -770,9 +755,14 @@ impl FileExplorer {
         }
         let new_path = parent_path.join(name);
         if new_path.exists() {
+            self.last_fs_error = Some(format!("Folder already exists: {name}"));
             return None;
         }
-        fs::create_dir(&new_path).ok()?;
+        if let Err(err) = fs::create_dir(&new_path) {
+            self.last_fs_error = Some(format!("Failed to create folder {name}: {err}"));
+            return None;
+        }
+        self.last_fs_error = None;
         if let Some(root) = &mut self.tree_root {
             if let Some(parent_node) = root.find_mut(parent_path) {
                 parent_node.expanded = true;
@@ -796,9 +786,14 @@ impl FileExplorer {
         }
         let new_path = parent_path.join(name);
         if new_path.exists() {
+            self.last_fs_error = Some(format!("File already exists: {name}"));
             return None;
         }
-        fs::write(&new_path, "").ok()?;
+        if let Err(err) = fs::write(&new_path, "") {
+            self.last_fs_error = Some(format!("Failed to create file {name}: {err}"));
+            return None;
+        }
+        self.last_fs_error = None;
         if let Some(root) = &mut self.tree_root {
             if let Some(parent_node) = root.find_mut(parent_path) {
                 parent_node.expanded = true;
@@ -824,9 +819,16 @@ impl FileExplorer {
         let parent = old_path.parent()?;
         let new_path = parent.join(new_name);
         if new_path == old_path || new_path.exists() {
+            if new_path != old_path {
+                self.last_fs_error = Some(format!("Target already exists: {new_name}"));
+            }
             return None;
         }
-        fs::rename(old_path, &new_path).ok()?;
+        if let Err(err) = fs::rename(old_path, &new_path) {
+            self.last_fs_error = Some(format!("Failed to rename to {new_name}: {err}"));
+            return None;
+        }
+        self.last_fs_error = None;
 
         if let Some((ref mut sel_path, _)) = self.selected_node {
             if paths_equal(sel_path, old_path) {
@@ -890,7 +892,24 @@ impl FileExplorer {
             .default_size(220.0)
             .min_size(140.0)
             .show(ui, |ui| {
-                if self.pending_tree_edit.is_none() && ui.input(|i| i.key_pressed(egui::Key::F2)) {
+                if let Some(err_msg) = self.last_fs_error.as_deref() {
+                    let mut clear_err = false;
+                    ui.horizontal_wrapped(|ui| {
+                        ui.colored_label(ui.visuals().error_fg_color, err_msg);
+                        if ui.small_button("Dismiss").clicked() {
+                            clear_err = true;
+                        }
+                    });
+                    ui.separator();
+                    if clear_err {
+                        self.last_fs_error = None;
+                    }
+                }
+
+                if !doc.find_open
+                    && self.pending_tree_edit.is_none()
+                    && ui.input(|i| i.key_pressed(egui::Key::F2))
+                {
                     self.start_rename_selected();
                 }
 

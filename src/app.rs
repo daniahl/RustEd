@@ -28,6 +28,9 @@ pub struct TextEditor {
     pub explorer: FileExplorer,
     pub terminal: TerminalPane,
     pub watcher: Option<FileWatcher>,
+    /// Draft text for the top-bar project folder input so uncommitted edits don't mutate `explorer.folder_path`.
+    folder_input: String,
+    last_synced_folder: String,
     /// When set, the next editor frame grabs keyboard focus so the caret is active at startup.
     pub focus_editor_pending: bool,
 }
@@ -67,6 +70,8 @@ impl TextEditor {
         let terminal = TerminalPane::new(ctx.clone(), Some(&initial_folder));
         let watcher = Some(FileWatcher::new(ctx, &initial_folder));
         let explorer = FileExplorer::new(initial_folder);
+        let folder_input = explorer.folder_path.clone();
+        let last_synced_folder = explorer.folder_path.clone();
         let doc = Document::new();
 
         Self {
@@ -75,6 +80,8 @@ impl TextEditor {
             explorer,
             terminal,
             watcher,
+            folder_input,
+            last_synced_folder,
             focus_editor_pending: true,
         }
     }
@@ -82,6 +89,8 @@ impl TextEditor {
     pub fn new_headless(folder: &Path) -> Self {
         let terminal = TerminalPane::new_headless();
         let explorer = FileExplorer::new(folder.to_path_buf());
+        let folder_input = explorer.folder_path.clone();
+        let last_synced_folder = explorer.folder_path.clone();
         let doc = Document::new();
 
         Self {
@@ -90,6 +99,8 @@ impl TextEditor {
             explorer,
             terminal,
             watcher: None,
+            folder_input,
+            last_synced_folder,
             focus_editor_pending: false,
         }
     }
@@ -238,14 +249,20 @@ impl TextEditor {
                 }
 
                 if self.tab == Tab::Editor {
+                    if self.last_synced_folder != self.explorer.folder_path {
+                        self.folder_input = self.explorer.folder_path.clone();
+                        self.last_synced_folder = self.explorer.folder_path.clone();
+                    }
                     ui.separator();
                     ui.label("Project folder:");
-                    let resp = ui.text_edit_singleline(&mut self.explorer.folder_path);
+                    let resp = ui.text_edit_singleline(&mut self.folder_input);
                     let enter_pressed =
                         resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
 
                     if enter_pressed {
-                        self.explorer.open_folder(PathBuf::from(&self.explorer.folder_path));
+                        self.explorer.open_folder(PathBuf::from(&self.folder_input));
+                        self.folder_input = self.explorer.folder_path.clone();
+                        self.last_synced_folder = self.explorer.folder_path.clone();
                     }
 
                     if ui
@@ -255,6 +272,8 @@ impl TextEditor {
                     {
                         if let Some(folder) = pick_folder(&self.explorer.folder_path) {
                             self.explorer.open_folder(folder);
+                            self.folder_input = self.explorer.folder_path.clone();
+                            self.last_synced_folder = self.explorer.folder_path.clone();
                         }
                     }
 

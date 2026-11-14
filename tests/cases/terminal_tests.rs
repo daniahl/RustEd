@@ -592,3 +592,24 @@ fn test_contains_dsr_request_across_chunks() {
     assert!(!contains_dsr_request(&mut tail, &mut tail_len, b"m"));
     assert!(!contains_dsr_request(&mut tail, &mut tail_len, b"n"));
 }
+
+#[test]
+fn test_terminal_resize_and_wide_char_cursor() {
+    let mut pane = TerminalPane::new_headless();
+    assert_eq!(pane.size_label(), "120x30");
+    pane.resize(40, 100);
+    assert_eq!(pane.size_label(), "100x40");
+    assert_eq!(pane.rows, 40);
+    assert_eq!(pane.cols, 100);
+
+    let mut parser = vt100::Parser::new(
+        std::num::NonZeroU16::new(4).unwrap(),
+        std::num::NonZeroU16::new(20).unwrap(),
+        0,
+    );
+    // Two wide chars ("你好") take 4 display columns, followed by "ab" -> cursor at cell col 6, char index 4.
+    parser.process("你好ab".as_bytes());
+    let (text, cursor_idx) = render_vt100_screen(parser.screen());
+    assert!(text.starts_with("你好ab"));
+    assert_eq!(cursor_idx, 4);
+}

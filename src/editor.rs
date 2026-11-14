@@ -369,7 +369,7 @@ fn feed_undoer_if_in_flux<T: EditorBuffer>(
     now: f64,
     cursor_range: CCursorRange,
 ) {
-    let mut undoer = state.undoer.lock().unwrap();
+    let mut undoer = state.undoer.lock().unwrap_or_else(|e| e.into_inner());
     if undoer.is_in_flux() {
         let snap = match &state.last_undo_snapshot {
             Some(s) => s.clone(),
@@ -623,7 +623,7 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
             state
                 .undoer
                 .lock()
-                .unwrap()
+                .unwrap_or_else(|e| e.into_inner())
                 .add_undo(&(cursor_range, snap.clone()));
             state.last_undo_snapshot = Some(snap);
         }
@@ -704,8 +704,20 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
                     self.seed_pre_edit_snapshot(state, cursor_range);
                 }
                 let mut ccursor = self.text.delete_selected(&cursor_range);
+                let (line_idx, col_idx) = self.text.char_to_line_col(ccursor.index.0);
+                let line_range = self.text.line_char_range(line_idx);
+                let prefix_end = (line_range.start + col_idx).min(line_range.end);
+                let line_prefix = self.text.slice_chars(line_range.start..prefix_end);
+                let indent: String = line_prefix
+                    .chars()
+                    .take_while(|c| *c == ' ' || *c == '\t')
+                    .collect();
                 self.text
                     .insert_text_at(&mut ccursor, self.newline, usize::MAX);
+                if !indent.is_empty() {
+                    self.text
+                        .insert_text_at(&mut ccursor, &indent, usize::MAX);
+                }
                 Some(CCursorRange::one(ccursor))
             }
             Event::Key {
@@ -714,12 +726,67 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
                 modifiers,
                 ..
             } if !modifiers.ctrl && !modifiers.command => {
-                if !text_changed {
-                    self.seed_pre_edit_snapshot(state, cursor_range);
+                if !modifiers.shift {
+                    if !text_changed {
+                        self.seed_pre_edit_snapshot(state, cursor_range);
+                    }
+                    let mut ccursor = self.text.delete_selected(&cursor_range);
+                    self.text.insert_text_at(&mut ccursor, "    ", usize::MAX);
+                    Some(CCursorRange::one(ccursor))
+                } else {
+                    let [min_c, max_c] = cursor_range.sorted_cursors();
+                    let total = self.text.char_count();
+                    let min_idx = min_c.index.0.min(total);
+                    let max_idx = max_c.index.0.min(total);
+                    let (start_line, _) = self.text.char_to_line_col(min_idx);
+                    let (mut end_line, end_col) = self.text.char_to_line_col(max_idx);
+                    if end_line > start_line && end_col == 0 {
+                        end_line -= 1;
+                    }
+
+                    let mut new_primary = cursor_range.primary.index.0.min(total);
+                    let mut new_secondary = cursor_range.secondary.index.0.min(total);
+                    let mut any_deleted = false;
+
+                    for line_idx in (start_line..=end_line).rev() {
+                        let line_range = self.text.line_char_range(line_idx);
+                        let check_end = (line_range.start + 4).min(line_range.end);
+                        let prefix = self.text.slice_chars(line_range.start..check_end);
+                        let remove_count = if prefix.starts_with('\t') {
+                            1
+                        } else {
+                            prefix.chars().take(4).take_while(|c| *c == ' ').count()
+                        };
+                        if remove_count > 0 {
+                            if !any_deleted && !text_changed {
+                                self.seed_pre_edit_snapshot(state, cursor_range);
+                            }
+                            any_deleted = true;
+                            self.text.delete_char_range(
+                                egui::text::CharIndex(line_range.start)
+                                    ..egui::text::CharIndex(line_range.start + remove_count),
+                            );
+                            let del_start = line_range.start;
+                            if new_primary > del_start {
+                                new_primary = new_primary
+                                    .saturating_sub(remove_count.min(new_primary - del_start));
+                            }
+                            if new_secondary > del_start {
+                                new_secondary = new_secondary
+                                    .saturating_sub(remove_count.min(new_secondary - del_start));
+                            }
+                        }
+                    }
+
+                    if any_deleted {
+                        Some(CCursorRange::two(
+                            CCursor::new(new_secondary),
+                            CCursor::new(new_primary),
+                        ))
+                    } else {
+                        None
+                    }
                 }
-                let mut ccursor = self.text.delete_selected(&cursor_range);
-                self.text.insert_text_at(&mut ccursor, "    ", usize::MAX);
-                Some(CCursorRange::one(ccursor))
             }
             Event::Key {
                 key: Key::Backspace,
@@ -781,7 +848,7 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
                 pressed: true,
                 modifiers,
                 ..
-            } if modifiers.command => {
+            } if modifiers.command && !modifiers.shift => {
                 let current_snap = match &state.last_undo_snapshot {
                     Some(s) if !text_changed => s.clone(),
                     _ => self.text.undo_snapshot(),
@@ -789,13 +856,37 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
                 let undo_target = state
                     .undoer
                     .lock()
-                    .unwrap()
+                    .unwrap_or_else(|e| e.into_inner())
                     .undo(&(cursor_range, current_snap))
                     .cloned();
                 if let Some((undo_range, undo_snap)) = undo_target {
                     self.text.restore_undo_snapshot(&undo_snap);
                     state.last_undo_snapshot = Some(undo_snap);
                     Some(undo_range)
+                } else {
+                    None
+                }
+            }
+            Event::Key {
+                key: Key::Z,
+                pressed: true,
+                modifiers,
+                ..
+            } if modifiers.command && modifiers.shift => {
+                let current_snap = match &state.last_undo_snapshot {
+                    Some(s) if !text_changed => s.clone(),
+                    _ => self.text.undo_snapshot(),
+                };
+                let redo_target = state
+                    .undoer
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .redo(&(cursor_range, current_snap))
+                    .cloned();
+                if let Some((redo_range, redo_snap)) = redo_target {
+                    self.text.restore_undo_snapshot(&redo_snap);
+                    state.last_undo_snapshot = Some(redo_snap);
+                    Some(redo_range)
                 } else {
                     None
                 }
@@ -813,7 +904,7 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
                 let redo_target = state
                     .undoer
                     .lock()
-                    .unwrap()
+                    .unwrap_or_else(|e| e.into_inner())
                     .redo(&(cursor_range, current_snap))
                     .cloned();
                 if let Some((redo_range, redo_snap)) = redo_target {
@@ -1055,7 +1146,11 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
 
         if text_changed {
             let snap = self.text.undo_snapshot();
-            state.undoer.lock().unwrap().feed_state(
+            state
+                .undoer
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .feed_state(
                 ui.input(|i| i.time),
                 &(cursor_range, snap.clone()),
             );
@@ -1484,7 +1579,11 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
 
         if text_changed {
             let snap = self.text.undo_snapshot();
-            state.undoer.lock().unwrap().feed_state(
+            state
+                .undoer
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .feed_state(
                 ui.input(|i| i.time),
                 &(ccursor_range, snap.clone()),
             );

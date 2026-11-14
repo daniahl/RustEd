@@ -18,7 +18,7 @@ use std::{
     time::SystemTime,
 };
 
-pub const MAX_HIGHLIGHT_BYTES: usize = 16_384;
+pub const MAX_HIGHLIGHT_BYTES: usize = 65_536;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DiskStamp {
@@ -261,10 +261,20 @@ impl Document {
 
         let incoming = if let Some(unsaved) = take_unsaved_entry(&mut self.unsaved_files, &chosen) {
             IncomingFile::Unsaved(Box::new(unsaved))
-        } else if let Ok(content) = fs::read_to_string(&chosen) {
-            IncomingFile::FromDisk(content, read_disk_stamp(&chosen))
         } else {
-            return;
+            match fs::read_to_string(&chosen) {
+                Ok(content) => IncomingFile::FromDisk(content, read_disk_stamp(&chosen)),
+                Err(err) => {
+                    self.last_save_error = Some(format!(
+                        "Failed to open {}: {err}",
+                        chosen
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("file")
+                    ));
+                    return;
+                }
+            }
         };
 
         let editor_id = editor::code_editor_id();
@@ -1008,7 +1018,8 @@ impl Document {
                                 if n == 0 || (n & WRAPPED_ROW_FLAG) != 0 {
                                     continue;
                                 }
-                                let color = if active_row == Some(row_idx) {
+                                let doc_row_idx = output.first_line + row_idx;
+                                let color = if active_row == Some(doc_row_idx) {
                                     ui.visuals().strong_text_color()
                                 } else {
                                     ui.visuals().weak_text_color()

@@ -70,6 +70,9 @@ pub struct TerminalPane {
     pub term_screen_text: String,
     pub term_revision: u64,
     pub term_cursor_idx: usize,
+    pub rows: u16,
+    pub cols: u16,
+    pub size_text: String,
     pub pty_writer: Option<mpsc::Sender<Vec<u8>>>,
     pub _pty_master: Option<Box<dyn portable_pty::MasterPty + Send>>,
     pub _pty_child: Option<Box<dyn portable_pty::Child + Send + Sync>>,
@@ -128,7 +131,7 @@ impl TerminalPane {
                     pty_child = Some(child);
                 }
                 Err(e) => {
-                    let mut lock = term.lock().unwrap();
+                    let mut lock = term.lock().unwrap_or_else(|e| e.into_inner());
                     lock.parser
                         .process(format!("Failed to spawn shell: {e}\r\n").as_bytes());
                 }
@@ -161,7 +164,7 @@ impl TerminalPane {
                         if n == 0 || shutdown_flag.load(Ordering::Relaxed) {
                             break;
                         }
-                        let mut lock = term_clone.lock().unwrap();
+                        let mut lock = term_clone.lock().unwrap_or_else(|e| e.into_inner());
                         lock.parser.process(&buf[..n]);
                         let cpr_reply =
                             contains_dsr_request(&mut dsr_tail, &mut dsr_tail_len, &buf[..n])
@@ -183,7 +186,7 @@ impl TerminalPane {
 
             pty_master = Some(pair.master);
         } else {
-            let mut lock = term.lock().unwrap();
+            let mut lock = term.lock().unwrap_or_else(|e| e.into_inner());
             lock.parser.process(b"Failed to open ConPTY.\r\n");
         }
 
@@ -192,6 +195,9 @@ impl TerminalPane {
             term_screen_text: String::new(),
             term_revision: 0,
             term_cursor_idx: 0,
+            rows: TERM_ROWS,
+            cols: TERM_COLS,
+            size_text: format!("{TERM_COLS}x{TERM_ROWS}"),
             pty_writer,
             _pty_master: pty_master,
             _pty_child: pty_child,
@@ -214,6 +220,9 @@ impl TerminalPane {
             term_screen_text: String::new(),
             term_revision: 0,
             term_cursor_idx: 0,
+            rows: TERM_ROWS,
+            cols: TERM_COLS,
+            size_text: format!("{TERM_COLS}x{TERM_ROWS}"),
             pty_writer: None,
             _pty_master: None,
             _pty_child: None,
@@ -223,8 +232,35 @@ impl TerminalPane {
         }
     }
 
-    pub const fn size_label(&self) -> &'static str {
-        "120x30"
+    pub fn size_label(&self) -> &str {
+        &self.size_text
+    }
+
+    /// Resizes the PTY and VT100 parser when the grid dimensions change.
+    pub fn resize(&mut self, rows: u16, cols: u16) {
+        let rows = rows.max(2);
+        let cols = cols.max(10);
+        if rows == self.rows && cols == self.cols {
+            return;
+        }
+        self.rows = rows;
+        self.cols = cols;
+        self.size_text = format!("{cols}x{rows}");
+        if let Some(master) = &self._pty_master {
+            let _ = master.resize(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            });
+        }
+        if let (Some(nz_rows), Some(nz_cols)) =
+            (std::num::NonZeroU16::new(rows), std::num::NonZeroU16::new(cols))
+        {
+            let mut lock = self.term.lock().unwrap_or_else(|e| e.into_inner());
+            lock.parser.screen_mut().set_size(nz_rows, nz_cols);
+            lock.pty_updated = true;
+        }
     }
 
     /// Terminates the current PTY session (if any) and spawns a fresh terminal in `working_dir`.
@@ -296,10 +332,18 @@ impl TerminalPane {
                             egui::Key::End => Some(b"\x1b[F"),
                             egui::Key::PageUp => Some(b"\x1b[5~"),
                             egui::Key::PageDown => Some(b"\x1b[6~"),
-                            egui::Key::C if modifiers.ctrl => Some(b"\x03"),
-                            egui::Key::D if modifiers.ctrl => Some(b"\x04"),
-                            egui::Key::Z if modifiers.ctrl => Some(b"\x1a"),
-                            egui::Key::L if modifiers.ctrl => Some(b"\x0c"),
+                            egui::Key::F1 => Some(b"\x1bOP"),
+                            egui::Key::F2 => Some(b"\x1bOQ"),
+                            egui::Key::F3 => Some(b"\x1bOR"),
+                            egui::Key::F4 => Some(b"\x1bOS"),
+                            egui::Key::F5 => Some(b"\x1b[15~"),
+                            egui::Key::F6 => Some(b"\x1b[17~"),
+                            egui::Key::F7 => Some(b"\x1b[18~"),
+                            egui::Key::F8 => Some(b"\x1b[19~"),
+                            egui::Key::F9 => Some(b"\x1b[20~"),
+                            egui::Key::F10 => Some(b"\x1b[21~"),
+                            egui::Key::F11 => Some(b"\x1b[23~"),
+                            egui::Key::F12 => Some(b"\x1b[24~"),
                             _ => None,
                         };
 
@@ -307,6 +351,14 @@ impl TerminalPane {
                             to_send.extend_from_slice(bytes);
                             clear_selection = true;
                             false
+                        } else if modifiers.ctrl && !modifiers.alt {
+                            if let Some(ctrl_byte) = ctrl_key_byte(*key) {
+                                to_send.push(ctrl_byte);
+                                clear_selection = true;
+                                false
+                            } else {
+                                true
+                            }
                         } else {
                             true
                         }
@@ -346,7 +398,7 @@ impl TerminalPane {
         self.handle_terminal_input(ctx, term_focused);
 
         let pty_updated = {
-            let mut lock = self.term.lock().unwrap();
+            let mut lock = self.term.lock().unwrap_or_else(|e| e.into_inner());
             let updated = lock.pty_updated || self.term_screen_text.is_empty();
             if updated {
                 lock.pty_updated = false;
@@ -377,6 +429,7 @@ impl TerminalPane {
         let screen_text = &mut self.term_screen_text;
         let term_revision = self.term_revision;
         let focus_terminal = &mut self.focus_terminal;
+        let mut target_grid: Option<(u16, u16)> = None;
 
         egui::CentralPanel::default().frame(panel_frame).show(ui, |ui| {
             let font_id = egui::TextStyle::Monospace.resolve(ui.style());
@@ -392,6 +445,14 @@ impl TerminalPane {
             };
 
             let available_size = ui.available_size();
+            let row_height = ui.fonts_mut(|f| f.row_height(&font_id)).max(1.0);
+            let char_width = ui.fonts_mut(|f| f.glyph_width(&font_id, ' ')).max(1.0);
+            let inner_w = (available_size.x - 16.0).max(char_width * 10.0);
+            let inner_h = (available_size.y - 8.0).max(row_height * 2.0);
+            let new_cols = (inner_w / char_width).floor().clamp(10.0, 500.0) as u16;
+            let new_rows = (inner_h / row_height).floor().clamp(2.0, 200.0) as u16;
+            target_grid = Some((new_rows, new_cols));
+
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .animated(false)
@@ -408,6 +469,10 @@ impl TerminalPane {
                     }
                 });
         });
+
+        if let Some((new_rows, new_cols)) = target_grid {
+            self.resize(new_rows, new_cols);
+        }
     }
 }
 
@@ -442,9 +507,28 @@ pub fn render_vt100_screen_into(screen: &vt100::Screen, full_text: &mut String) 
         total_chars += line_chars;
 
         if r_u16 == cur_row {
-            let target_col = cur_col as usize;
-            if target_col > line_chars {
-                let pad = target_col - line_chars;
+            let mut char_col = 0usize;
+            let mut display_col = 0u16;
+            for c in 0..cur_col.min(cols) {
+                if let Some(cell) = screen.cell(r_u16, c) {
+                    if !cell.is_wide_continuation() {
+                        let contents = cell.contents();
+                        char_col += if contents.is_empty() {
+                            1
+                        } else {
+                            contents.chars().count()
+                        };
+                    }
+                } else {
+                    char_col += 1;
+                }
+                display_col += 1;
+            }
+            if cur_col > display_col {
+                char_col += (cur_col - display_col) as usize;
+            }
+            if char_col > line_chars {
+                let pad = char_col - line_chars;
                 const SPACES: &str = "                                                                ";
                 let mut rem = pad;
                 while rem > 0 {
@@ -454,7 +538,7 @@ pub fn render_vt100_screen_into(screen: &vt100::Screen, full_text: &mut String) 
                 }
                 total_chars += pad;
             }
-            cursor_char_idx = (total_chars - line_chars.max(target_col)) + target_col;
+            cursor_char_idx = (total_chars - line_chars.max(char_col)) + char_col;
         }
 
         if r_u16 + 1 < rows {
@@ -464,4 +548,37 @@ pub fn render_vt100_screen_into(screen: &vt100::Screen, full_text: &mut String) 
     }
 
     cursor_char_idx
+}
+
+fn ctrl_key_byte(key: egui::Key) -> Option<u8> {
+    let idx = match key {
+        egui::Key::A => 1,
+        egui::Key::B => 2,
+        egui::Key::C => 3,
+        egui::Key::D => 4,
+        egui::Key::E => 5,
+        egui::Key::F => 6,
+        egui::Key::G => 7,
+        egui::Key::H => 8,
+        egui::Key::I => 9,
+        egui::Key::J => 10,
+        egui::Key::K => 11,
+        egui::Key::L => 12,
+        egui::Key::M => 13,
+        egui::Key::N => 14,
+        egui::Key::O => 15,
+        egui::Key::P => 16,
+        egui::Key::Q => 17,
+        egui::Key::R => 18,
+        egui::Key::S => 19,
+        egui::Key::T => 20,
+        egui::Key::U => 21,
+        egui::Key::V => 22,
+        egui::Key::W => 23,
+        egui::Key::X => 24,
+        egui::Key::Y => 25,
+        egui::Key::Z => 26,
+        _ => return None,
+    };
+    Some(idx)
 }
