@@ -35,9 +35,16 @@ RustEd is built from the ground up with assistive technologies—especially **Wi
 
 ## Project Structure
 
-- `src/main.rs` — Application state (`TextEditor`), top bar, status bar, file explorer (`FileNode`), ConPTY terminal management, and terminal AccessKit caret synchronization.
-- `src/editor.rs` — Custom `FastEditor` widget implementing revision-cached layout, coalesced event handling, viewport-culled selection painting, undo/redo management, and AccessKit `TextRun` generation.
-- `tests/editor_integration.rs` — Headless integration tests covering the editor lifecycle, undo/redo, arrow-key navigation, scroll-to-caret on large pastes, coalesced relayouts, and AccessKit node invariants.
+- `src/main.rs` — Native window entry point (`eframe::run_native`) and command-line folder startup.
+- `src/lib.rs` — Library root exporting editor modules (`TextEditor`, `PieceTable`, etc.) for integration tests.
+- `src/app.rs` — Top-level application state (`TextEditor`), top bar, tab switching (`Editor` / `Terminal`), status bar, folder picker, and watcher synchronization.
+- `src/document.rs` — Document management (`Document`), atomic file saves, disk conflict detection/reload, syntax-highlighted/virtualized `FastEditor` integration, line-number gutter, and Find dialog.
+- `src/editor.rs` — Custom `FastEditor` widget with layout caching, windowed virtualization, CRLF-aware navigation/editing, coalesced event handling, undo/redo history, and AccessKit `TextRun` generation.
+- `src/piece_table.rs` — Rope/chunk-cached `PieceTable` buffer with line-feed checkpoints, CRLF-aware line indexing, zero-flatten incremental search (`find_from_byte`), and structural snapshots.
+- `src/explorer.rs` — Lazy-loading `FileExplorer` tree with case-insensitive sorting, inline create/rename, and Windows Recycle Bin deletion.
+- `src/terminal.rs` — Windows ConPTY `TerminalPane` with background I/O threads, `vt100` screen parsing, DSR cursor query replies (`contains_dsr_request`), and clean PTY shutdown on drop/restart.
+- `src/watcher.rs` — Windows `ReadDirectoryChangesW` filesystem watcher and Windows-aware path comparison helpers (`paths_equal`, `path_starts_with`, `path_strip_prefix`).
+- `tests/cases/` — Unit and headless GUI integration tests (`app_integration.rs`, `document_tests.rs`, `editor_buffer_tests.rs`, `editor_integration.rs`, `explorer_tests.rs`, `piece_table_tests.rs`, `terminal_tests.rs`, `watcher_tests.rs`).
 
 ---
 

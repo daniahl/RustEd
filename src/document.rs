@@ -5,8 +5,8 @@
 
 use crate::{
     editor::{self, EditorBuffer, FastEditor},
-    piece_table::PieceTable,
-    watcher::{path_starts_with, paths_equal},
+    piece_table::{PieceTable, PieceTableSnapshot},
+    watcher::{path_starts_with, path_strip_prefix, paths_equal},
 };
 use eframe::egui;
 use egui_extras::syntax_highlighting::{self, CodeTheme};
@@ -77,9 +77,63 @@ fn has_unsaved_entry(map: &HashMap<PathBuf, UnsavedFileState>, target: &Path) ->
     map.contains_key(target) || map.keys().any(|k| paths_equal(k, target))
 }
 
+fn write_piece_table_atomic(path: &Path, text: &PieceTable) -> std::io::Result<()> {
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let stem = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("file");
+    let pid = std::process::id();
+
+    let mut temp_file = None;
+    let mut temp_path = PathBuf::new();
+    for attempt in 0u32..32 {
+        let candidate = parent.join(format!(".{stem}.{pid}.{attempt}.tmp"));
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(f) => {
+                temp_path = candidate;
+                temp_file = Some(f);
+                break;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(_) => break,
+        }
+    }
+
+    if let Some(file) = temp_file {
+        let write_res = (|| -> std::io::Result<()> {
+            let mut writer = std::io::BufWriter::new(file);
+            text.write_to(&mut writer)?;
+            let file = writer.into_inner().map_err(|e| e.into_error())?;
+            file.sync_all()?;
+            Ok(())
+        })();
+
+        if write_res.is_ok() && fs::rename(&temp_path, path).is_ok() {
+            return Ok(());
+        }
+        let _ = fs::remove_file(&temp_path);
+    }
+
+    // Fallback to direct write when atomic temp + rename isn't possible (e.g. symlink target or ACLs).
+    let file = fs::File::create(path)?;
+    let mut writer = std::io::BufWriter::new(file);
+    text.write_to(&mut writer)?;
+    let file = writer.into_inner().map_err(|e| e.into_error())?;
+    file.sync_all()?;
+    Ok(())
+}
+
 pub struct UnsavedFileState {
     pub text: PieceTable,
-    pub saved_text: String,
+    pub saved_snapshot: Option<PieceTableSnapshot>,
     pub saved_revision: u64,
     pub editor_state: Option<editor::FastEditorState>,
     pub line_count: usize,
@@ -91,7 +145,7 @@ pub struct UnsavedFileState {
 pub struct Document {
     pub path: String,
     pub text: PieceTable,
-    pub saved_text: String,
+    pub saved_snapshot: Option<PieceTableSnapshot>,
     pub saved_revision: u64,
     pub is_current_dirty: bool,
     pub unsaved_files: HashMap<PathBuf, UnsavedFileState>,
@@ -117,6 +171,7 @@ pub struct Document {
     pub focus_editor: bool,
     pub disk_stamp: Option<DiskStamp>,
     pub external_conflict: Option<ExternalConflict>,
+    pub last_save_error: Option<String>,
 }
 
 impl Default for Document {
@@ -130,7 +185,7 @@ impl Document {
         Self {
             path: String::new(),
             text: PieceTable::new(),
-            saved_text: String::new(),
+            saved_snapshot: None,
             saved_revision: 0,
             is_current_dirty: false,
             unsaved_files: HashMap::new(),
@@ -153,6 +208,7 @@ impl Document {
             focus_editor: false,
             disk_stamp: None,
             external_conflict: None,
+            last_save_error: None,
         }
     }
 
@@ -175,17 +231,20 @@ impl Document {
 
     pub fn save_current_file(&mut self) {
         if !self.path.is_empty() && self.is_current_dirty {
-            let write_ok = fs::File::create(&self.path)
-                .and_then(|file| self.text.write_to(std::io::BufWriter::new(file)))
-                .is_ok();
-            if write_ok {
-                let path = Path::new(&self.path).to_path_buf();
-                self.saved_text.clear();
-                self.saved_revision = self.text_revision;
-                self.is_current_dirty = false;
-                self.disk_stamp = read_disk_stamp(&path);
-                self.external_conflict = None;
-                take_unsaved_entry(&mut self.unsaved_files, &path);
+            let path = Path::new(&self.path).to_path_buf();
+            match write_piece_table_atomic(&path, &self.text) {
+                Ok(()) => {
+                    self.saved_snapshot = Some(self.text.snapshot());
+                    self.saved_revision = self.text_revision;
+                    self.is_current_dirty = false;
+                    self.last_save_error = None;
+                    self.disk_stamp = read_disk_stamp(&path);
+                    self.external_conflict = None;
+                    take_unsaved_entry(&mut self.unsaved_files, &path);
+                }
+                Err(err) => {
+                    self.last_save_error = Some(format!("Failed to save {}: {err}", self.file_name));
+                }
             }
         }
     }
@@ -196,30 +255,33 @@ impl Document {
         }
 
         enum IncomingFile {
-            Unsaved(UnsavedFileState),
+            Unsaved(Box<UnsavedFileState>),
             FromDisk(String, Option<DiskStamp>),
         }
 
         let incoming = if let Some(unsaved) = take_unsaved_entry(&mut self.unsaved_files, &chosen) {
-            IncomingFile::Unsaved(unsaved)
+            IncomingFile::Unsaved(Box::new(unsaved))
         } else if let Ok(content) = fs::read_to_string(&chosen) {
             IncomingFile::FromDisk(content, read_disk_stamp(&chosen))
         } else {
             return;
         };
 
-        let editor_id = egui::Id::unique("code_editor");
+        let editor_id = editor::code_editor_id();
         if !self.path.is_empty() && self.is_current_dirty {
             let mut prev_state = ctx.data_mut(|d| d.get_temp::<editor::FastEditorState>(editor_id));
             if let Some(ref mut st) = prev_state {
                 st.layout_cache = None;
+                st.virtual_layout_cache = None;
                 st.accesskit_row_cache = None;
+                st.last_undo_snapshot = None;
             }
+            self.text.drop_cached_text();
             self.unsaved_files.insert(
                 PathBuf::from(&self.path),
                 UnsavedFileState {
                     text: std::mem::take(&mut self.text),
-                    saved_text: std::mem::take(&mut self.saved_text),
+                    saved_snapshot: self.saved_snapshot.take(),
                     saved_revision: self.saved_revision,
                     editor_state: prev_state,
                     line_count: self.line_count,
@@ -234,11 +296,12 @@ impl Document {
         self.text_revision = self.text_revision.wrapping_add(1);
         self.gutter_cache = None;
         self.external_conflict = None;
+        self.last_save_error = None;
 
         match incoming {
             IncomingFile::Unsaved(unsaved) => {
                 self.text = unsaved.text;
-                self.saved_text = unsaved.saved_text;
+                self.saved_snapshot = unsaved.saved_snapshot;
                 self.saved_revision = unsaved.saved_revision;
                 self.is_current_dirty = self.text_revision != self.saved_revision;
                 self.line_count = unsaved.line_count;
@@ -248,15 +311,16 @@ impl Document {
                 self.disk_stamp = read_disk_stamp(&chosen);
                 self.refresh_file_metadata();
 
+                let editor_state = unsaved.editor_state;
                 ctx.data_mut(|d| {
-                    let mut st = unsaved.editor_state.unwrap_or_default();
+                    let mut st = editor_state.unwrap_or_default();
                     st.scroll_to_cursor = true;
                     d.insert_temp(editor_id, st);
                 });
             }
             IncomingFile::FromDisk(content, stamp) => {
-                self.saved_text.clear();
                 self.text = PieceTable::from_string(content);
+                self.saved_snapshot = Some(self.text.snapshot());
                 self.line_count = self.text.line_count();
                 self.saved_revision = self.text_revision;
                 self.is_current_dirty = false;
@@ -353,8 +417,8 @@ impl Document {
         content: String,
         stamp: Option<DiskStamp>,
     ) {
-        self.saved_text.clear();
         self.text = PieceTable::from_string(content);
+        self.saved_snapshot = Some(self.text.snapshot());
         self.text_revision = self.text_revision.wrapping_add(1);
         self.saved_revision = self.text_revision;
         self.is_current_dirty = false;
@@ -362,9 +426,10 @@ impl Document {
         self.line_count = self.text.line_count();
         self.disk_stamp = stamp;
         self.external_conflict = None;
+        self.last_save_error = None;
         self.refresh_file_metadata();
 
-        let editor_id = egui::Id::unique("code_editor");
+        let editor_id = editor::code_editor_id();
         let total_chars = self.text.char_count();
         let mut st = ctx
             .data_mut(|d| d.get_temp::<editor::FastEditorState>(editor_id))
@@ -404,7 +469,7 @@ impl Document {
             if paths_equal(cur, path) || (is_dir && path_starts_with(cur, path)) {
                 self.path.clear();
                 self.text.clear();
-                self.saved_text.clear();
+                self.saved_snapshot = None;
                 self.is_current_dirty = false;
                 self.text_revision = self.text_revision.wrapping_add(1);
                 self.saved_revision = self.text_revision;
@@ -415,9 +480,10 @@ impl Document {
                 self.selected_chars = 0;
                 self.disk_stamp = None;
                 self.external_conflict = None;
+                self.last_save_error = None;
                 self.refresh_file_metadata();
 
-                let editor_id = egui::Id::unique("code_editor");
+                let editor_id = editor::code_editor_id();
                 ctx.data_mut(|d| {
                     d.insert_temp(editor_id, editor::FastEditorState::default());
                 });
@@ -428,11 +494,11 @@ impl Document {
     pub fn update_path_if_renamed(&mut self, old_path: &Path, new_path: &Path, is_dir: bool) {
         if !self.path.is_empty() {
             let cur = Path::new(&self.path);
-            if cur == old_path {
+            if paths_equal(cur, old_path) {
                 self.path = new_path.to_string_lossy().into_owned();
                 self.refresh_file_metadata();
             } else if is_dir {
-                if let Ok(rel) = cur.strip_prefix(old_path) {
+                if let Some(rel) = path_strip_prefix(cur, old_path) {
                     self.path = new_path.join(rel).to_string_lossy().into_owned();
                     self.refresh_file_metadata();
                 }
@@ -444,17 +510,17 @@ impl Document {
                 let affected: Vec<PathBuf> = self
                     .unsaved_files
                     .keys()
-                    .filter(|k| k.starts_with(old_path))
+                    .filter(|k| path_starts_with(k, old_path))
                     .cloned()
                     .collect();
                 for k in affected {
-                    if let (Ok(rel), Some(state)) =
-                        (k.strip_prefix(old_path), self.unsaved_files.remove(&k))
+                    if let (Some(rel), Some(state)) =
+                        (path_strip_prefix(&k, old_path), self.unsaved_files.remove(&k))
                     {
                         self.unsaved_files.insert(new_path.join(rel), state);
                     }
                 }
-            } else if let Some(state) = self.unsaved_files.remove(old_path) {
+            } else if let Some(state) = take_unsaved_entry(&mut self.unsaved_files, old_path) {
                 self.unsaved_files.insert(new_path.to_path_buf(), state);
             }
         }
@@ -557,7 +623,7 @@ impl Document {
     }
 
     pub fn open_find_dialog(&mut self, ctx: &egui::Context) {
-        let editor_id = egui::Id::unique("code_editor");
+        let editor_id = editor::code_editor_id();
         if let Some(state) = ctx.data_mut(|d| d.get_temp::<editor::FastEditorState>(editor_id)) {
             if let Some(range) = state.cursor.char_range() {
                 if range.primary != range.secondary {
@@ -583,7 +649,7 @@ impl Document {
         if self.find_query.is_empty() || self.text.is_empty() {
             return false;
         }
-        let editor_id = egui::Id::unique("code_editor");
+        let editor_id = editor::code_editor_id();
         let mut state = ctx
             .data_mut(|d| d.get_temp::<editor::FastEditorState>(editor_id))
             .unwrap_or_default();
@@ -595,12 +661,13 @@ impl Document {
             .unwrap_or(0);
 
         let start_byte = self.text.char_to_byte(start_char_idx);
-        let text_str = self.text.as_str();
-
-        let match_byte = if let Some(rel) = text_str[start_byte..].find(&self.find_query) {
-            start_byte + rel
-        } else if let Some(mb) = text_str.find(&self.find_query) {
+        let match_byte = if let Some(mb) = self.text.find_from_byte(&self.find_query, start_byte) {
             mb
+        } else if start_byte > 0 {
+            match self.text.find_from_byte(&self.find_query, 0) {
+                Some(mb) => mb,
+                None => return false,
+            }
         } else {
             return false;
         };
@@ -614,18 +681,7 @@ impl Document {
         )));
         state.scroll_to_cursor = true;
         ctx.data_mut(|d| d.insert_temp(editor_id, state));
-        ctx.memory_mut(|m| {
-            m.request_focus(editor_id);
-            m.set_focus_lock_filter(
-                editor_id,
-                egui::EventFilter {
-                    horizontal_arrows: true,
-                    vertical_arrows: true,
-                    tab: true,
-                    escape: true,
-                },
-            );
-        });
+        editor::request_editor_focus(ctx, editor_id);
         ctx.request_repaint();
         true
     }
@@ -710,19 +766,7 @@ impl Document {
 
         if close_dialog {
             open = false;
-            let editor_id = egui::Id::unique("code_editor");
-            ctx.memory_mut(|m| {
-                m.request_focus(editor_id);
-                m.set_focus_lock_filter(
-                    editor_id,
-                    egui::EventFilter {
-                        horizontal_arrows: true,
-                        vertical_arrows: true,
-                        tab: true,
-                        escape: true,
-                    },
-                );
-            });
+            editor::request_editor_focus(ctx, editor::code_editor_id());
             ctx.input_mut(|i| {
                 i.events.retain(|e| {
                     !matches!(
@@ -747,6 +791,19 @@ impl Document {
         let ctx = &ctx;
         let mut editor_text_changed = false;
         egui::CentralPanel::default().frame(panel_frame).show(ui, |ui| {
+            if let Some(err_msg) = self.last_save_error.as_deref() {
+                let mut clear_err = false;
+                ui.horizontal(|ui| {
+                    ui.colored_label(ui.visuals().error_fg_color, err_msg);
+                    if ui.button("Dismiss").clicked() {
+                        clear_err = true;
+                    }
+                });
+                ui.separator();
+                if clear_err {
+                    self.last_save_error = None;
+                }
+            }
             if let Some(conflict) = self.external_conflict {
                 let mut do_reload = false;
                 let mut do_close = false;
@@ -846,14 +903,16 @@ impl Document {
                         );
 
                         let is_large = self.text.len() > MAX_HIGHLIGHT_BYTES;
+                        let newline = if self.line_ending == "CRLF" { "\r\n" } else { "\n" };
                         let editor = FastEditor::new_with_buffer(
-                            egui::Id::unique("code_editor"),
+                            editor::code_editor_id(),
                             &mut self.text,
                             editor_min_size,
                             &mut layouter,
                         )
                         .cache_salt(language_salt)
                         .text_revision(text_revision)
+                        .newline(newline)
                         .virtualized(is_large);
                         let output = editor.show(ui);
                         if self.focus_editor {
@@ -940,8 +999,7 @@ impl Document {
                             let top = clip_rect.min.y - output.galley_pos.y;
                             let first = rows.partition_point(|r| r.rect().max.y < top);
                             let mut num_buf = [0u8; 16];
-                            for row_idx in first..rows.len() {
-                                let row = &rows[row_idx];
+                            for (row_idx, row) in rows.iter().enumerate().skip(first) {
                                 let y = output.galley_pos.y + row.rect().min.y;
                                 if y > clip_rect.max.y {
                                     break;
@@ -980,6 +1038,13 @@ impl Document {
 
         if editor_text_changed {
             self.text_revision = self.text_revision.wrapping_add(1);
+            if self
+                .saved_snapshot
+                .as_ref()
+                .is_some_and(|snap| self.text.matches_snapshot(snap))
+            {
+                self.saved_revision = self.text_revision;
+            }
             let was_dirty = self.is_current_dirty;
             self.is_current_dirty =
                 !self.path.is_empty() && self.text_revision != self.saved_revision;

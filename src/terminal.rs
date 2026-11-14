@@ -3,18 +3,62 @@
 //! Manages pseudo-terminal (PTY) child process execution, streaming I/O, VT100 escape sequence parsing,
 //! screen buffer rendering, and terminal keyboard input forwarding.
 
-use crate::editor::{FastEditor, FastEditorState};
+use crate::editor::{terminal_id, FastEditor, FastEditorState};
 use eframe::egui;
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use std::{
     io::{Read, Write},
     path::Path,
-    sync::{mpsc, Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc, Arc, Mutex,
+    },
     thread,
 };
 
 pub const TERM_ROWS: u16 = 30;
 pub const TERM_COLS: u16 = 120;
+
+/// Detects `\x1b[6n` (DSR cursor position request) within `chunk` or split across the
+/// previous chunk's trailing bytes (`tail[..*tail_len]`), updating the trailing buffer.
+pub fn contains_dsr_request(tail: &mut [u8; 3], tail_len: &mut usize, chunk: &[u8]) -> bool {
+    const DSR: &[u8; 4] = b"\x1b[6n";
+    if chunk.is_empty() {
+        return false;
+    }
+
+    let mut found = false;
+    if *tail_len > 0 {
+        let mut boundary = [0u8; 6];
+        boundary[..*tail_len].copy_from_slice(&tail[..*tail_len]);
+        let prefix_len = chunk.len().min(3);
+        boundary[*tail_len..*tail_len + prefix_len].copy_from_slice(&chunk[..prefix_len]);
+        if boundary[..*tail_len + prefix_len]
+            .windows(DSR.len())
+            .any(|w| w == DSR)
+        {
+            found = true;
+        }
+    }
+    if !found && chunk.windows(DSR.len()).any(|w| w == DSR) {
+        found = true;
+    }
+
+    if chunk.len() >= 3 {
+        tail.copy_from_slice(&chunk[chunk.len() - 3..]);
+        *tail_len = 3;
+    } else {
+        let mut combined = [0u8; 5];
+        combined[..*tail_len].copy_from_slice(&tail[..*tail_len]);
+        combined[*tail_len..*tail_len + chunk.len()].copy_from_slice(chunk);
+        let total = *tail_len + chunk.len();
+        let keep = total.min(3);
+        tail[..keep].copy_from_slice(&combined[total - keep..total]);
+        *tail_len = keep;
+    }
+
+    found
+}
 
 pub struct TerminalState {
     pub parser: vt100::Parser,
@@ -29,11 +73,28 @@ pub struct TerminalPane {
     pub pty_writer: Option<mpsc::Sender<Vec<u8>>>,
     pub _pty_master: Option<Box<dyn portable_pty::MasterPty + Send>>,
     pub _pty_child: Option<Box<dyn portable_pty::Child + Send + Sync>>,
+    pub shutdown: Arc<AtomicBool>,
     pub focus_terminal: bool,
     pub selecting_in_terminal: bool,
 }
 
+impl Drop for TerminalPane {
+    fn drop(&mut self) {
+        self.shutdown_session();
+    }
+}
+
 impl TerminalPane {
+    fn shutdown_session(&mut self) {
+        self.shutdown.store(true, Ordering::Relaxed);
+        self.pty_writer = None;
+        if let Some(mut child) = self._pty_child.take() {
+            let _ = child.kill();
+            let _ = child.try_wait();
+        }
+        self._pty_master = None;
+    }
+
     pub fn new(ctx: egui::Context, working_dir: Option<&Path>) -> Self {
         let term = Arc::new(Mutex::new(TerminalState {
             parser: vt100::Parser::new(
@@ -43,6 +104,7 @@ impl TerminalPane {
             ),
             pty_updated: true,
         }));
+        let shutdown = Arc::new(AtomicBool::new(false));
         let mut pty_writer = None;
         let mut pty_master = None;
         let mut pty_child = None;
@@ -86,19 +148,27 @@ impl TerminalPane {
 
             if let Ok(mut reader) = pair.master.try_clone_reader() {
                 let term_clone = Arc::clone(&term);
+                let shutdown_flag = Arc::clone(&shutdown);
                 let dsr_writer = pty_writer.clone();
                 thread::spawn(move || {
                     let mut buf = [0u8; 4096];
-                    while let Ok(n) = reader.read(&mut buf) {
-                        if n == 0 {
+                    let mut dsr_tail = [0u8; 3];
+                    let mut dsr_tail_len = 0usize;
+                    while !shutdown_flag.load(Ordering::Relaxed) {
+                        let Ok(n) = reader.read(&mut buf) else {
+                            break;
+                        };
+                        if n == 0 || shutdown_flag.load(Ordering::Relaxed) {
                             break;
                         }
                         let mut lock = term_clone.lock().unwrap();
                         lock.parser.process(&buf[..n]);
-                        let cpr_reply = buf[..n].windows(4).any(|w| w == b"\x1b[6n").then(|| {
-                            let (row, col) = lock.parser.screen().cursor_position();
-                            format!("\x1b[{};{}R", row + 1, col + 1).into_bytes()
-                        });
+                        let cpr_reply =
+                            contains_dsr_request(&mut dsr_tail, &mut dsr_tail_len, &buf[..n])
+                                .then(|| {
+                                    let (row, col) = lock.parser.screen().cursor_position();
+                                    format!("\x1b[{};{}R", row + 1, col + 1).into_bytes()
+                                });
                         let was_updated = std::mem::replace(&mut lock.pty_updated, true);
                         drop(lock);
                         if let (Some(tx), Some(reply)) = (&dsr_writer, cpr_reply) {
@@ -125,6 +195,7 @@ impl TerminalPane {
             pty_writer,
             _pty_master: pty_master,
             _pty_child: pty_child,
+            shutdown,
             focus_terminal: false,
             selecting_in_terminal: false,
         }
@@ -146,6 +217,7 @@ impl TerminalPane {
             pty_writer: None,
             _pty_master: None,
             _pty_child: None,
+            shutdown: Arc::new(AtomicBool::new(false)),
             focus_terminal: false,
             selecting_in_terminal: false,
         }
@@ -158,11 +230,7 @@ impl TerminalPane {
     /// Terminates the current PTY session (if any) and spawns a fresh terminal in `working_dir`.
     pub fn restart(&mut self, ctx: &egui::Context, working_dir: Option<&Path>) {
         let next_revision = self.term_revision.wrapping_add(1);
-        if let Some(mut child) = self._pty_child.take() {
-            let _ = child.kill();
-        }
-        self.pty_writer = None;
-        self._pty_master = None;
+        self.shutdown_session();
         *self = Self::new(ctx.clone(), working_dir);
         self.term_revision = next_revision;
         self.focus_terminal = true;
@@ -249,11 +317,12 @@ impl TerminalPane {
         });
 
         if clear_selection {
+            let term_id = terminal_id();
             self.selecting_in_terminal = false;
             ctx.data_mut(|d| {
-                if let Some(mut state) = d.get_temp::<FastEditorState>(egui::Id::unique("conpty_terminal")) {
+                if let Some(mut state) = d.get_temp::<FastEditorState>(term_id) {
                     state.mouse_selection = None;
-                    d.insert_temp(egui::Id::unique("conpty_terminal"), state);
+                    d.insert_temp(term_id, state);
                 }
             });
         }
@@ -265,7 +334,7 @@ impl TerminalPane {
     pub fn show(&mut self, ui: &mut egui::Ui, panel_frame: egui::Frame) {
         let ctx = ui.ctx().clone();
         let ctx = &ctx;
-        let term_id = egui::Id::unique("conpty_terminal");
+        let term_id = terminal_id();
         let term_focused = ctx.memory(|m| m.has_focus(term_id));
 
         self.selecting_in_terminal = ctx.data(|d| {

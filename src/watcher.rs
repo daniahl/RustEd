@@ -79,16 +79,22 @@ pub fn paths_equal(a: &Path, b: &Path) -> bool {
 
 /// Returns true if `path` equals `base` or is a descendant of `base`, using Windows-aware matching.
 pub fn path_starts_with(path: &Path, base: &Path) -> bool {
+    path_strip_prefix(path, base).is_some()
+}
+
+/// If `path` equals `base` or is a descendant of `base` (using Windows-aware matching),
+/// returns the relative path suffix under `base`.
+pub fn path_strip_prefix(path: &Path, base: &Path) -> Option<PathBuf> {
     let np = normalize_verbatim(path);
     let nb = normalize_verbatim(base);
     let mut cp = np.components();
     for cb in nb.components() {
         match cp.next() {
             Some(c) if component_eq(c, cb) => {}
-            _ => return false,
+            _ => return None,
         }
     }
-    true
+    Some(cp.as_path().to_path_buf())
 }
 
 #[derive(Default)]
@@ -374,7 +380,7 @@ fn run_windows_watch_loop(
             win32::ReadDirectoryChangesW(
                 dir_handle,
                 buf.as_mut_ptr().cast(),
-                (buf.len() * std::mem::size_of::<u32>()) as u32,
+                std::mem::size_of_val(buf) as u32,
                 i32::from(recursive),
                 win32::FILE_NOTIFY_CHANGE_FILE_NAME
                     | win32::FILE_NOTIFY_CHANGE_DIR_NAME

@@ -700,3 +700,93 @@ fn test_ctrl_s_saves_dirty_file_in_editor() {
 
     let _ = fs::remove_dir_all(&temp_dir);
 }
+
+#[test]
+fn test_undo_back_to_saved_state_clears_dirty() {
+    let temp_dir =
+        std::env::temp_dir().join(format!("rusted_undo_dirty_test_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+    let file_path = temp_dir.join("notes.txt");
+    fs::write(&file_path, "initial").unwrap();
+
+    let ctx = egui::Context::default();
+    let mut app = TextEditor::new_headless(&temp_dir);
+    app.doc.open_file(&ctx, file_path.clone());
+    assert!(!app.doc.is_current_dirty);
+    assert!(!app.doc.can_save());
+
+    // Render initial frame and focus editor
+    rusted::editor::request_editor_focus(&ctx, rusted::editor::code_editor_id());
+    let _ = run_ui(&ctx, egui::RawInput::default(), |ui| {
+        app.update_ui(ui);
+    });
+
+    // Type one character at end of buffer -> becomes dirty
+    let edit_input = egui::RawInput {
+        time: Some(1.0),
+        events: vec![
+            egui::Event::Key {
+                key: egui::Key::End,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+            egui::Event::Text("!".to_string()),
+        ],
+        ..Default::default()
+    };
+    let _ = run_ui(&ctx, edit_input, |ui| {
+        app.update_ui(ui);
+    });
+    assert_eq!(app.doc.text, "initial!");
+    assert!(app.doc.is_current_dirty);
+    assert!(app.doc.can_save());
+
+    // Undo back to saved content -> dirty flag and can_save() should clear
+    let undo_input = egui::RawInput {
+        time: Some(2.5),
+        events: vec![egui::Event::Key {
+            key: egui::Key::Z,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::COMMAND,
+        }],
+        ..Default::default()
+    };
+    let _ = run_ui(&ctx, undo_input, |ui| {
+        app.update_ui(ui);
+    });
+    assert_eq!(app.doc.text, "initial");
+    assert!(
+        !app.doc.is_current_dirty,
+        "Undoing back to saved state should clear is_current_dirty"
+    );
+    assert!(
+        !app.doc.can_save(),
+        "Undoing back to saved state should disable can_save()"
+    );
+
+    // Redo makes it dirty again
+    let redo_input = egui::RawInput {
+        time: Some(3.0),
+        events: vec![egui::Event::Key {
+            key: egui::Key::Y,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::COMMAND,
+        }],
+        ..Default::default()
+    };
+    let _ = run_ui(&ctx, redo_input, |ui| {
+        app.update_ui(ui);
+    });
+    assert_eq!(app.doc.text, "initial!");
+    assert!(app.doc.is_current_dirty);
+    assert!(app.doc.can_save());
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}

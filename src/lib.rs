@@ -13,6 +13,7 @@ pub mod document;
 pub mod editor;
 pub mod explorer;
 pub mod piece_table;
+pub mod platform;
 pub mod terminal;
 pub mod watcher;
 

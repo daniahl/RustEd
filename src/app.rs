@@ -51,7 +51,7 @@ impl TextEditor {
         Self::new_with_folder(ctx, folder_from_args(std::env::args().skip(1)))
     }
 
-    /// Creates the app showing older (or the current directory when None).
+    /// Creates the app showing `folder` (or the current directory when `None`).
     pub fn new_with_folder(ctx: egui::Context, folder: Option<PathBuf>) -> Self {
         ctx.set_zoom_factor(1.2);
         ctx.global_style_mut(|s| {
@@ -342,19 +342,7 @@ impl TextEditor {
                 if self.focus_editor_pending {
                     self.focus_editor_pending = false;
                     self.doc.focus_editor = true;
-                    let editor_id = egui::Id::unique("code_editor");
-                    ctx.memory_mut(|m| {
-                        m.request_focus(editor_id);
-                        m.set_focus_lock_filter(
-                            editor_id,
-                            egui::EventFilter {
-                                horizontal_arrows: true,
-                                vertical_arrows: true,
-                                tab: true,
-                                escape: true,
-                            },
-                        );
-                    });
+                    crate::editor::request_editor_focus(ctx, crate::editor::code_editor_id());
                 }
                 self.doc.show_find_dialog(ctx);
                 self.doc.show_editor(ui, panel_frame);

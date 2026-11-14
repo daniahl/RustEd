@@ -209,7 +209,7 @@ fn test_document_update_path_if_renamed() {
         other_file.clone(),
         UnsavedFileState {
             text: "// dirty".into(),
-            saved_text: "".to_string(),
+            saved_snapshot: None,
             saved_revision: 0,
             editor_state: None,
             line_count: 1,
@@ -251,7 +251,6 @@ fn test_document_close_if_deleted() {
 
     doc.path = active_file.to_string_lossy().into_owned();
     doc.text = "fn main() {}".into();
-    doc.saved_text = "fn main() {}".to_string();
     doc.is_current_dirty = false;
     doc.refresh_file_metadata();
 
@@ -260,7 +259,7 @@ fn test_document_close_if_deleted() {
         other_file.clone(),
         UnsavedFileState {
             text: "dirty".into(),
-            saved_text: "".to_string(),
+            saved_snapshot: None,
             saved_revision: 0,
             editor_state: None,
             line_count: 1,
@@ -273,7 +272,7 @@ fn test_document_close_if_deleted() {
         external_file.clone(),
         UnsavedFileState {
             text: "external".into(),
-            saved_text: "".to_string(),
+            saved_snapshot: None,
             saved_revision: 0,
             editor_state: None,
             line_count: 1,
@@ -491,4 +490,58 @@ fn test_open_file_stashes_dirty_buffer_and_restores_it() {
     assert!(doc.unsaved_files.is_empty());
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_find_next_across_multi_piece_buffer() {
+    use rusted::{
+        editor::{code_editor_id, FastEditorState},
+        PieceTable,
+    };
+
+    let mut pt = PieceTable::from_str("abc");
+    pt.insert(3, "defghi");
+    pt.insert(6, "XYZ");
+    // Buffer: "abcdefXYZghi" split across 4 pieces
+    assert_eq!(pt, "abcdefXYZghi");
+    assert_eq!(pt.find_from_byte("cdefXYZg", 0), Some(2));
+    assert_eq!(pt.find_from_byte("cdefXYZg", 2), Some(2));
+    assert_eq!(pt.find_from_byte("cdefXYZg", 3), None);
+
+    let ctx = egui::Context::default();
+    let mut doc = Document::new();
+    let mut content = PieceTable::from_str("alpha beta alpha");
+    content.insert(10, " gamma alpha");
+    // "alpha beta gamma alpha alpha"
+    doc.text = content;
+    doc.find_query = "alpha".to_string();
+
+    assert!(doc.find_next(&ctx));
+    let sel1 = ctx
+        .data(|d| d.get_temp::<FastEditorState>(code_editor_id()))
+        .and_then(|s| s.cursor.char_range())
+        .unwrap();
+    assert_eq!((sel1.secondary.index.0, sel1.primary.index.0), (0, 5));
+
+    assert!(doc.find_next(&ctx));
+    let sel2 = ctx
+        .data(|d| d.get_temp::<FastEditorState>(code_editor_id()))
+        .and_then(|s| s.cursor.char_range())
+        .unwrap();
+    assert_eq!((sel2.secondary.index.0, sel2.primary.index.0), (17, 22));
+
+    assert!(doc.find_next(&ctx));
+    let sel3 = ctx
+        .data(|d| d.get_temp::<FastEditorState>(code_editor_id()))
+        .and_then(|s| s.cursor.char_range())
+        .unwrap();
+    assert_eq!((sel3.secondary.index.0, sel3.primary.index.0), (23, 28));
+
+    // Wraps around back to the first match
+    assert!(doc.find_next(&ctx));
+    let sel4 = ctx
+        .data(|d| d.get_temp::<FastEditorState>(code_editor_id()))
+        .and_then(|s| s.cursor.char_range())
+        .unwrap();
+    assert_eq!((sel4.secondary.index.0, sel4.primary.index.0), (0, 5));
 }

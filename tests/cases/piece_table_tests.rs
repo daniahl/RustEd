@@ -155,10 +155,10 @@ fn test_piece_table_large_edit_performance() {
     assert_eq!(pt.line_count(), 2001);
 
     // Simulate typing characters sequentially in the middle of the document
-    let mut insert_pos = 1000;
-    for ch in "println!(\"debugging hot path performance\");\n".chars() {
+    for (insert_pos, ch) in
+        (1000..).zip("println!(\"debugging hot path performance\");\n".chars())
+    {
         pt.insert(insert_pos, &ch.to_string());
-        insert_pos += 1;
     }
 
     // Fast check: neither original buffer was shifted in memory
@@ -308,6 +308,7 @@ fn assert_matches_model(pt: &PieceTable, model: &str) {
 }
 
 #[test]
+#[allow(clippy::reversed_empty_ranges)]
 fn test_delete_noop_cases() {
     let mut pt = PieceTable::from_str("abc");
     pt.delete(1..1);
@@ -545,4 +546,34 @@ fn test_crlf_detection_across_piece_boundary() {
     assert!(pt.has_crlf_in_initial_bytes(4096));
     assert!(!pt.has_crlf_in_initial_bytes(2));
     assert!(!PieceTable::from_str("a\nb").has_crlf_in_initial_bytes(4096));
+}
+
+#[test]
+fn test_crlf_line_char_range_and_replace_with() {
+    use eframe::egui::TextBuffer;
+
+    let pt = PieceTable::from_str("one\r\ntwo\r\nthree");
+    assert_eq!(pt.line_count(), 3);
+    assert_eq!(pt.line_char_range(0), 0..3);
+    assert_eq!(pt.slice_chars(pt.line_char_range(0)), "one");
+    assert_eq!(pt.line_char_range(1), 5..8);
+    assert_eq!(pt.slice_chars(pt.line_char_range(1)), "two");
+    assert_eq!(pt.line_char_range(2), 10..15);
+    assert_eq!(pt.slice_chars(pt.line_char_range(2)), "three");
+
+    // CRLF split right between '\r' and '\n' across two pieces
+    let mut split = PieceTable::from_str("ab\r");
+    split.insert(3, "\ncd");
+    assert_eq!(split.line_count(), 2);
+    assert_eq!(split.line_char_range(0), 0..2);
+    assert_eq!(split.line_char_range(1), 4..6);
+
+    // replace_with resets added buffer & piece count cleanly
+    split.insert(0, &"Z".repeat(512));
+    assert!(split.piece_count() > 1);
+    split.replace_with("fresh");
+    assert_eq!(split, "fresh");
+    assert_eq!(split.char_count(), 5);
+    assert_eq!(split.line_count(), 1);
+    assert_eq!(split.piece_count(), 1);
 }

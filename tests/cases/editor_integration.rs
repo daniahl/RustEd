@@ -1,4 +1,4 @@
-﻿//! Integration tests for the `FastEditor` widget.
+//! Integration tests for the `FastEditor` widget.
 //!
 //! Validates text editing lifecycle, AccessKit node hierarchy, cursor navigation,
 //! clipboard paste scrolling, and layout caching.
@@ -85,40 +85,48 @@ fn test_editor_full_lifecycle() {
     }
 
     // Frame 4: Type "Second Line" at time = 1.0s
-    let mut input = egui::RawInput::default();
-    input.time = Some(1.0);
-    input.events.push(Event::Text("Second Line".to_string()));
+    let input = egui::RawInput {
+        time: Some(1.0),
+        events: vec![Event::Text("Second Line".to_string())],
+        ..Default::default()
+    };
     let _ = run_frame(&ctx, &mut text, input);
     assert_eq!(text, "First Line\nSecond Line");
 
     // Frame 4b: Idle frame at time = 2.5s (> 1.0s stable_time) to stabilize undo point
-    let mut input_idle = egui::RawInput::default();
-    input_idle.time = Some(2.5);
+    let input_idle = egui::RawInput {
+        time: Some(2.5),
+        ..Default::default()
+    };
     let _ = run_frame(&ctx, &mut text, input_idle);
 
     // Frame 5: Press Backspace at time = 3.0s
-    let mut input_bs = egui::RawInput::default();
-    input_bs.time = Some(3.0);
-    input_bs.events.push(Event::Key {
-        key: Key::Backspace,
-        physical_key: None,
-        pressed: true,
-        repeat: false,
-        modifiers: Modifiers::NONE,
-    });
+    let input_bs = egui::RawInput {
+        time: Some(3.0),
+        events: vec![Event::Key {
+            key: Key::Backspace,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::NONE,
+        }],
+        ..Default::default()
+    };
     let _ = run_frame(&ctx, &mut text, input_bs);
     assert_eq!(text, "First Line\nSecond Lin");
 
     // Frame 6: Undo (Ctrl+Z) at time = 3.5s
-    let mut input_undo = egui::RawInput::default();
-    input_undo.time = Some(3.5);
-    input_undo.events.push(Event::Key {
-        key: Key::Z,
-        physical_key: None,
-        pressed: true,
-        repeat: false,
-        modifiers: Modifiers::COMMAND,
-    });
+    let input_undo = egui::RawInput {
+        time: Some(3.5),
+        events: vec![Event::Key {
+            key: Key::Z,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::COMMAND,
+        }],
+        ..Default::default()
+    };
     let _ = run_frame(&ctx, &mut text, input_undo);
     assert_eq!(text, "First Line\nSecond Line");
 
@@ -277,9 +285,11 @@ fn test_paste_scrolls_to_caret() {
 
     let mut caret_visible = false;
     let mut run_frame = |ctx: &egui::Context, text: &mut String, events: Vec<Event>| {
-        let mut input = egui::RawInput::default();
-        input.screen_rect = Some(screen);
-        input.events = events;
+        let input = egui::RawInput {
+            screen_rect: Some(screen),
+            events,
+            ..Default::default()
+        };
         let font_id = font_id.clone();
         let mut out = ctx.run_ui(input, |ui| {
             egui::CentralPanel::default().show(ui, |ui| {
@@ -340,8 +350,10 @@ fn test_coalesced_relayout_and_long_line_accesskit() {
                      text: &mut String,
                      rev: &mut u64,
                      events: Vec<Event>| {
-        let mut input = egui::RawInput::default();
-        input.events = events;
+        let input = egui::RawInput {
+            events,
+            ..Default::default()
+        };
         let font_id = font_id.clone();
         let layout_calls = std::sync::Arc::clone(&layout_calls);
         let mut out = ctx.run_ui(input, |ui| {
@@ -432,9 +444,11 @@ fn test_virtualized_large_file_layout_and_editing() {
     let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), Vec2::new(600.0, 300.0));
 
     let run_frame = |pt: &mut PieceTable, rev: &mut u64, events: Vec<Event>| {
-        let mut input = egui::RawInput::default();
-        input.screen_rect = Some(screen);
-        input.events = events;
+        let input = egui::RawInput {
+            screen_rect: Some(screen),
+            events,
+            ..Default::default()
+        };
         let mut last_rows = 0usize;
         let mut last_first_line = 0usize;
         let mut last_cursor = None;
@@ -634,4 +648,140 @@ fn test_accesskit_caret_moves_to_start_after_select_all_delete_on_long_line() {
             }
         }
     }
+}
+
+#[test]
+fn test_virtualized_crlf_navigation_and_editing() {
+    use rusted::PieceTable;
+
+    let ctx = egui::Context::default();
+    let mut pt = PieceTable::from_str("alpha\r\nbeta\r\ngamma");
+    let mut rev = 1u64;
+    let id = Id::unique("test_virtualized_crlf");
+    let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), Vec2::new(600.0, 300.0));
+
+    let run_frame = |pt: &mut PieceTable, rev: &mut u64, events: Vec<Event>| {
+        let input = egui::RawInput {
+            screen_rect: Some(screen),
+            events,
+            ..Default::default()
+        };
+        let mut last_cursor = None;
+        let mut out = ctx.run_ui(input, |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .animated(false)
+                    .show(ui, |ui| {
+                        let mut layouter = |_ui: &Ui, _buf: &PieceTable, _wrap: f32| {
+                            panic!("full-buffer layouter must not be called in virtualized mode");
+                        };
+                        let output = FastEditor::new_with_buffer(
+                            id,
+                            pt,
+                            Vec2::new(400.0, 200.0),
+                            &mut layouter,
+                        )
+                        .text_revision(*rev)
+                        .newline("\r\n")
+                        .virtualized(true)
+                        .show(ui);
+                        output.response.request_focus();
+                        last_cursor = output.cursor_range;
+                        if output.text_changed {
+                            *rev = rev.wrapping_add(1);
+                        }
+                    });
+            });
+        });
+        out.textures_delta.clear();
+        last_cursor.unwrap().primary.index.0
+    };
+
+    let key = |k: Key| Event::Key {
+        key: k,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: Modifiers::NONE,
+    };
+
+    // Frame 1: Initial render & focus
+    assert_eq!(run_frame(&mut pt, &mut rev, vec![]), 0);
+
+    // End stops before '\r' (index 5)
+    assert_eq!(run_frame(&mut pt, &mut rev, vec![key(Key::End)]), 5);
+
+    // ArrowRight skips over "\r\n" onto index 7 ("beta")
+    assert_eq!(run_frame(&mut pt, &mut rev, vec![key(Key::ArrowRight)]), 7);
+
+    // ArrowLeft skips back over "\r\n" to index 5 (before '\r')
+    assert_eq!(run_frame(&mut pt, &mut rev, vec![key(Key::ArrowLeft)]), 5);
+
+    // Enter inserts "\r\n" (text becomes "alpha\r\n\r\nbeta\r\ngamma", caret at 7)
+    assert_eq!(run_frame(&mut pt, &mut rev, vec![key(Key::Enter)]), 7);
+    assert_eq!(pt, "alpha\r\n\r\nbeta\r\ngamma");
+
+    // Backspace removes "\r\n" as one unit
+    assert_eq!(run_frame(&mut pt, &mut rev, vec![key(Key::Backspace)]), 5);
+    assert_eq!(pt, "alpha\r\nbeta\r\ngamma");
+
+    // Delete removes "\r\n" as one unit
+    assert_eq!(run_frame(&mut pt, &mut rev, vec![key(Key::Delete)]), 5);
+    assert_eq!(pt, "alphabeta\r\ngamma");
+}
+
+/// After the OS window loses and regains focus, UIA clients must keep seeing a text
+/// selection and receive a fresh selection change (magnifier caret tracking).
+#[test]
+fn test_accesskit_selection_resyncs_after_window_refocus() {
+    use rusted::app::TextEditor;
+    let temp_dir = std::env::temp_dir().join(format!("rusted_refocus_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&temp_dir);
+    std::fs::create_dir_all(&temp_dir).unwrap();
+    let ctx = egui::Context::default();
+    ctx.enable_accesskit();
+    let mut app = TextEditor::new_headless(&temp_dir);
+    app.text = "hello world\nsecond line".to_string().into();
+    app.text_revision = 1;
+    app.focus_editor_pending = true;
+    let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), Vec2::new(900.0, 600.0));
+    let mut tree: Option<accesskit_consumer::Tree> = None;
+    let mut selections = Vec::new();
+    for (i, focused) in [true, true, true, false, false, true, true, true].into_iter().enumerate() {
+        let mut events = vec![];
+        if i == 3 {
+            events.push(Event::WindowFocused(false));
+        }
+        if i == 5 {
+            events.push(Event::WindowFocused(true));
+        }
+        let input = egui::RawInput { screen_rect: Some(screen), events, focused, ..Default::default() };
+        let mut out = ctx.run_ui(input, |ui| app.update_ui(ui));
+        out.textures_delta.clear();
+        let u = out.platform_output.accesskit_update.unwrap();
+        match tree.as_mut() {
+            None => tree = Some(accesskit_consumer::Tree::new(u, true)),
+            Some(t) => {
+                struct H;
+                impl accesskit_consumer::TreeChangeHandler for H {
+                    fn node_added(&mut self, _n: &accesskit_consumer::NodeRef) {}
+                    fn node_updated(&mut self, _o: &accesskit_consumer::NodeRef, _n: &accesskit_consumer::NodeRef) {}
+                    fn focus_moved(&mut self, _o: Option<&accesskit_consumer::NodeRef>, _n: Option<&accesskit_consumer::NodeRef>) {}
+                    fn node_removed(&mut self, _n: &accesskit_consumer::NodeRef) {}
+                }
+                t.update_and_process_changes(u, &mut H);
+            }
+        }
+        let state = tree.as_ref().unwrap().state();
+        let sel = state
+            .focus_in_tree()
+            .raw_text_selection()
+            .map(|s| s.focus.character_index);
+        selections.push(sel);
+    }
+    let _ = std::fs::remove_dir_all(&temp_dir);
+    assert!(selections[3..].iter().all(|s| s.is_some()), "selection must stay exposed: {selections:?}");
+    assert_ne!(selections[4], selections[5], "regaining focus must change selection: {selections:?}");
+    assert_eq!(selections[4], selections[6], "selection must settle back on the caret: {selections:?}");
 }

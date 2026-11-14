@@ -302,19 +302,19 @@ fn test_terminal_clicking_does_not_move_caret() {
 
     let term_id = egui::Id::unique("conpty_terminal");
     let run_frame = |pane: &mut TerminalPane, events: Vec<egui::Event>| {
-        let mut raw = egui::RawInput::default();
-        raw.screen_rect = Some(egui::Rect::from_min_size(
-            egui::Pos2::ZERO,
-            egui::Vec2::new(800.0, 600.0),
-        ));
-        raw.events = events;
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::Vec2::new(800.0, 600.0),
+            )),
+            events,
+            ..Default::default()
+        };
         let mut out = ctx.run_ui(raw, |ui| {
             pane.show(ui, egui::Frame::default());
         });
         out.textures_delta.clear();
         out
-        .textures_delta
-        .clear();
     };
 
     // Initial frame renders the PTY buffer and sets the caret to the PTY cursor position.
@@ -420,12 +420,14 @@ fn test_terminal_mouse_drag_select_and_copy_without_moving_caret() {
 
     let term_id = egui::Id::unique("conpty_terminal");
     let run_frame = |pane: &mut TerminalPane, events: Vec<egui::Event>| {
-        let mut raw = egui::RawInput::default();
-        raw.screen_rect = Some(egui::Rect::from_min_size(
-            egui::Pos2::ZERO,
-            egui::Vec2::new(800.0, 600.0),
-        ));
-        raw.events = events;
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::Vec2::new(800.0, 600.0),
+            )),
+            events,
+            ..Default::default()
+        };
         let mut out = ctx.run_ui(raw, |ui| {
             pane.show(ui, egui::Frame::default());
         });
@@ -556,4 +558,37 @@ fn test_terminal_mouse_drag_select_and_copy_without_moving_caret() {
         sel_after_rc.is_none(),
         "Right-clicking to copy should clear the selection"
     );
+}
+
+#[test]
+fn test_contains_dsr_request_across_chunks() {
+    use rusted::terminal::contains_dsr_request;
+
+    let mut tail = [0u8; 3];
+    let mut tail_len = 0usize;
+
+    // Single chunk match
+    assert!(contains_dsr_request(&mut tail, &mut tail_len, b"abc\x1b[6ndef"));
+
+    // Split across two chunks (2 + 2 bytes)
+    let mut tail = [0u8; 3];
+    let mut tail_len = 0usize;
+    assert!(!contains_dsr_request(&mut tail, &mut tail_len, b"prefix\x1b["));
+    assert!(contains_dsr_request(&mut tail, &mut tail_len, b"6nsuffix"));
+
+    // Split 1 byte at a time, including an empty intermediate chunk
+    let mut tail = [0u8; 3];
+    let mut tail_len = 0usize;
+    assert!(!contains_dsr_request(&mut tail, &mut tail_len, b"\x1b"));
+    assert!(!contains_dsr_request(&mut tail, &mut tail_len, b""));
+    assert!(!contains_dsr_request(&mut tail, &mut tail_len, b"["));
+    assert!(!contains_dsr_request(&mut tail, &mut tail_len, b"6"));
+    assert!(contains_dsr_request(&mut tail, &mut tail_len, b"n"));
+
+    // Non-matching byte breaks partial sequence
+    let mut tail = [0u8; 3];
+    let mut tail_len = 0usize;
+    assert!(!contains_dsr_request(&mut tail, &mut tail_len, b"\x1b[6"));
+    assert!(!contains_dsr_request(&mut tail, &mut tail_len, b"m"));
+    assert!(!contains_dsr_request(&mut tail, &mut tail_len, b"n"));
 }

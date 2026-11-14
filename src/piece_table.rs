@@ -235,7 +235,7 @@ fn scan_str_with_checkpoints(text: &str) -> (usize, usize, Vec<LineCheckpoint>) 
         }
         if b == b'\n' {
             line_feed_cnt += 1;
-            if line_feed_cnt % CHECKPOINT_STRIDE == 0 {
+            if line_feed_cnt.is_multiple_of(CHECKPOINT_STRIDE) {
                 checkpoints.push(LineCheckpoint {
                     nl_count: line_feed_cnt,
                     byte_offset: i + 1,
@@ -272,6 +272,7 @@ impl PieceTable {
         Self::from_arc_str(Arc::<str>::from(original))
     }
 
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(text: &str) -> Self {
         Self::from_arc_str(Arc::<str>::from(text))
     }
@@ -337,6 +338,77 @@ impl PieceTable {
             self.total_line_feeds = snapshot.total_line_feeds;
             self.cached_dirty.set(true);
         }
+    }
+
+    /// Returns `true` if the current buffer contents match `snapshot` without flattening.
+    pub fn matches_snapshot(&self, snapshot: &PieceTableSnapshot) -> bool {
+        if self.total_bytes != snapshot.total_bytes
+            || self.total_chars != snapshot.total_chars
+            || self.total_line_feeds != snapshot.total_line_feeds
+        {
+            return false;
+        }
+        if Arc::ptr_eq(&self.original, &snapshot.original)
+            && (Arc::ptr_eq(&self.pieces, &snapshot.pieces) || *self.pieces == *snapshot.pieces)
+        {
+            return true;
+        }
+        self.eq_snapshot_content(snapshot)
+    }
+
+    fn eq_snapshot_content(&self, snapshot: &PieceTableSnapshot) -> bool {
+        if !snapshot
+            .pieces
+            .iter()
+            .all(|p| p.buffer != BufferType::Added || p.start + p.length <= self.added.len())
+        {
+            return false;
+        }
+        let mut a_idx = 0usize;
+        let mut a_off = 0usize;
+        let mut b_idx = 0usize;
+        let mut b_off = 0usize;
+        let a_pieces = &self.pieces[..];
+        let b_pieces = &snapshot.pieces[..];
+
+        while a_idx < a_pieces.len() && b_idx < b_pieces.len() {
+            if a_off >= a_pieces[a_idx].length {
+                a_idx += 1;
+                a_off = 0;
+                continue;
+            }
+            if b_off >= b_pieces[b_idx].length {
+                b_idx += 1;
+                b_off = 0;
+                continue;
+            }
+            let a_slice = &a_pieces[a_idx].get_text(&self.original, &self.added).as_bytes()[a_off..];
+            let b_slice =
+                &b_pieces[b_idx].get_text(&snapshot.original, &self.added).as_bytes()[b_off..];
+            let step = a_slice.len().min(b_slice.len());
+            if a_slice[..step] != b_slice[..step] {
+                return false;
+            }
+            a_off += step;
+            b_off += step;
+        }
+        while a_idx < a_pieces.len() && a_off >= a_pieces[a_idx].length {
+            a_idx += 1;
+            a_off = 0;
+        }
+        while b_idx < b_pieces.len() && b_off >= b_pieces[b_idx].length {
+            b_idx += 1;
+            b_off = 0;
+        }
+        a_idx == a_pieces.len() && b_idx == b_pieces.len()
+    }
+
+    /// Releases any lazily flattened string cache without altering buffer contents.
+    pub fn drop_cached_text(&mut self) {
+        unsafe {
+            *self.cached_text.get() = String::new();
+        }
+        self.cached_dirty.set(true);
     }
 
     #[inline]
@@ -912,7 +984,7 @@ impl PieceTable {
         (curr_line, target - last_line_start_char)
     }
 
-    /// Returns the character range `start..end` (excluding trailing `'\n'`) of 0-based `line_idx`.
+    /// Returns the character range `start..end` (excluding trailing `'\n'` or `"\r\n"`) of 0-based `line_idx`.
     pub fn line_char_range(&self, line_idx: usize) -> Range<usize> {
         if line_idx > self.total_line_feeds {
             return self.total_chars..self.total_chars;
@@ -923,24 +995,36 @@ impl PieceTable {
         }
 
         let mut curr_char = start;
+        let mut prev_last_byte: Option<u8> = None;
         for (idx, p) in self.pieces[start_piece_idx..].iter().enumerate() {
             let byte_offset = if idx == 0 { start_byte_in_piece } else { 0 };
             if byte_offset >= p.length {
                 continue;
             }
-            if idx > 0 && p.line_feed_cnt == 0 {
-                curr_char += p.char_count;
-                continue;
-            }
             let text = p.get_text(&self.original, &self.added);
             let slice = &text[byte_offset..];
+            if idx > 0 && p.line_feed_cnt == 0 {
+                curr_char += p.char_count;
+                if !slice.is_empty() {
+                    prev_last_byte = slice.as_bytes().last().copied();
+                }
+                continue;
+            }
             if let Some(nl_pos) = slice.as_bytes().iter().position(|&b| b == b'\n') {
                 let chars_in_line = if p.char_count == p.length {
                     nl_pos
                 } else {
                     slice[..nl_pos].chars().count()
                 };
-                let end = curr_char + chars_in_line;
+                let mut end = curr_char + chars_in_line;
+                let preceded_by_cr = if nl_pos > 0 {
+                    slice.as_bytes()[nl_pos - 1] == b'\r'
+                } else {
+                    prev_last_byte == Some(b'\r')
+                };
+                if preceded_by_cr && end > start {
+                    end -= 1;
+                }
                 return start..end.max(start);
             } else {
                 let rem_chars = if idx == 0 {
@@ -953,6 +1037,9 @@ impl PieceTable {
                     p.char_count
                 };
                 curr_char += rem_chars;
+                if !slice.is_empty() {
+                    prev_last_byte = slice.as_bytes().last().copied();
+                }
             }
         }
 
@@ -964,12 +1051,12 @@ impl PieceTable {
         out.clear();
         let start = char_range.start.min(self.total_chars);
         let end = char_range.end.min(self.total_chars);
-        if start >= end {
+        if start >= end || self.pieces.is_empty() {
             return;
         }
 
-        let mut curr_char = 0usize;
-        for p in self.pieces.iter() {
+        let (start_idx, mut curr_char) = self.locate_char(start);
+        for p in &self.pieces[start_idx..] {
             let piece_start = curr_char;
             let piece_end = curr_char + p.char_count;
             curr_char = piece_end;
@@ -1037,6 +1124,83 @@ impl PieceTable {
             remaining -= slice.len();
         }
         false
+    }
+
+    /// Searches for `needle` starting at UTF-8 byte offset `start_byte` without flattening
+    /// the piece table into `cached_text`. Returns the matching byte offset if found.
+    pub fn find_from_byte(&self, needle: &str, start_byte: usize) -> Option<usize> {
+        if needle.is_empty() || needle.len() > self.total_bytes || start_byte >= self.total_bytes {
+            return None;
+        }
+        if let [p] = self.pieces.as_slice() {
+            let text = p.get_text(&self.original, &self.added);
+            return text[start_byte..].find(needle).map(|rel| start_byte + rel);
+        }
+
+        let needle_bytes = needle.as_bytes();
+        let needle_len = needle_bytes.len();
+        if needle_len == 1 {
+            let target = needle_bytes[0];
+            let mut piece_byte_start = 0usize;
+            for p in self.pieces.iter() {
+                let piece_end = piece_byte_start + p.length;
+                if piece_end > start_byte {
+                    let local_start = start_byte.saturating_sub(piece_byte_start);
+                    let bytes = &p.get_text(&self.original, &self.added).as_bytes()[local_start..];
+                    if let Some(rel) = bytes.iter().position(|&b| b == target) {
+                        return Some(piece_byte_start + local_start + rel);
+                    }
+                }
+                piece_byte_start = piece_end;
+            }
+            return None;
+        }
+
+        // Keep at most `needle_len - 1` trailing bytes from preceding slices to catch
+        // matches that straddle piece boundaries.
+        let max_tail = needle_len - 1;
+        let mut tail: Vec<u8> = Vec::with_capacity(max_tail * 2);
+        let mut piece_byte_start = 0usize;
+
+        for p in self.pieces.iter() {
+            let piece_end = piece_byte_start + p.length;
+            if piece_end <= start_byte {
+                piece_byte_start = piece_end;
+                continue;
+            }
+            let local_start = start_byte.saturating_sub(piece_byte_start);
+            let slice_start_byte = piece_byte_start + local_start;
+            let slice = &p.get_text(&self.original, &self.added)[local_start..];
+            let slice_bytes = slice.as_bytes();
+
+            if !tail.is_empty() {
+                let tail_len = tail.len();
+                let take_prefix = slice_bytes.len().min(max_tail);
+                tail.extend_from_slice(&slice_bytes[..take_prefix]);
+                if let Some(rel) = tail.windows(needle_len).position(|w| w == needle_bytes) {
+                    return Some(slice_start_byte - tail_len + rel);
+                }
+                tail.truncate(tail_len);
+            }
+
+            if let Some(rel) = slice.find(needle) {
+                return Some(slice_start_byte + rel);
+            }
+
+            if slice_bytes.len() >= max_tail {
+                tail.clear();
+                tail.extend_from_slice(&slice_bytes[slice_bytes.len() - max_tail..]);
+            } else {
+                let combined_len = tail.len() + slice_bytes.len();
+                if combined_len > max_tail {
+                    tail.drain(..combined_len - max_tail);
+                }
+                tail.extend_from_slice(slice_bytes);
+            }
+            piece_byte_start = piece_end;
+        }
+
+        None
     }
 
     #[inline]
@@ -1127,6 +1291,14 @@ impl PartialEq<PieceTable> for String {
     }
 }
 
+impl std::str::FromStr for PieceTable {
+    type Err = std::convert::Infallible;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(Self::from_str(s))
+    }
+}
+
 impl From<&str> for PieceTable {
     fn from(s: &str) -> Self {
         PieceTable::from_str(s)
@@ -1188,6 +1360,9 @@ impl eframe::egui::TextBuffer for PieceTable {
 
         self.original = Arc::<str>::from(text);
         self.orig_checkpoints = Arc::from(checkpoints);
+        self.added.clear();
+        self.added_chars = 0;
+        self.added_lfs = 0;
         self.hint.set((0, 0));
         let pieces = Arc::make_mut(&mut self.pieces);
         pieces.clear();
@@ -1205,6 +1380,9 @@ impl eframe::egui::TextBuffer for PieceTable {
         self.total_chars = char_count;
         self.total_bytes = byte_len;
         self.total_line_feeds = line_feed_cnt;
+        unsafe {
+            (*self.cached_text.get()).clear();
+        }
         self.cached_dirty.set(true);
     }
 

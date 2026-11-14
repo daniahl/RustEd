@@ -16,6 +16,33 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+pub const CODE_EDITOR_ID: &str = "code_editor";
+pub const TERMINAL_ID: &str = "conpty_terminal";
+
+pub fn code_editor_id() -> Id {
+    Id::unique(CODE_EDITOR_ID)
+}
+
+pub fn terminal_id() -> Id {
+    Id::unique(TERMINAL_ID)
+}
+
+pub fn default_focus_lock_filter() -> egui::EventFilter {
+    egui::EventFilter {
+        horizontal_arrows: true,
+        vertical_arrows: true,
+        tab: true,
+        escape: true,
+    }
+}
+
+pub fn request_editor_focus(ctx: &egui::Context, id: Id) {
+    ctx.memory_mut(|m| {
+        m.request_focus(id);
+        m.set_focus_lock_filter(id, default_focus_lock_filter());
+    });
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum UndoSnapshot {
     PieceTable(PieceTableSnapshot),
@@ -81,11 +108,14 @@ pub trait EditorBuffer: egui::TextBuffer {
     fn line_char_range(&self, line_idx: usize) -> Range<usize> {
         let start = self.line_to_char(line_idx);
         let total_lines = self.line_count();
-        let end = if line_idx + 1 >= total_lines {
+        let mut end = if line_idx + 1 >= total_lines {
             self.char_count()
         } else {
             self.line_to_char(line_idx + 1).saturating_sub(1)
         };
+        if end > start && self.slice_chars(end - 1..end) == "\r" {
+            end -= 1;
+        }
         start..end.max(start)
     }
 
@@ -101,6 +131,47 @@ pub trait EditorBuffer: egui::TextBuffer {
         let mut s = String::new();
         self.extract_char_range(char_range, &mut s);
         s
+    }
+
+    fn prev_word_ccursor(&self, ccursor: CCursor) -> CCursor {
+        let end = ccursor.index.0.min(self.char_count());
+        if end == 0 {
+            return CCursor::new(0);
+        }
+        let mut window = 256usize;
+        let mut buf = String::new();
+        loop {
+            let start = end.saturating_sub(window);
+            self.extract_char_range(start..end, &mut buf);
+            let local_len = end - start;
+            let new_local = egui::TextBuffer::delete_previous_word(&mut buf, CCursor::new(local_len));
+            if new_local.index.0 > 0 || start == 0 {
+                return CCursor::new(start + new_local.index.0);
+            }
+            window = window.saturating_mul(2);
+        }
+    }
+
+    fn next_word_ccursor(&self, ccursor: CCursor) -> CCursor {
+        let total = self.char_count();
+        let start = ccursor.index.0.min(total);
+        if start >= total {
+            return CCursor::new(total);
+        }
+        let mut window = 256usize;
+        let mut buf = String::new();
+        loop {
+            let end = (start + window).min(total);
+            let local_len = end - start;
+            self.extract_char_range(start..end, &mut buf);
+            let _ = egui::TextBuffer::delete_next_word(&mut buf, CCursor::new(0));
+            let remaining = buf.chars().count();
+            let deleted = local_len.saturating_sub(remaining);
+            if remaining > 0 || end == total {
+                return CCursor::new(start + deleted);
+            }
+            window = window.saturating_mul(2);
+        }
     }
 
     fn delete_prev_word(&mut self, ccursor: CCursor) -> CCursor {
@@ -155,47 +226,21 @@ impl EditorBuffer for PieceTable {
     }
 
     fn delete_prev_word(&mut self, ccursor: CCursor) -> CCursor {
+        let target_start = self.prev_word_ccursor(ccursor);
         let end = ccursor.index.0.min(self.char_count());
-        if end == 0 {
-            return CCursor::new(0);
+        if target_start.index.0 < end {
+            self.delete(target_start.index.0..end);
         }
-        let mut window = 256usize;
-        let mut buf = String::new();
-        loop {
-            let start = end.saturating_sub(window);
-            self.extract_char_range(start..end, &mut buf);
-            let local_len = end - start;
-            let new_local = egui::TextBuffer::delete_previous_word(&mut buf, CCursor::new(local_len));
-            if new_local.index.0 > 0 || start == 0 {
-                let target_start = start + new_local.index.0;
-                self.delete(target_start..end);
-                return CCursor::new(target_start);
-            }
-            window = window.saturating_mul(2);
-        }
+        target_start
     }
 
     fn delete_nxt_word(&mut self, ccursor: CCursor) -> CCursor {
-        let total = self.char_count();
-        let start = ccursor.index.0.min(total);
-        if start >= total {
-            return CCursor::new(total);
+        let start = ccursor.index.0.min(self.char_count());
+        let target_end = self.next_word_ccursor(ccursor);
+        if target_end.index.0 > start {
+            self.delete(start..target_end.index.0);
         }
-        let mut window = 256usize;
-        let mut buf = String::new();
-        loop {
-            let end = (start + window).min(total);
-            let local_len = end - start;
-            self.extract_char_range(start..end, &mut buf);
-            let _ = egui::TextBuffer::delete_next_word(&mut buf, CCursor::new(0));
-            let remaining = buf.chars().count();
-            let deleted = local_len.saturating_sub(remaining);
-            if remaining > 0 || end == total {
-                self.delete(start..start + deleted);
-                return CCursor::new(start);
-            }
-            window = window.saturating_mul(2);
-        }
+        CCursor::new(start)
     }
 }
 
@@ -282,6 +327,209 @@ impl<'a, T: egui::TextBuffer> Layouter<'a, T> {
     }
 }
 
+fn load_editor_state(ui: &Ui, id: Id) -> (FastEditorState, u64) {
+    let mut state = ui
+        .ctx()
+        .data_mut(|d| d.get_temp::<FastEditorState>(id))
+        .unwrap_or_default();
+
+    let current_pass = ui.ctx().cumulative_pass_nr();
+    if state.last_rendered_pass != Some(current_pass.saturating_sub(1)) {
+        state.accesskit_row_cache = None;
+        state.had_focus_prev_frame = false;
+    }
+    // egui keeps the widget focused while the OS window is inactive, so a window
+    // focus change never shows up as a widget focus change. Treat an inactive
+    // window as "not focused" so that regaining window focus re-triggers the
+    // AccessKit selection sync (UIA_Text_TextSelectionChangedEventId) that
+    // magnifiers / screen readers need to resume caret tracking.
+    let window_focused = ui.input(|i| i.focused);
+    if !window_focused {
+        state.accesskit_row_cache = None;
+        state.had_focus_prev_frame = false;
+    }
+
+    (state, current_pass)
+}
+
+fn restore_focus_on_escape(ui: &Ui, response: &Response, id: Id) -> bool {
+    let escape_without_popup =
+        !ui.ctx().any_popup_open() && ui.input(|i| i.key_pressed(Key::Escape));
+    if (response.has_focus() || escape_without_popup)
+        && ui.memory(|m| m.had_focus_last_frame(id) && m.focused().is_none())
+    {
+        response.request_focus();
+    }
+    response.has_focus()
+}
+
+fn feed_undoer_if_in_flux<T: EditorBuffer>(
+    state: &mut FastEditorState,
+    text: &T,
+    now: f64,
+    cursor_range: CCursorRange,
+) {
+    let mut undoer = state.undoer.lock().unwrap();
+    if undoer.is_in_flux() {
+        let snap = match &state.last_undo_snapshot {
+            Some(s) => s.clone(),
+            None => {
+                let s = text.undo_snapshot();
+                state.last_undo_snapshot = Some(s.clone());
+                s
+            }
+        };
+        undoer.feed_state(now, &(cursor_range, snap));
+    }
+}
+
+fn collect_relevant_events(ui: &Ui) -> Vec<Event> {
+    ui.input(|i| {
+        let has_relevant = i.events.iter().any(|e| {
+            matches!(
+                e,
+                Event::Key { .. }
+                    | Event::Text(_)
+                    | Event::Paste(_)
+                    | Event::Copy
+                    | Event::Cut
+            )
+        });
+        if has_relevant {
+            i.events.clone()
+        } else {
+            Vec::new()
+        }
+    })
+}
+
+fn paint_selection_rows(
+    painter: &egui::Painter,
+    galley: &Galley,
+    galley_pos: Pos2,
+    text_clip_rect: Rect,
+    bg_fill: Color32,
+    sel_range: CCursorRange,
+    window: Range<usize>,
+) {
+    if galley.rows.is_empty() {
+        return;
+    }
+    let [min_c, max_c] = sel_range.sorted_cursors();
+    if max_c.index.0 <= window.start || min_c.index.0 >= window.end {
+        return;
+    }
+    let clamped_min = min_c.index.0.max(window.start) - window.start;
+    let clamped_max = max_c.index.0.min(window.end) - window.start;
+    let min_cursor = galley.layout_from_cursor(CCursor::new(clamped_min));
+    let max_cursor = galley.layout_from_cursor(CCursor::new(clamped_max));
+    let min_row = min_cursor.row;
+    let max_row = max_cursor.row.min(galley.rows.len() - 1);
+    let top = text_clip_rect.min.y - galley_pos.y;
+    let first_vis = galley.rows.partition_point(|r| r.rect().max.y < top);
+    let start_row = min_row.max(first_vis);
+
+    if start_row > max_row {
+        return;
+    }
+
+    for (row_idx, row) in galley.rows[start_row..=max_row]
+        .iter()
+        .enumerate()
+        .map(|(i, r)| (start_row + i, r))
+    {
+        let row_top_y = galley_pos.y + row.rect().min.y;
+        if row_top_y > text_clip_rect.max.y {
+            break;
+        }
+        let left = if row_idx == min_row && min_c.index.0 >= window.start {
+            row.x_offset(min_cursor.column)
+        } else {
+            0.0
+        };
+        let right = if row_idx == max_row && max_c.index.0 <= window.end {
+            row.x_offset(max_cursor.column)
+        } else {
+            let newline_extra = if row.ends_with_newline {
+                row.rect().height() * 0.5
+            } else {
+                0.0
+            };
+            row.rect().width() + newline_extra
+        };
+        let sel_rect = Rect::from_min_max(
+            galley_pos + Vec2::new(left, row.rect().min.y),
+            galley_pos + Vec2::new(right, row.rect().max.y),
+        );
+        painter.rect_filled(sel_rect, 0.0, bg_fill);
+    }
+}
+
+fn finish_cursor_and_scroll(
+    ui: &Ui,
+    state: &mut FastEditorState,
+    cursor_box: Rect,
+    text_clip_rect: Rect,
+    has_focus: bool,
+) -> bool {
+    if has_focus {
+        let now = ui.input(|i| i.time);
+        // Use the full visible clip rect so the caret is never cut off at the edges.
+        let cursor_painter = ui.painter().with_clip_rect(ui.clip_rect());
+        paint_text_cursor(
+            ui,
+            &cursor_painter,
+            cursor_box,
+            now - state.last_interaction_time,
+        );
+    }
+
+    let cursor_in_view = text_clip_rect.contains(cursor_box.center());
+    if cursor_in_view {
+        state.scroll_to_cursor = false;
+        if has_focus && !ui.ctx().will_discard() && ui.input(|i| i.focused) {
+            let ppp = ui.ctx().pixels_per_point();
+            let x = (cursor_box.min.x * ppp).round() as i32;
+            let y = (cursor_box.min.y * ppp).round() as i32;
+            let w = ((cursor_box.width() * ppp).round() as i32).max(1);
+            let h = ((cursor_box.height() * ppp).round() as i32).max(1);
+            let force = !state.had_focus_prev_frame || state.pending_accesskit_selection_sync;
+            crate::platform::update_caret(x, y, w, h, force);
+        }
+    } else if state.scroll_to_cursor {
+        // Only redo the pass when we've just asked the ScrollArea to scroll to the
+        // caret (edit / caret move). If the user simply scrolled the caret out of view,
+        // discarding every frame would re-run layout continuously.
+        if !ui.ctx().will_discard() {
+            ui.ctx().request_discard("scroll to cursor");
+        }
+        // If the pass limit is hit, keep scrolling on the next frame.
+        ui.ctx().request_repaint();
+    }
+
+    cursor_in_view
+}
+
+fn store_editor_state(
+    ui: &Ui,
+    id: Id,
+    mut state: FastEditorState,
+    current_pass: u64,
+    has_focus: bool,
+) {
+    if !ui.ctx().will_discard() {
+        state.had_focus_prev_frame = has_focus && ui.input(|i| i.focused);
+    }
+    state.last_rendered_pass = Some(current_pass);
+    ui.ctx().data_mut(|d| d.insert_temp(id, state));
+
+    if has_focus {
+        ui.memory_mut(|mem| {
+            mem.set_focus_lock_filter(id, default_focus_lock_filter());
+        });
+    }
+}
+
 pub struct FastEditor<'a, T: EditorBuffer = String> {
     id: Id,
     text: &'a mut T,
@@ -291,6 +539,7 @@ pub struct FastEditor<'a, T: EditorBuffer = String> {
     text_revision: Option<u64>,
     virtualized: bool,
     pointer_moves_caret: bool,
+    newline: &'static str,
 }
 
 impl<'a, T: EditorBuffer> FastEditor<'a, T> {
@@ -309,6 +558,7 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
             text_revision: None,
             virtualized: false,
             pointer_moves_caret: true,
+            newline: "\n",
         }
     }
 
@@ -327,7 +577,14 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
             text_revision: None,
             virtualized: false,
             pointer_moves_caret: true,
+            newline: "\n",
         }
+    }
+
+    /// Sets the line ending inserted when `Enter` is pressed (defaults to `"\n"`).
+    pub fn newline(mut self, newline: &'static str) -> Self {
+        self.newline = newline;
+        self
     }
 
     /// Enables line-windowed virtualized layout (no word-wrap, only visible lines laid out).
@@ -360,6 +617,217 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
         self
     }
 
+    fn seed_pre_edit_snapshot(&self, state: &mut FastEditorState, cursor_range: CCursorRange) {
+        if state.last_undo_snapshot.is_none() {
+            let snap = self.text.undo_snapshot();
+            state
+                .undoer
+                .lock()
+                .unwrap()
+                .add_undo(&(cursor_range, snap.clone()));
+            state.last_undo_snapshot = Some(snap);
+        }
+    }
+
+    fn handle_common_edit_event(
+        &mut self,
+        ui: &Ui,
+        event: &Event,
+        state: &mut FastEditorState,
+        cursor_range: CCursorRange,
+        text_changed: bool,
+    ) -> Option<CCursorRange> {
+        match event {
+            Event::Copy => {
+                let copy_range = if !self.pointer_moves_caret {
+                    state.mouse_selection
+                } else {
+                    Some(cursor_range)
+                };
+                if let Some(range) = copy_range.filter(|r| r.primary != r.secondary) {
+                    let [min_c, max_c] = range.sorted_cursors();
+                    let total = self.text.char_count();
+                    ui.ctx().copy_text(
+                        self.text
+                            .slice_chars(min_c.index.0.min(total)..max_c.index.0.min(total)),
+                    );
+                }
+                None
+            }
+            Event::Cut => {
+                if cursor_range.is_empty() {
+                    return None;
+                }
+                if !text_changed {
+                    self.seed_pre_edit_snapshot(state, cursor_range);
+                }
+                let [min_c, max_c] = cursor_range.sorted_cursors();
+                let total = self.text.char_count();
+                ui.ctx().copy_text(
+                    self.text
+                        .slice_chars(min_c.index.0.min(total)..max_c.index.0.min(total)),
+                );
+                let ccursor = self.text.delete_selected(&cursor_range);
+                Some(CCursorRange::one(ccursor))
+            }
+            Event::Paste(text_to_insert) => {
+                if text_to_insert.is_empty() {
+                    return None;
+                }
+                if !text_changed {
+                    self.seed_pre_edit_snapshot(state, cursor_range);
+                }
+                let mut ccursor = self.text.delete_selected(&cursor_range);
+                self.text
+                    .insert_text_at(&mut ccursor, text_to_insert, usize::MAX);
+                Some(CCursorRange::one(ccursor))
+            }
+            Event::Text(text_to_insert) => {
+                // Enter/Return is handled by Key::Enter to avoid double newlines
+                if text_to_insert.is_empty() || text_to_insert == "\n" || text_to_insert == "\r" {
+                    return None;
+                }
+                if !text_changed {
+                    self.seed_pre_edit_snapshot(state, cursor_range);
+                }
+                let mut ccursor = self.text.delete_selected(&cursor_range);
+                self.text
+                    .insert_text_at(&mut ccursor, text_to_insert, usize::MAX);
+                Some(CCursorRange::one(ccursor))
+            }
+            Event::Key {
+                key: Key::Enter,
+                pressed: true,
+                ..
+            } => {
+                if !text_changed {
+                    self.seed_pre_edit_snapshot(state, cursor_range);
+                }
+                let mut ccursor = self.text.delete_selected(&cursor_range);
+                self.text
+                    .insert_text_at(&mut ccursor, self.newline, usize::MAX);
+                Some(CCursorRange::one(ccursor))
+            }
+            Event::Key {
+                key: Key::Tab,
+                pressed: true,
+                modifiers,
+                ..
+            } if !modifiers.ctrl && !modifiers.command => {
+                if !text_changed {
+                    self.seed_pre_edit_snapshot(state, cursor_range);
+                }
+                let mut ccursor = self.text.delete_selected(&cursor_range);
+                self.text.insert_text_at(&mut ccursor, "    ", usize::MAX);
+                Some(CCursorRange::one(ccursor))
+            }
+            Event::Key {
+                key: Key::Backspace,
+                pressed: true,
+                modifiers,
+                ..
+            } => {
+                if !text_changed {
+                    self.seed_pre_edit_snapshot(state, cursor_range);
+                }
+                let ccursor = if let Some(cursor) = cursor_range.single() {
+                    if modifiers.ctrl {
+                        self.text.delete_prev_word(cursor)
+                    } else {
+                        let idx = cursor.index.0.min(self.text.char_count());
+                        if idx >= 2 && self.text.slice_chars(idx - 2..idx) == "\r\n" {
+                            self.text
+                                .delete_char_range(egui::text::CharIndex(idx - 2)..egui::text::CharIndex(idx));
+                            CCursor::new(idx - 2)
+                        } else {
+                            self.text.delete_previous_char(cursor)
+                        }
+                    }
+                } else {
+                    self.text.delete_selected(&cursor_range)
+                };
+                Some(CCursorRange::one(ccursor))
+            }
+            Event::Key {
+                key: Key::Delete,
+                pressed: true,
+                modifiers,
+                ..
+            } => {
+                if !text_changed {
+                    self.seed_pre_edit_snapshot(state, cursor_range);
+                }
+                let ccursor = if let Some(cursor) = cursor_range.single() {
+                    if modifiers.ctrl {
+                        self.text.delete_nxt_word(cursor)
+                    } else {
+                        let idx = cursor.index.0;
+                        let total = self.text.char_count();
+                        if idx + 2 <= total && self.text.slice_chars(idx..idx + 2) == "\r\n" {
+                            self.text
+                                .delete_char_range(egui::text::CharIndex(idx)..egui::text::CharIndex(idx + 2));
+                            CCursor::new(idx)
+                        } else {
+                            self.text.delete_next_char(cursor)
+                        }
+                    }
+                } else {
+                    self.text.delete_selected(&cursor_range)
+                };
+                Some(CCursorRange::one(ccursor))
+            }
+            Event::Key {
+                key: Key::Z,
+                pressed: true,
+                modifiers,
+                ..
+            } if modifiers.command => {
+                let current_snap = match &state.last_undo_snapshot {
+                    Some(s) if !text_changed => s.clone(),
+                    _ => self.text.undo_snapshot(),
+                };
+                let undo_target = state
+                    .undoer
+                    .lock()
+                    .unwrap()
+                    .undo(&(cursor_range, current_snap))
+                    .cloned();
+                if let Some((undo_range, undo_snap)) = undo_target {
+                    self.text.restore_undo_snapshot(&undo_snap);
+                    state.last_undo_snapshot = Some(undo_snap);
+                    Some(undo_range)
+                } else {
+                    None
+                }
+            }
+            Event::Key {
+                key: Key::Y,
+                pressed: true,
+                modifiers,
+                ..
+            } if modifiers.command => {
+                let current_snap = match &state.last_undo_snapshot {
+                    Some(s) if !text_changed => s.clone(),
+                    _ => self.text.undo_snapshot(),
+                };
+                let redo_target = state
+                    .undoer
+                    .lock()
+                    .unwrap()
+                    .redo(&(cursor_range, current_snap))
+                    .cloned();
+                if let Some((redo_range, redo_snap)) = redo_target {
+                    self.text.restore_undo_snapshot(&redo_snap);
+                    state.last_undo_snapshot = Some(redo_snap);
+                    Some(redo_range)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
     pub fn show(mut self, ui: &mut Ui) -> EditorOutput {
         if self.virtualized {
             return self.show_virtualized(ui);
@@ -367,18 +835,7 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
         const MARGIN: Vec2 = Vec2::new(6.0, 2.0);
         let wrap_width = (ui.available_width() - MARGIN.x * 2.0).max(100.0);
 
-        let mut state = ui
-            .ctx()
-            .data_mut(|d| d.get_temp::<FastEditorState>(self.id))
-            .unwrap_or_default();
-
-        let current_pass = ui.ctx().cumulative_pass_nr();
-        let was_rendered_last_pass =
-            state.last_rendered_pass == Some(current_pass.saturating_sub(1));
-        if !was_rendered_last_pass {
-            state.accesskit_row_cache = None;
-            state.had_focus_prev_frame = false;
-        }
+        let (mut state, current_pass) = load_editor_state(ui, self.id);
 
         // Reuse the previous layout when nothing it depends on has changed.
         // When `text_revision` is supplied, this is an O(1) integer comparison;
@@ -450,15 +907,17 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
                 state.last_interaction_time = ui.input(|i| i.time);
             }
             if response.secondary_clicked() {
-                if let Some(sel) = state.mouse_selection.take() {
-                    if sel.primary != sel.secondary {
-                        let [min_c, max_c] = sel.sorted_cursors();
-                        let total = self.text.char_count();
-                        let start = min_c.index.0.min(total);
-                        let end = max_c.index.0.min(total);
-                        if start < end {
-                            ui.ctx().copy_text(self.text.slice_chars(start..end));
-                        }
+                if let Some(sel) = state
+                    .mouse_selection
+                    .take()
+                    .filter(|sel| sel.primary != sel.secondary)
+                {
+                    let [min_c, max_c] = sel.sorted_cursors();
+                    let total = self.text.char_count();
+                    let start = min_c.index.0.min(total);
+                    let end = max_c.index.0.min(total);
+                    if start < end {
+                        ui.ctx().copy_text(self.text.slice_chars(start..end));
                     }
                 }
             } else if let Some(pointer_pos) = ui.ctx().pointer_interact_pos() {
@@ -486,63 +945,22 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
             }
         }
 
-        let has_focus = response.has_focus();
         let os = ui.ctx().os();
         let mut text_changed = false;
+        // Keep editor focus if Escape was pressed while editor had focus on the previous frame
+        let has_focus = restore_focus_on_escape(ui, &response, self.id);
 
-        if has_focus
-            || (!ui.ctx().any_popup_open()
-                && ui.input(|i| i.key_pressed(Key::Escape)))
-        {
-            // Keep editor focus if Escape was pressed while editor had focus on the previous frame
-            if ui.memory(|m| m.had_focus_last_frame(self.id) && m.focused().is_none()) {
-                response.request_focus();
-            }
-        }
-
-        let has_focus = response.has_focus();
         if has_focus {
             let now = ui.input(|i| i.time);
 
             // Feed state to undoer if in flux so undo points can stabilize.
             // Reuse the cached UndoSnapshot when available to avoid snapshotting on idle frames.
-            {
-                let mut undoer = state.undoer.lock().unwrap();
-                if undoer.is_in_flux() {
-                    let snap = match &state.last_undo_snapshot {
-                        Some(s) => s.clone(),
-                        None => {
-                            let s = self.text.undo_snapshot();
-                            state.last_undo_snapshot = Some(s.clone());
-                            s
-                        }
-                    };
-                    undoer.feed_state(now, &(cursor_range, snap));
-                }
-            }
+            feed_undoer_if_in_flux(&mut state, self.text, now, cursor_range);
 
-            let events = ui.input(|i| {
-                let has_relevant = i.events.iter().any(|e| {
-                    matches!(
-                        e,
-                        Event::Key { .. }
-                            | Event::Text(_)
-                            | Event::Paste(_)
-                            | Event::Copy
-                            | Event::Cut
-                    )
-                });
-                if has_relevant {
-                    i.events.clone()
-                } else {
-                    Vec::new()
-                }
-            });
+            let events = collect_relevant_events(ui);
             let mut pending_relayout = false;
 
             for event in &events {
-                let mut mutated: Option<CCursorRange> = None;
-
                 // If an earlier event in this same frame mutated the text and this event
                 // might depend on visual row layout, flush the pending relayout first.
                 if pending_relayout
@@ -573,7 +991,7 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
                     continue;
                 }
 
-                match event {
+                let mutated = match event {
                     Event::Key {
                         key: Key::PageUp,
                         pressed: true,
@@ -610,146 +1028,14 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
                         state.last_interaction_time = now;
                         continue;
                     }
-                    Event::Copy => {
-                        let copy_range = if !self.pointer_moves_caret {
-                            state.mouse_selection
-                        } else {
-                            Some(cursor_range)
-                        };
-                        if let Some(range) = copy_range.filter(|r| r.primary != r.secondary) {
-                            let [min_c, max_c] = range.sorted_cursors();
-                            let total = self.text.char_count();
-                            ui.ctx().copy_text(
-                                self.text
-                                    .slice_chars(min_c.index.0.min(total)..max_c.index.0.min(total)),
-                            );
-                        }
-                    }
-                    Event::Cut => {
-                        if !cursor_range.is_empty() {
-                            let [min_c, max_c] = cursor_range.sorted_cursors();
-                            ui.ctx().copy_text(self.text.slice_chars(min_c.index.0..max_c.index.0));
-                            let ccursor = self.text.delete_selected(&cursor_range);
-                            mutated = Some(CCursorRange::one(ccursor));
-                        }
-                    }
-                    Event::Paste(text_to_insert) => {
-                        if !text_to_insert.is_empty() {
-                            let mut ccursor = self.text.delete_selected(&cursor_range);
-                            self.text.insert_text_at(&mut ccursor, text_to_insert, usize::MAX);
-                            mutated = Some(CCursorRange::one(ccursor));
-                        }
-                    }
-                    Event::Text(text_to_insert) => {
-                        // Enter/Return is handled by Key::Enter to avoid double newlines
-                        if !text_to_insert.is_empty()
-                            && text_to_insert != "\n"
-                            && text_to_insert != "\r"
-                        {
-                            let mut ccursor = self.text.delete_selected(&cursor_range);
-                            self.text.insert_text_at(&mut ccursor, text_to_insert, usize::MAX);
-                            mutated = Some(CCursorRange::one(ccursor));
-                        }
-                    }
-                    Event::Key {
-                        key: Key::Enter,
-                        pressed: true,
-                        ..
-                    } => {
-                        let mut ccursor = self.text.delete_selected(&cursor_range);
-                        self.text.insert_text_at(&mut ccursor, "\n", usize::MAX);
-                        mutated = Some(CCursorRange::one(ccursor));
-                    }
-                    Event::Key {
-                        key: Key::Tab,
-                        pressed: true,
-                        modifiers,
-                        ..
-                    } if !modifiers.ctrl && !modifiers.command => {
-                        let mut ccursor = self.text.delete_selected(&cursor_range);
-                        self.text.insert_text_at(&mut ccursor, "    ", usize::MAX);
-                        mutated = Some(CCursorRange::one(ccursor));
-                    }
-                    Event::Key {
-                        key: Key::Backspace,
-                        pressed: true,
-                        modifiers,
-                        ..
-                    } => {
-                        let ccursor = if let Some(cursor) = cursor_range.single() {
-                            if modifiers.ctrl {
-                                self.text.delete_prev_word(cursor)
-                            } else {
-                                self.text.delete_previous_char(cursor)
-                            }
-                        } else {
-                            self.text.delete_selected(&cursor_range)
-                        };
-                        mutated = Some(CCursorRange::one(ccursor));
-                    }
-                    Event::Key {
-                        key: Key::Delete,
-                        pressed: true,
-                        modifiers,
-                        ..
-                    } => {
-                        let ccursor = if let Some(cursor) = cursor_range.single() {
-                            if modifiers.ctrl {
-                                self.text.delete_nxt_word(cursor)
-                            } else {
-                                self.text.delete_next_char(cursor)
-                            }
-                        } else {
-                            self.text.delete_selected(&cursor_range)
-                        };
-                        mutated = Some(CCursorRange::one(ccursor));
-                    }
-                    Event::Key {
-                        key: Key::Z,
-                        pressed: true,
-                        modifiers,
-                        ..
-                    } if modifiers.command => {
-                        let current_snap = match &state.last_undo_snapshot {
-                            Some(s) if !text_changed => s.clone(),
-                            _ => self.text.undo_snapshot(),
-                        };
-                        let undo_target = state
-                            .undoer
-                            .lock()
-                            .unwrap()
-                            .undo(&(cursor_range, current_snap))
-                            .cloned();
-                        if let Some((undo_range, undo_snap)) = undo_target {
-                            self.text.restore_undo_snapshot(&undo_snap);
-                            state.last_undo_snapshot = Some(undo_snap);
-                            mutated = Some(undo_range);
-                        }
-                    }
-                    Event::Key {
-                        key: Key::Y,
-                        pressed: true,
-                        modifiers,
-                        ..
-                    } if modifiers.command => {
-                        let current_snap = match &state.last_undo_snapshot {
-                            Some(s) if !text_changed => s.clone(),
-                            _ => self.text.undo_snapshot(),
-                        };
-                        let redo_target = state
-                            .undoer
-                            .lock()
-                            .unwrap()
-                            .redo(&(cursor_range, current_snap))
-                            .cloned();
-                        if let Some((redo_range, redo_snap)) = redo_target {
-                            self.text.restore_undo_snapshot(&redo_snap);
-                            state.last_undo_snapshot = Some(redo_snap);
-                            mutated = Some(redo_range);
-                        }
-                    }
-                    _ => {}
-                }
+                    _ => self.handle_common_edit_event(
+                        ui,
+                        event,
+                        &mut state,
+                        cursor_range,
+                        text_changed,
+                    ),
+                };
 
                 if let Some(new_ccursor_range) = mutated {
                     text_changed = true;
@@ -820,77 +1106,21 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
             // Paint selection rects directly for visible rows instead of calling
             // `paint_text_selection` on `galley`, which would deep-clone the entire
             // Galley via `Arc::make_mut` every frame.
-            let [min_c, max_c] = sel_range.sorted_cursors();
-            let min_cursor = galley.layout_from_cursor(min_c);
-            let max_cursor = galley.layout_from_cursor(max_c);
-            let min_row = min_cursor.row;
-            let max_row = max_cursor.row.min(galley.rows.len().saturating_sub(1));
-            let top = text_clip_rect.min.y - galley_pos.y;
-            let first_vis = galley.rows.partition_point(|r| r.rect().max.y < top);
-            let start_row = min_row.max(first_vis);
-            let bg_fill = ui.visuals().selection.bg_fill;
-
-            if start_row <= max_row {
-                for (row_idx, row) in galley.rows[start_row..=max_row]
-                    .iter()
-                    .enumerate()
-                    .map(|(i, r)| (start_row + i, r))
-                {
-                    let row_top_y = galley_pos.y + row.rect().min.y;
-                    if row_top_y > text_clip_rect.max.y {
-                        break;
-                    }
-                    let left = if row_idx == min_row {
-                        row.x_offset(min_cursor.column)
-                    } else {
-                        0.0
-                    };
-                    let right = if row_idx == max_cursor.row {
-                        row.x_offset(max_cursor.column)
-                    } else {
-                        let newline_extra = if row.ends_with_newline {
-                            row.rect().height() * 0.5
-                        } else {
-                            0.0
-                        };
-                        row.rect().width() + newline_extra
-                    };
-                    let sel_rect = Rect::from_min_max(
-                        galley_pos + Vec2::new(left, row.rect().min.y),
-                        galley_pos + Vec2::new(right, row.rect().max.y),
-                    );
-                    painter.rect_filled(sel_rect, 0.0, bg_fill);
-                }
-            }
+            paint_selection_rows(
+                &painter,
+                &galley,
+                galley_pos,
+                text_clip_rect,
+                ui.visuals().selection.bg_fill,
+                sel_range,
+                0..usize::MAX,
+            );
         }
 
         painter.galley(galley_pos, Arc::clone(&galley), Color32::WHITE);
 
-        if has_focus {
-            let now = ui.input(|i| i.time);
-            // Use the full visible clip rect so the caret is never cut off at the edges.
-            let cursor_painter = ui.painter().with_clip_rect(ui.clip_rect());
-            paint_text_cursor(
-                ui,
-                &cursor_painter,
-                cursor_box,
-                now - state.last_interaction_time,
-            );
-        }
-
-        let cursor_in_view = text_clip_rect.contains(cursor_box.center());
-        if cursor_in_view {
-            state.scroll_to_cursor = false;
-        } else if state.scroll_to_cursor {
-            // Only redo the pass when we've just asked the ScrollArea to scroll to the
-            // caret (edit / caret move). If the user simply scrolled the caret out of view,
-            // discarding every frame would re-run layout continuously.
-            if !ui.ctx().will_discard() {
-                ui.ctx().request_discard("scroll to cursor");
-            }
-            // If the pass limit is hit, keep scrolling on the next frame.
-            ui.ctx().request_repaint();
-        }
+        let cursor_in_view =
+            finish_cursor_and_scroll(ui, &mut state, cursor_box, text_clip_rect, has_focus);
 
         let focus = galley.layout_from_cursor(cursor_range.primary);
         update_accesskit(
@@ -908,10 +1138,6 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
             focus.column.0,
         );
 
-        if !ui.ctx().will_discard() {
-            state.had_focus_prev_frame = has_focus;
-        }
-
         if layout_dirty {
             let cached_rev = if text_changed {
                 self.text_revision.map(|r| r.wrapping_add(1))
@@ -924,20 +1150,7 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
                 galley: Arc::clone(&galley),
             }));
         }
-        state.last_rendered_pass = Some(current_pass);
-        ui.ctx().data_mut(|d| d.insert_temp(self.id, state));
-
-        let focus_filter = egui::EventFilter {
-            horizontal_arrows: true,
-            vertical_arrows: true,
-            tab: true,
-            escape: true,
-        };
-        if has_focus {
-            ui.memory_mut(|mem| {
-                mem.set_focus_lock_filter(self.id, focus_filter);
-            });
-        }
+        store_editor_state(ui, self.id, state, current_pass, has_focus);
 
         EditorOutput {
             response,
@@ -951,7 +1164,7 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
         }
     }
 
-    fn show_virtualized(self, ui: &mut Ui) -> EditorOutput {
+    fn show_virtualized(mut self, ui: &mut Ui) -> EditorOutput {
         const MARGIN: Vec2 = Vec2::new(6.0, 2.0);
         const OVERSCAN: usize = 4;
 
@@ -960,18 +1173,7 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
         let line_height = ui.fonts_mut(|f| f.row_height(&font_id)).max(1.0);
         let char_width = ui.fonts_mut(|f| f.glyph_width(&font_id, ' ')).max(1.0);
 
-        let mut state = ui
-            .ctx()
-            .data_mut(|d| d.get_temp::<FastEditorState>(self.id))
-            .unwrap_or_default();
-
-        let current_pass = ui.ctx().cumulative_pass_nr();
-        let was_rendered_last_pass =
-            state.last_rendered_pass == Some(current_pass.saturating_sub(1));
-        if !was_rendered_last_pass {
-            state.accesskit_row_cache = None;
-            state.had_focus_prev_frame = false;
-        }
+        let (mut state, current_pass) = load_editor_state(ui, self.id);
 
         let total_lines = self.text.line_count().max(1);
         let total_chars = self.text.char_count();
@@ -1028,7 +1230,7 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
                     let we = if last_line >= total_lines {
                         total_chars
                     } else {
-                        self.text.line_to_char(last_line).saturating_sub(1)
+                        self.text.line_char_range(last_line - 1).end
                     };
                     self.text.extract_char_range(ws..we, &mut window_buf);
                     let job = LayoutJob::simple(
@@ -1062,7 +1264,7 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
                     let is_being_dragged = ui.ctx().is_being_dragged(self.id);
                     let cursor_at_pointer = galley.cursor_from_pos(pointer_pos - window_galley_pos);
 
-                    let mut local_cursor_state = state.cursor.clone();
+                    let mut local_cursor_state = state.cursor;
                     let clamped_local = CCursorRange::two(
                         CCursor::new(
                             ccursor_range
@@ -1108,57 +1310,17 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
             state.last_interaction_time = ui.input(|i| i.time);
         }
 
-        let has_focus = response.has_focus();
         let mut text_changed = false;
+        let has_focus = restore_focus_on_escape(ui, &response, self.id);
 
-        if has_focus
-            || (!ui.ctx().any_popup_open()
-                && ui.input(|i| i.key_pressed(Key::Escape)))
-        {
-            if ui.memory(|m| m.had_focus_last_frame(self.id) && m.focused().is_none()) {
-                response.request_focus();
-            }
-        }
-
-        let has_focus = response.has_focus();
         if has_focus {
             let now = ui.input(|i| i.time);
-            {
-                let mut undoer = state.undoer.lock().unwrap();
-                if undoer.is_in_flux() {
-                    let snap = match &state.last_undo_snapshot {
-                        Some(s) => s.clone(),
-                        None => {
-                            let s = self.text.undo_snapshot();
-                            state.last_undo_snapshot = Some(s.clone());
-                            s
-                        }
-                    };
-                    undoer.feed_state(now, &(ccursor_range, snap));
-                }
-            }
+            feed_undoer_if_in_flux(&mut state, self.text, now, ccursor_range);
 
-            let events = ui.input(|i| {
-                let has_relevant = i.events.iter().any(|e| {
-                    matches!(
-                        e,
-                        Event::Key { .. }
-                            | Event::Text(_)
-                            | Event::Paste(_)
-                            | Event::Copy
-                            | Event::Cut
-                    )
-                });
-                if has_relevant {
-                    i.events.clone()
-                } else {
-                    Vec::new()
-                }
-            });
+            let events = collect_relevant_events(ui);
 
             for event in &events {
                 let cur_total = self.text.char_count();
-                let mut mutated: Option<CCursorRange> = None;
 
                 match event {
                     Event::Key {
@@ -1177,7 +1339,16 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
                         modifiers,
                         ..
                     } => {
-                        let next = ccursor_range.primary.index.saturating_sub(1);
+                        let next = if modifiers.ctrl || modifiers.command {
+                            self.text.prev_word_ccursor(ccursor_range.primary).index.0
+                        } else {
+                            let cur = ccursor_range.primary.index.0.min(cur_total);
+                            if cur >= 2 && self.text.slice_chars(cur - 2..cur) == "\r\n" {
+                                cur - 2
+                            } else {
+                                cur.saturating_sub(1)
+                            }
+                        };
                         ccursor_range.primary = CCursor::new(next);
                         if !modifiers.shift {
                             ccursor_range.secondary = ccursor_range.primary;
@@ -1190,7 +1361,18 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
                         modifiers,
                         ..
                     } => {
-                        let next = (ccursor_range.primary.index.0 + 1).min(cur_total);
+                        let next = if modifiers.ctrl || modifiers.command {
+                            self.text.next_word_ccursor(ccursor_range.primary).index.0
+                        } else {
+                            let cur = ccursor_range.primary.index.0.min(cur_total);
+                            if cur + 2 <= cur_total
+                                && self.text.slice_chars(cur..cur + 2) == "\r\n"
+                            {
+                                cur + 2
+                            } else {
+                                (cur + 1).min(cur_total)
+                            }
+                        };
                         ccursor_range.primary = CCursor::new(next);
                         if !modifiers.shift {
                             ccursor_range.secondary = ccursor_range.primary;
@@ -1226,7 +1408,7 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
                         modifiers,
                         ..
                     } => {
-                        let next = if modifiers.ctrl {
+                        let next = if modifiers.ctrl || modifiers.command {
                             0
                         } else {
                             let (line, _) = self.text.char_to_line_col(ccursor_range.primary.index.0);
@@ -1244,7 +1426,7 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
                         modifiers,
                         ..
                     } => {
-                        let next = if modifiers.ctrl {
+                        let next = if modifiers.ctrl || modifiers.command {
                             cur_total
                         } else {
                             let (line, _) = self.text.char_to_line_col(ccursor_range.primary.index.0);
@@ -1256,157 +1438,19 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
                         }
                         state.last_interaction_time = now;
                     }
-                    Event::Copy => {
-                        if ccursor_range.primary != ccursor_range.secondary {
-                            let [min_c, max_c] = ccursor_range.sorted_cursors();
-                            ui.ctx().copy_text(self.text.slice_chars(min_c.index.0..max_c.index.0));
+                    _ => {
+                        if let Some(new_ccursor_range) = self.handle_common_edit_event(
+                            ui,
+                            event,
+                            &mut state,
+                            ccursor_range,
+                            text_changed,
+                        ) {
+                            text_changed = true;
+                            state.last_interaction_time = now;
+                            ccursor_range = new_ccursor_range;
                         }
                     }
-                    Event::Cut => {
-                        if ccursor_range.primary != ccursor_range.secondary {
-                            let [min_c, max_c] = ccursor_range.sorted_cursors();
-                            ui.ctx().copy_text(self.text.slice_chars(min_c.index.0..max_c.index.0));
-                            self.text.delete_char_range(min_c.index..max_c.index);
-                            mutated = Some(CCursorRange::one(min_c));
-                        }
-                    }
-                    Event::Paste(text_to_insert) => {
-                        if !text_to_insert.is_empty() {
-                            let [min_c, max_c] = ccursor_range.sorted_cursors();
-                            if min_c.index < max_c.index {
-                                self.text.delete_char_range(min_c.index..max_c.index);
-                            }
-                            let mut c = min_c;
-                            self.text.insert_text_at(&mut c, text_to_insert, usize::MAX);
-                            mutated = Some(CCursorRange::one(c));
-                        }
-                    }
-                    Event::Text(text_to_insert) => {
-                        if !text_to_insert.is_empty()
-                            && text_to_insert != "\n"
-                            && text_to_insert != "\r"
-                        {
-                            let [min_c, max_c] = ccursor_range.sorted_cursors();
-                            if min_c.index < max_c.index {
-                                self.text.delete_char_range(min_c.index..max_c.index);
-                            }
-                            let mut c = min_c;
-                            self.text.insert_text_at(&mut c, text_to_insert, usize::MAX);
-                            mutated = Some(CCursorRange::one(c));
-                        }
-                    }
-                    Event::Key {
-                        key: Key::Enter,
-                        pressed: true,
-                        ..
-                    } => {
-                        let [min_c, max_c] = ccursor_range.sorted_cursors();
-                        if min_c.index < max_c.index {
-                            self.text.delete_char_range(min_c.index..max_c.index);
-                        }
-                        let mut c = min_c;
-                        self.text.insert_text_at(&mut c, "\n", usize::MAX);
-                        mutated = Some(CCursorRange::one(c));
-                    }
-                    Event::Key {
-                        key: Key::Tab,
-                        pressed: true,
-                        modifiers,
-                        ..
-                    } if !modifiers.ctrl && !modifiers.command => {
-                        let [min_c, max_c] = ccursor_range.sorted_cursors();
-                        if min_c.index < max_c.index {
-                            self.text.delete_char_range(min_c.index..max_c.index);
-                        }
-                        let mut c = min_c;
-                        self.text.insert_text_at(&mut c, "    ", usize::MAX);
-                        mutated = Some(CCursorRange::one(c));
-                    }
-                    Event::Key {
-                        key: Key::Backspace,
-                        pressed: true,
-                        modifiers,
-                        ..
-                    } => {
-                        let [min_c, max_c] = ccursor_range.sorted_cursors();
-                        let c = if min_c.index < max_c.index {
-                            self.text.delete_char_range(min_c.index..max_c.index);
-                            min_c
-                        } else if modifiers.ctrl {
-                            self.text.delete_prev_word(min_c)
-                        } else {
-                            self.text.delete_previous_char(min_c)
-                        };
-                        mutated = Some(CCursorRange::one(c));
-                    }
-                    Event::Key {
-                        key: Key::Delete,
-                        pressed: true,
-                        modifiers,
-                        ..
-                    } => {
-                        let [min_c, max_c] = ccursor_range.sorted_cursors();
-                        let c = if min_c.index < max_c.index {
-                            self.text.delete_char_range(min_c.index..max_c.index);
-                            min_c
-                        } else if modifiers.ctrl {
-                            self.text.delete_nxt_word(min_c)
-                        } else {
-                            self.text.delete_next_char(min_c)
-                        };
-                        mutated = Some(CCursorRange::one(c));
-                    }
-                    Event::Key {
-                        key: Key::Z,
-                        pressed: true,
-                        modifiers,
-                        ..
-                    } if modifiers.command => {
-                        let current_snap = match &state.last_undo_snapshot {
-                            Some(s) if !text_changed => s.clone(),
-                            _ => self.text.undo_snapshot(),
-                        };
-                        let undo_target = state
-                            .undoer
-                            .lock()
-                            .unwrap()
-                            .undo(&(ccursor_range, current_snap))
-                            .cloned();
-                        if let Some((undo_range, undo_snap)) = undo_target {
-                            self.text.restore_undo_snapshot(&undo_snap);
-                            state.last_undo_snapshot = Some(undo_snap);
-                            mutated = Some(undo_range);
-                        }
-                    }
-                    Event::Key {
-                        key: Key::Y,
-                        pressed: true,
-                        modifiers,
-                        ..
-                    } if modifiers.command => {
-                        let current_snap = match &state.last_undo_snapshot {
-                            Some(s) if !text_changed => s.clone(),
-                            _ => self.text.undo_snapshot(),
-                        };
-                        let redo_target = state
-                            .undoer
-                            .lock()
-                            .unwrap()
-                            .redo(&(ccursor_range, current_snap))
-                            .cloned();
-                        if let Some((redo_range, redo_snap)) = redo_target {
-                            self.text.restore_undo_snapshot(&redo_snap);
-                            state.last_undo_snapshot = Some(redo_snap);
-                            mutated = Some(redo_range);
-                        }
-                    }
-                    _ => {}
-                }
-
-                if let Some(new_ccursor_range) = mutated {
-                    text_changed = true;
-                    state.last_interaction_time = now;
-                    ccursor_range = new_ccursor_range;
                 }
             }
         }
@@ -1421,9 +1465,7 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
             let we = if last_line >= total_lines_after {
                 total_chars_after
             } else {
-                self.text
-                    .line_to_char(last_line.min(total_lines_after))
-                    .saturating_sub(1)
+                self.text.line_char_range(last_line - 1).end
             };
             self.text.extract_char_range(ws..we, &mut window_buf);
             let job = LayoutJob::simple(
@@ -1485,74 +1527,21 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
 
         // Paint selection rects for visible rows inside the window
         if ccursor_range.primary != ccursor_range.secondary {
-            let [min_c, max_c] = ccursor_range.sorted_cursors();
-            if max_c.index.0 > window_start_char && min_c.index.0 < window_end_char {
-                let clamped_min = min_c.index.0.max(window_start_char) - window_start_char;
-                let clamped_max = max_c.index.0.min(window_end_char) - window_start_char;
-                let min_cur = galley.layout_from_cursor(CCursor::new(clamped_min));
-                let max_cur = galley.layout_from_cursor(CCursor::new(clamped_max));
-                let min_row = min_cur.row;
-                let max_row = max_cur.row.min(galley.rows.len().saturating_sub(1));
-                let bg_fill = ui.visuals().selection.bg_fill;
-
-                for (row_idx, row) in galley.rows[min_row..=max_row]
-                    .iter()
-                    .enumerate()
-                    .map(|(i, r)| (min_row + i, r))
-                {
-                    let row_top_y = window_galley_pos.y + row.rect().min.y;
-                    if row_top_y > text_clip_rect.max.y {
-                        break;
-                    }
-                    if window_galley_pos.y + row.rect().max.y < text_clip_rect.min.y {
-                        continue;
-                    }
-                    let left = if row_idx == min_row && min_c.index.0 >= window_start_char {
-                        row.x_offset(min_cur.column)
-                    } else {
-                        0.0
-                    };
-                    let right = if row_idx == max_row && max_c.index.0 <= window_end_char {
-                        row.x_offset(max_cur.column)
-                    } else {
-                        let newline_extra = if row.ends_with_newline {
-                            row.rect().height() * 0.5
-                        } else {
-                            0.0
-                        };
-                        row.rect().width() + newline_extra
-                    };
-                    let sel_rect = Rect::from_min_max(
-                        window_galley_pos + Vec2::new(left, row.rect().min.y),
-                        window_galley_pos + Vec2::new(right, row.rect().max.y),
-                    );
-                    painter.rect_filled(sel_rect, 0.0, bg_fill);
-                }
-            }
+            paint_selection_rows(
+                &painter,
+                &galley,
+                window_galley_pos,
+                text_clip_rect,
+                ui.visuals().selection.bg_fill,
+                ccursor_range,
+                window_start_char..window_end_char,
+            );
         }
 
         painter.galley(window_galley_pos, Arc::clone(&galley), Color32::WHITE);
 
-        if has_focus {
-            let now = ui.input(|i| i.time);
-            let cursor_painter = ui.painter().with_clip_rect(ui.clip_rect());
-            paint_text_cursor(
-                ui,
-                &cursor_painter,
-                cursor_box,
-                now - state.last_interaction_time,
-            );
-        }
-
-        let cursor_in_view = text_clip_rect.contains(cursor_box.center());
-        if cursor_in_view {
-            state.scroll_to_cursor = false;
-        } else if state.scroll_to_cursor {
-            if !ui.ctx().will_discard() {
-                ui.ctx().request_discard("scroll to cursor");
-            }
-            ui.ctx().request_repaint();
-        }
+        let cursor_in_view =
+            finish_cursor_and_scroll(ui, &mut state, cursor_box, text_clip_rect, has_focus);
 
         let local_row = cur_line.saturating_sub(first_line);
         let local_col = local_primary.map(|lp| lp.column.0).unwrap_or(cur_col);
@@ -1571,10 +1560,6 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
             local_col,
         );
 
-        if !ui.ctx().will_discard() {
-            state.had_focus_prev_frame = has_focus;
-        }
-
         if layout_dirty {
             let cached_rev = if text_changed {
                 rev.wrapping_add(1)
@@ -1591,20 +1576,7 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
                 galley: Arc::clone(&galley),
             }));
         }
-        state.last_rendered_pass = Some(current_pass);
-        ui.ctx().data_mut(|d| d.insert_temp(self.id, state));
-
-        let focus_filter = egui::EventFilter {
-            horizontal_arrows: true,
-            vertical_arrows: true,
-            tab: true,
-            escape: true,
-        };
-        if has_focus {
-            ui.memory_mut(|mem| {
-                mem.set_focus_lock_filter(self.id, focus_filter);
-            });
-        }
+        store_editor_state(ui, self.id, state, current_pass, has_focus);
 
         EditorOutput {
             response,
@@ -1683,6 +1655,22 @@ fn update_accesskit(
                     });
                 });
             }
+        } else if ui.memory(|m| m.has_focus(id)) {
+            // The widget keeps egui focus but the OS window is inactive. Keep exposing
+            // the caret so that when Windows re-announces focus on window activation
+            // (before our next frame runs) UIA clients (magnifier, screen readers) find
+            // a valid text selection and keep tracking the caret.
+            ui.ctx().accesskit_node_builder(id, |builder| {
+                let target_idx = (col_idx + 1).min(row.glyphs.len() + 1);
+                let focus_pos = egui::accesskit::TextPosition {
+                    node: row_accesskit_id,
+                    character_index: target_idx,
+                };
+                builder.set_text_selection(egui::accesskit::TextSelection {
+                    anchor: focus_pos,
+                    focus: focus_pos,
+                });
+            });
         } else {
             ui.ctx().accesskit_node_builder(id, |builder| {
                 builder.clear_text_selection();

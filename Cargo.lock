@@ -3061,8 +3061,10 @@ dependencies = [
  "eframe",
  "egui_extras",
  "portable-pty",
+ "raw-window-handle",
  "rfd",
  "vt100",
+ "windows",
 ]
 
 [[package]]

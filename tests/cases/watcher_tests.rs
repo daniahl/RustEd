@@ -6,7 +6,7 @@ use rusted::{
     document::{DiskSyncResult, ExternalConflict},
     editor::FastEditorState,
     piece_table::PieceTable,
-    watcher::{path_starts_with, paths_equal, FileWatcher},
+    watcher::{path_starts_with, path_strip_prefix, paths_equal, FileWatcher},
 };
 use std::{
     fs,
@@ -121,7 +121,7 @@ fn test_refresh_watched_paths_keeps_collapsed_dirs_lazy_and_adds_new_items() {
     // Simulate creating a new file in root
     let added = root_dir.join("added.rs");
     fs::write(&added, "// new").unwrap();
-    app.process_fs_events(&ctx, &[added.clone()], false);
+    app.process_fs_events(&ctx, std::slice::from_ref(&added), false);
     assert!(
         app.explorer
             .tree_root
@@ -157,7 +157,7 @@ fn test_clean_reload_preserves_clamped_caret_and_dirty_conflict_protects_edits()
 
     // 1. External edit to clean file -> auto-reloads and clamps caret cleanly
     fs::write(&file_path, "short").unwrap();
-    app.process_fs_events(&ctx, &[file_path.clone()], false);
+    app.process_fs_events(&ctx, std::slice::from_ref(&file_path), false);
     assert_eq!(app.doc.text.build_string(), "short");
     assert!(!app.doc.is_current_dirty);
     assert_eq!(app.doc.external_conflict, None);
@@ -172,7 +172,7 @@ fn test_clean_reload_preserves_clamped_caret_and_dirty_conflict_protects_edits()
     app.doc.set_text("unsaved local edits");
     app.doc.is_current_dirty = true;
     fs::write(&file_path, "external replacement").unwrap();
-    app.process_fs_events(&ctx, &[file_path.clone()], false);
+    app.process_fs_events(&ctx, std::slice::from_ref(&file_path), false);
     assert_eq!(app.doc.text.build_string(), "unsaved local edits");
     assert_eq!(
         app.doc.external_conflict,
@@ -189,7 +189,7 @@ fn test_clean_reload_preserves_clamped_caret_and_dirty_conflict_protects_edits()
     app.doc.set_text("unsaved before delete");
     app.doc.is_current_dirty = true;
     fs::remove_file(&file_path).unwrap();
-    app.process_fs_events(&ctx, &[file_path.clone()], false);
+    app.process_fs_events(&ctx, std::slice::from_ref(&file_path), false);
     assert_eq!(app.doc.text.build_string(), "unsaved before delete");
     assert_eq!(
         app.doc.external_conflict,
@@ -279,4 +279,37 @@ fn test_live_file_watcher_syncs_tree_editor_retarget_and_extra_file() {
     let _ = fs::remove_dir_all(&root_a);
     let _ = fs::remove_dir_all(&root_b);
     let _ = fs::remove_dir_all(&outside_dir);
+}
+
+#[test]
+fn test_path_strip_prefix_windows_aware() {
+    assert_eq!(
+        path_strip_prefix(Path::new(r"C:\Proj\src\main.rs"), Path::new(r"C:\Proj")),
+        Some(PathBuf::from("src").join("main.rs"))
+    );
+    assert_eq!(
+        path_strip_prefix(Path::new(r"C:\Proj\src"), Path::new(r"C:\Proj\src")),
+        Some(PathBuf::new())
+    );
+    assert_eq!(
+        path_strip_prefix(Path::new(r"C:\ProjTwo\src"), Path::new(r"C:\Proj")),
+        None
+    );
+
+    #[cfg(target_os = "windows")]
+    {
+        assert_eq!(
+            path_strip_prefix(Path::new(r"C:\Proj\SRC\main.rs"), Path::new(r"c:\proj\")),
+            Some(PathBuf::from("SRC").join("main.rs"))
+        );
+        assert_eq!(
+            path_strip_prefix(Path::new(r"\\?\C:\Proj\src\lib.rs"), Path::new(r"C:\Proj")),
+            Some(PathBuf::from("src").join("lib.rs"))
+        );
+        assert!(paths_equal(Path::new(r"c:/proj/src"), Path::new(r"C:\Proj\SRC")));
+        assert!(path_starts_with(
+            Path::new(r"c:/proj/src/lib.rs"),
+            Path::new(r"C:\Proj")
+        ));
+    }
 }

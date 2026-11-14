@@ -4,8 +4,8 @@
 //! of files and folders, context menus, and trash/recycle bin operations.
 
 use crate::{
-    document::{Document, UnsavedFileState},
-    watcher::{path_starts_with, paths_equal},
+    document::Document,
+    watcher::{path_starts_with, path_strip_prefix, paths_equal},
 };
 use eframe::egui;
 use std::{
@@ -46,6 +46,7 @@ pub enum TreeAction {
 pub fn move_to_trash(path: &Path) -> bool {
     use std::os::windows::ffi::OsStrExt;
 
+    #[allow(clippy::upper_case_acronyms)]
     #[cfg_attr(target_arch = "x86", repr(C, packed))]
     #[cfg_attr(not(target_arch = "x86"), repr(C))]
     struct SHFILEOPSTRUCTW {
@@ -196,6 +197,10 @@ impl FileNode {
                 let (expanded, children_loaded, children) = if is_dir {
                     old_dirs
                         .remove(&path)
+                        .or_else(|| {
+                            let key = old_dirs.keys().find(|k| paths_equal(k, &path)).cloned()?;
+                            old_dirs.remove(&key)
+                        })
                         .unwrap_or((false, false, Vec::new()))
                 } else {
                     (false, false, Vec::new())
@@ -344,9 +349,7 @@ pub fn render_inline_tree_edit(
 pub fn render_file_node(
     ui: &mut egui::Ui,
     node: &mut FileNode,
-    current_path: &Path,
-    is_current_dirty: bool,
-    unsaved_files: &HashMap<PathBuf, UnsavedFileState>,
+    doc: &Document,
     selected_node: &mut Option<(PathBuf, bool)>,
     pending_edit: &mut Option<PendingTreeEdit>,
     tree_action: &mut Option<TreeAction>,
@@ -358,9 +361,7 @@ pub fn render_file_node(
     render_file_node_with_buf(
         ui,
         node,
-        current_path,
-        is_current_dirty,
-        unsaved_files,
+        doc,
         selected_node,
         pending_edit,
         tree_action,
@@ -375,9 +376,7 @@ pub fn render_file_node(
 fn render_file_node_with_buf(
     ui: &mut egui::Ui,
     node: &mut FileNode,
-    current_path: &Path,
-    is_current_dirty: bool,
-    unsaved_files: &HashMap<PathBuf, UnsavedFileState>,
+    doc: &Document,
     selected_node: &mut Option<(PathBuf, bool)>,
     pending_edit: &mut Option<PendingTreeEdit>,
     tree_action: &mut Option<TreeAction>,
@@ -389,15 +388,15 @@ fn render_file_node_with_buf(
     let indent = depth as f32 * 14.0;
     let is_renaming_self = matches!(
         pending_edit,
-        Some(e) if matches!(&e.kind, TreeEditKind::Rename { target_path, .. } if target_path == &node.path)
+        Some(e) if matches!(&e.kind, TreeEditKind::Rename { target_path, .. } if paths_equal(target_path, &node.path))
     );
 
     let has_pending_edit = match pending_edit {
         Some(e) => match &e.kind {
             TreeEditKind::NewFolder { parent_path } | TreeEditKind::NewFile { parent_path } => {
-                parent_path.starts_with(&node.path)
+                path_starts_with(parent_path, &node.path)
             }
-            TreeEditKind::Rename { target_path, .. } => target_path.starts_with(&node.path),
+            TreeEditKind::Rename { target_path, .. } => path_starts_with(target_path, &node.path),
         },
         None => false,
     };
@@ -431,7 +430,7 @@ fn render_file_node_with_buf(
         } else {
             let is_selected = selected_node
                 .as_ref()
-                .map(|(p, _)| p == &node.path)
+                .map(|(p, _)| paths_equal(p, &node.path))
                 .unwrap_or(false);
             ui.horizontal(|ui| {
                 ui.add_space(indent);
@@ -482,14 +481,18 @@ fn render_file_node_with_buf(
         if node.expanded {
             if let Some(edit) = pending_edit.as_mut() {
                 match &edit.kind {
-                    TreeEditKind::NewFolder { parent_path } if parent_path == &node.path => {
+                    TreeEditKind::NewFolder { parent_path }
+                        if paths_equal(parent_path, &node.path) =>
+                    {
                         ui.horizontal(|ui| {
                             ui.add_space((depth + 1) as f32 * 14.0);
                             ui.label("▸");
                             render_inline_tree_edit(ui, edit, edit_outcome);
                         });
                     }
-                    TreeEditKind::NewFile { parent_path } if parent_path == &node.path => {
+                    TreeEditKind::NewFile { parent_path }
+                        if paths_equal(parent_path, &node.path) =>
+                    {
                         ui.horizontal(|ui| {
                             ui.add_space((depth + 1) as f32 * 14.0 + 14.0);
                             render_inline_tree_edit(ui, edit, edit_outcome);
@@ -503,9 +506,7 @@ fn render_file_node_with_buf(
                 render_file_node_with_buf(
                     ui,
                     child,
-                    current_path,
-                    is_current_dirty,
-                    unsaved_files,
+                    doc,
                     selected_node,
                     pending_edit,
                     tree_action,
@@ -526,12 +527,12 @@ fn render_file_node_with_buf(
     } else if row_above_clip {
         ui.add_space(row_height);
     } else {
+        let current_path = Path::new(&doc.path);
         let is_selected = match selected_node.as_ref() {
-            Some((sel_path, _)) => sel_path == &node.path,
-            None => current_path == node.path,
+            Some((sel_path, _)) => paths_equal(sel_path, &node.path),
+            None => !doc.path.is_empty() && paths_equal(current_path, &node.path),
         };
-        let is_dirty = (current_path == node.path && is_current_dirty)
-            || (!unsaved_files.is_empty() && unsaved_files.contains_key(&node.path));
+        let is_dirty = doc.is_file_dirty(&node.path);
         ui.horizontal(|ui| {
             ui.add_space(indent + 14.0);
             let resp = if is_dirty {
@@ -727,7 +728,7 @@ impl FileExplorer {
         }
 
         if let Some((ref sel_path, _)) = self.selected_node {
-            if sel_path == path || (is_dir && sel_path.starts_with(path)) {
+            if paths_equal(sel_path, path) || (is_dir && path_starts_with(sel_path, path)) {
                 self.selected_node = None;
             }
         }
@@ -736,10 +737,12 @@ impl FileExplorer {
             let matches_deleted = match &edit.kind {
                 TreeEditKind::NewFolder { parent_path }
                 | TreeEditKind::NewFile { parent_path } => {
-                    parent_path == path || (is_dir && parent_path.starts_with(path))
+                    paths_equal(parent_path, path)
+                        || (is_dir && path_starts_with(parent_path, path))
                 }
                 TreeEditKind::Rename { target_path, .. } => {
-                    target_path == path || (is_dir && target_path.starts_with(path))
+                    paths_equal(target_path, path)
+                        || (is_dir && path_starts_with(target_path, path))
                 }
             };
             if matches_deleted {
@@ -826,10 +829,10 @@ impl FileExplorer {
         fs::rename(old_path, &new_path).ok()?;
 
         if let Some((ref mut sel_path, _)) = self.selected_node {
-            if sel_path == old_path {
+            if paths_equal(sel_path, old_path) {
                 *sel_path = new_path.clone();
             } else if is_dir {
-                if let Ok(rel) = sel_path.strip_prefix(old_path) {
+                if let Some(rel) = path_strip_prefix(sel_path, old_path) {
                     *sel_path = new_path.join(rel);
                 }
             }
@@ -894,9 +897,6 @@ impl FileExplorer {
                 let mut file_to_open: Option<PathBuf> = None;
                 let mut tree_action: Option<TreeAction> = None;
                 let mut edit_outcome: Option<TreeEditOutcome> = None;
-                let current_path = Path::new(&doc.path);
-                let is_current_dirty = doc.is_current_dirty;
-                let unsaved_files = &doc.unsaved_files;
                 let selected_node = &mut self.selected_node;
                 let pending_edit = &mut self.pending_tree_edit;
                 let label_buf = &mut self.label_buf;
@@ -910,13 +910,17 @@ impl FileExplorer {
                             // Inline name editor for items being created at the project root.
                             if let Some(edit) = pending_edit.as_mut() {
                                 match &edit.kind {
-                                    TreeEditKind::NewFolder { parent_path } if *parent_path == root_path => {
+                                    TreeEditKind::NewFolder { parent_path }
+                                        if paths_equal(parent_path, &root_path) =>
+                                    {
                                         ui.horizontal(|ui| {
                                             ui.label("▸");
                                             render_inline_tree_edit(ui, edit, &mut edit_outcome);
                                         });
                                     }
-                                    TreeEditKind::NewFile { parent_path } if *parent_path == root_path => {
+                                    TreeEditKind::NewFile { parent_path }
+                                        if paths_equal(parent_path, &root_path) =>
+                                    {
                                         ui.horizontal(|ui| {
                                             ui.add_space(14.0);
                                             render_inline_tree_edit(ui, edit, &mut edit_outcome);
@@ -929,9 +933,7 @@ impl FileExplorer {
                                 render_file_node_with_buf(
                                     ui,
                                     child,
-                                    current_path,
-                                    is_current_dirty,
-                                    unsaved_files,
+                                    doc,
                                     selected_node,
                                     pending_edit,
                                     &mut tree_action,
