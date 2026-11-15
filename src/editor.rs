@@ -192,7 +192,9 @@ impl EditorBuffer for PieceTable {
 
     fn restore_undo_snapshot(&mut self, snapshot: &UndoSnapshot) {
         match snapshot {
-            UndoSnapshot::PieceTable(snap) => self.restore_snapshot(snap),
+            UndoSnapshot::PieceTable(snap) => {
+                let _ = self.restore_snapshot(snap);
+            }
             UndoSnapshot::FullText(text) => egui::TextBuffer::replace_with(self, text),
         }
     }
@@ -542,6 +544,13 @@ pub struct FastEditor<'a, T: EditorBuffer = String> {
     newline: &'static str,
 }
 
+#[derive(Clone, Copy)]
+enum EditOutcome {
+    Unchanged,
+    Edited(CCursorRange),
+    Restored(CCursorRange),
+}
+
 impl<'a, T: EditorBuffer> FastEditor<'a, T> {
     pub fn new(
         id: Id,
@@ -636,7 +645,7 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
         state: &mut FastEditorState,
         cursor_range: CCursorRange,
         text_changed: bool,
-    ) -> Option<CCursorRange> {
+    ) -> EditOutcome {
         match event {
             Event::Copy => {
                 let copy_range = if !self.pointer_moves_caret {
@@ -652,11 +661,11 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
                             .slice_chars(min_c.index.0.min(total)..max_c.index.0.min(total)),
                     );
                 }
-                None
+                EditOutcome::Unchanged
             }
             Event::Cut => {
                 if cursor_range.is_empty() {
-                    return None;
+                    return EditOutcome::Unchanged;
                 }
                 if !text_changed {
                     self.seed_pre_edit_snapshot(state, cursor_range);
@@ -668,11 +677,11 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
                         .slice_chars(min_c.index.0.min(total)..max_c.index.0.min(total)),
                 );
                 let ccursor = self.text.delete_selected(&cursor_range);
-                Some(CCursorRange::one(ccursor))
+                EditOutcome::Edited(CCursorRange::one(ccursor))
             }
             Event::Paste(text_to_insert) => {
                 if text_to_insert.is_empty() {
-                    return None;
+                    return EditOutcome::Unchanged;
                 }
                 if !text_changed {
                     self.seed_pre_edit_snapshot(state, cursor_range);
@@ -680,12 +689,12 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
                 let mut ccursor = self.text.delete_selected(&cursor_range);
                 self.text
                     .insert_text_at(&mut ccursor, text_to_insert, usize::MAX);
-                Some(CCursorRange::one(ccursor))
+                EditOutcome::Edited(CCursorRange::one(ccursor))
             }
             Event::Text(text_to_insert) => {
                 // Enter/Return is handled by Key::Enter to avoid double newlines
                 if text_to_insert.is_empty() || text_to_insert == "\n" || text_to_insert == "\r" {
-                    return None;
+                    return EditOutcome::Unchanged;
                 }
                 if !text_changed {
                     self.seed_pre_edit_snapshot(state, cursor_range);
@@ -693,7 +702,7 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
                 let mut ccursor = self.text.delete_selected(&cursor_range);
                 self.text
                     .insert_text_at(&mut ccursor, text_to_insert, usize::MAX);
-                Some(CCursorRange::one(ccursor))
+                EditOutcome::Edited(CCursorRange::one(ccursor))
             }
             Event::Key {
                 key: Key::Enter,
@@ -718,7 +727,7 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
                     self.text
                         .insert_text_at(&mut ccursor, &indent, usize::MAX);
                 }
-                Some(CCursorRange::one(ccursor))
+                EditOutcome::Edited(CCursorRange::one(ccursor))
             }
             Event::Key {
                 key: Key::Tab,
@@ -732,7 +741,7 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
                     }
                     let mut ccursor = self.text.delete_selected(&cursor_range);
                     self.text.insert_text_at(&mut ccursor, "    ", usize::MAX);
-                    Some(CCursorRange::one(ccursor))
+                    EditOutcome::Edited(CCursorRange::one(ccursor))
                 } else {
                     let [min_c, max_c] = cursor_range.sorted_cursors();
                     let total = self.text.char_count();
@@ -779,12 +788,12 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
                     }
 
                     if any_deleted {
-                        Some(CCursorRange::two(
+                        EditOutcome::Edited(CCursorRange::two(
                             CCursor::new(new_secondary),
                             CCursor::new(new_primary),
                         ))
                     } else {
-                        None
+                        EditOutcome::Unchanged
                     }
                 }
             }
@@ -813,7 +822,7 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
                 } else {
                     self.text.delete_selected(&cursor_range)
                 };
-                Some(CCursorRange::one(ccursor))
+                EditOutcome::Edited(CCursorRange::one(ccursor))
             }
             Event::Key {
                 key: Key::Delete,
@@ -841,7 +850,7 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
                 } else {
                     self.text.delete_selected(&cursor_range)
                 };
-                Some(CCursorRange::one(ccursor))
+                EditOutcome::Edited(CCursorRange::one(ccursor))
             }
             Event::Key {
                 key: Key::Z,
@@ -862,17 +871,19 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
                 if let Some((undo_range, undo_snap)) = undo_target {
                     self.text.restore_undo_snapshot(&undo_snap);
                     state.last_undo_snapshot = Some(undo_snap);
-                    Some(undo_range)
+                    EditOutcome::Restored(undo_range)
                 } else {
-                    None
+                    EditOutcome::Unchanged
                 }
             }
             Event::Key {
-                key: Key::Z,
+                key,
                 pressed: true,
                 modifiers,
                 ..
-            } if modifiers.command && modifiers.shift => {
+            } if (*key == Key::Z && modifiers.command && modifiers.shift)
+                || (*key == Key::Y && modifiers.command) =>
+            {
                 let current_snap = match &state.last_undo_snapshot {
                     Some(s) if !text_changed => s.clone(),
                     _ => self.text.undo_snapshot(),
@@ -886,36 +897,12 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
                 if let Some((redo_range, redo_snap)) = redo_target {
                     self.text.restore_undo_snapshot(&redo_snap);
                     state.last_undo_snapshot = Some(redo_snap);
-                    Some(redo_range)
+                    EditOutcome::Restored(redo_range)
                 } else {
-                    None
+                    EditOutcome::Unchanged
                 }
             }
-            Event::Key {
-                key: Key::Y,
-                pressed: true,
-                modifiers,
-                ..
-            } if modifiers.command => {
-                let current_snap = match &state.last_undo_snapshot {
-                    Some(s) if !text_changed => s.clone(),
-                    _ => self.text.undo_snapshot(),
-                };
-                let redo_target = state
-                    .undoer
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .redo(&(cursor_range, current_snap))
-                    .cloned();
-                if let Some((redo_range, redo_snap)) = redo_target {
-                    self.text.restore_undo_snapshot(&redo_snap);
-                    state.last_undo_snapshot = Some(redo_snap);
-                    Some(redo_range)
-                } else {
-                    None
-                }
-            }
-            _ => None,
+            _ => EditOutcome::Unchanged,
         }
     }
 
@@ -1038,6 +1025,7 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
 
         let os = ui.ctx().os();
         let mut text_changed = false;
+        let mut should_feed_undoer = false;
         // Keep editor focus if Escape was pressed while editor had focus on the previous frame
         let has_focus = restore_focus_on_escape(ui, &response, self.id);
 
@@ -1082,7 +1070,7 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
                     continue;
                 }
 
-                let mutated = match event {
+                let outcome = match event {
                     Event::Key {
                         key: Key::PageUp,
                         pressed: true,
@@ -1128,11 +1116,22 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
                     ),
                 };
 
-                if let Some(new_ccursor_range) = mutated {
-                    text_changed = true;
-                    state.last_interaction_time = now;
-                    cursor_range = new_ccursor_range;
-                    pending_relayout = true;
+                match outcome {
+                    EditOutcome::Edited(new_ccursor_range) => {
+                        text_changed = true;
+                        should_feed_undoer = true;
+                        state.last_interaction_time = now;
+                        cursor_range = new_ccursor_range;
+                        pending_relayout = true;
+                    }
+                    EditOutcome::Restored(new_ccursor_range) => {
+                        text_changed = true;
+                        should_feed_undoer = false;
+                        state.last_interaction_time = now;
+                        cursor_range = new_ccursor_range;
+                        pending_relayout = true;
+                    }
+                    EditOutcome::Unchanged => {}
                 }
             }
 
@@ -1144,7 +1143,7 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
 
         state.cursor.set_char_range(Some(cursor_range));
 
-        if text_changed {
+        if should_feed_undoer {
             let snap = self.text.undo_snapshot();
             state
                 .undoer
@@ -1378,6 +1377,7 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
                                 .min(window_end_char - window_start_char),
                         ),
                     );
+                    let prev_clamped_sec = clamped_local.secondary.index.0;
                     local_cursor_state.set_char_range(Some(clamped_local));
 
                     let did_interact = local_cursor_state.pointer_interaction(
@@ -1391,8 +1391,16 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
                         response.request_focus();
                         state.last_interaction_time = ui.input(|i| i.time);
                         if let Some(r) = local_cursor_state.char_range() {
+                            let secondary = if is_being_dragged
+                                && !response.clicked()
+                                && r.secondary.index.0 == prev_clamped_sec
+                            {
+                                ccursor_range.secondary
+                            } else {
+                                CCursor::new((window_start_char + r.secondary.index.0).min(total_chars))
+                            };
                             ccursor_range = CCursorRange::two(
-                                CCursor::new((window_start_char + r.secondary.index.0).min(total_chars)),
+                                secondary,
                                 CCursor::new((window_start_char + r.primary.index.0).min(total_chars)),
                             );
                         }
@@ -1406,6 +1414,7 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
         }
 
         let mut text_changed = false;
+        let mut should_feed_undoer = false;
         let has_focus = restore_focus_on_escape(ui, &response, self.id);
 
         if has_focus {
@@ -1533,19 +1542,27 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
                         }
                         state.last_interaction_time = now;
                     }
-                    _ => {
-                        if let Some(new_ccursor_range) = self.handle_common_edit_event(
-                            ui,
-                            event,
-                            &mut state,
-                            ccursor_range,
-                            text_changed,
-                        ) {
+                    _ => match self.handle_common_edit_event(
+                        ui,
+                        event,
+                        &mut state,
+                        ccursor_range,
+                        text_changed,
+                    ) {
+                        EditOutcome::Edited(new_ccursor_range) => {
                             text_changed = true;
+                            should_feed_undoer = true;
                             state.last_interaction_time = now;
                             ccursor_range = new_ccursor_range;
                         }
-                    }
+                        EditOutcome::Restored(new_ccursor_range) => {
+                            text_changed = true;
+                            should_feed_undoer = false;
+                            state.last_interaction_time = now;
+                            ccursor_range = new_ccursor_range;
+                        }
+                        EditOutcome::Unchanged => {}
+                    },
                 }
             }
         }
@@ -1577,7 +1594,7 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
 
         state.cursor.set_char_range(Some(ccursor_range));
 
-        if text_changed {
+        if should_feed_undoer {
             let snap = self.text.undo_snapshot();
             state
                 .undoer
@@ -1807,13 +1824,7 @@ fn update_accesskit(
         };
 
         if row_unchanged {
-            let sub_ui = ui.new_child(
-                egui::UiBuilder::new()
-                    .id_salt(("accesskit_row", row_id))
-                    .accessibility_parent(id),
-            );
-            let container_id = sub_ui.unique_id();
-            sub_ui.ctx().accesskit_node_builder(container_id, |builder| {
+            ui.ctx().accesskit_node_builder(id, |builder| {
                 if !builder.children().contains(&row_accesskit_id) {
                     builder.push_child(row_accesskit_id);
                 }

@@ -818,10 +818,12 @@ impl FileExplorer {
         }
         let parent = old_path.parent()?;
         let new_path = parent.join(new_name);
-        if new_path == old_path || new_path.exists() {
-            if new_path != old_path {
-                self.last_fs_error = Some(format!("Target already exists: {new_name}"));
+        if paths_equal(&new_path, old_path) {
+            if new_path == old_path {
+                return None;
             }
+        } else if new_path.exists() {
+            self.last_fs_error = Some(format!("Target already exists: {new_name}"));
             return None;
         }
         if let Err(err) = fs::rename(old_path, &new_path) {

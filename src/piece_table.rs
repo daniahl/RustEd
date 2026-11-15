@@ -172,6 +172,7 @@ pub struct PieceTableSnapshot {
     original: Arc<str>,
     orig_checkpoints: Arc<[LineCheckpoint]>,
     pieces: Arc<Vec<Piece>>,
+    added_epoch: u64,
     total_chars: usize,
     total_bytes: usize,
     total_line_feeds: usize,
@@ -181,6 +182,7 @@ pub struct PieceTable {
     original: Arc<str>,
     orig_checkpoints: Arc<[LineCheckpoint]>,
     added: String,
+    added_epoch: u64,
     added_chars: usize,
     added_lfs: usize,
     /// Copy-on-write piece list: snapshots share it in O(1); edits call Arc::make_mut.
@@ -204,6 +206,7 @@ impl Clone for PieceTable {
             original: Arc::clone(&self.original),
             orig_checkpoints: Arc::clone(&self.orig_checkpoints),
             added: self.added.clone(),
+            added_epoch: self.added_epoch,
             added_chars: self.added_chars,
             added_lfs: self.added_lfs,
             pieces: Arc::clone(&self.pieces),
@@ -298,6 +301,7 @@ impl PieceTable {
             original,
             orig_checkpoints: Arc::from(checkpoints),
             added: String::new(),
+            added_epoch: 0,
             added_chars: 0,
             added_lfs: 0,
             pieces: Arc::new(pieces),
@@ -316,28 +320,36 @@ impl PieceTable {
             original: Arc::clone(&self.original),
             orig_checkpoints: Arc::clone(&self.orig_checkpoints),
             pieces: Arc::clone(&self.pieces),
+            added_epoch: self.added_epoch,
             total_chars: self.total_chars,
             total_bytes: self.total_bytes,
             total_line_feeds: self.total_line_feeds,
         }
     }
 
+    fn snapshot_added_valid(&self, snapshot: &PieceTableSnapshot) -> bool {
+        snapshot.pieces.iter().all(|p| {
+            p.buffer != BufferType::Added
+                || (snapshot.added_epoch == self.added_epoch
+                    && p.start + p.length <= self.added.len())
+        })
+    }
+
     /// Restores piece descriptors from a previously captured `PieceTableSnapshot` in O(P) time.
-    pub fn restore_snapshot(&mut self, snapshot: &PieceTableSnapshot) {
-        if snapshot
-            .pieces
-            .iter()
-            .all(|p| p.buffer != BufferType::Added || p.start + p.length <= self.added.len())
-        {
-            self.original = Arc::clone(&snapshot.original);
-            self.orig_checkpoints = Arc::clone(&snapshot.orig_checkpoints);
-            self.pieces = Arc::clone(&snapshot.pieces);
-            self.hint.set((0, 0));
-            self.total_chars = snapshot.total_chars;
-            self.total_bytes = snapshot.total_bytes;
-            self.total_line_feeds = snapshot.total_line_feeds;
-            self.cached_dirty.set(true);
+    /// Returns `false` if the snapshot references `added` buffer offsets from a different epoch.
+    pub fn restore_snapshot(&mut self, snapshot: &PieceTableSnapshot) -> bool {
+        if !self.snapshot_added_valid(snapshot) {
+            return false;
         }
+        self.original = Arc::clone(&snapshot.original);
+        self.orig_checkpoints = Arc::clone(&snapshot.orig_checkpoints);
+        self.pieces = Arc::clone(&snapshot.pieces);
+        self.hint.set((0, 0));
+        self.total_chars = snapshot.total_chars;
+        self.total_bytes = snapshot.total_bytes;
+        self.total_line_feeds = snapshot.total_line_feeds;
+        self.cached_dirty.set(true);
+        true
     }
 
     /// Returns `true` if the current buffer contents match `snapshot` without flattening.
@@ -357,11 +369,7 @@ impl PieceTable {
     }
 
     fn eq_snapshot_content(&self, snapshot: &PieceTableSnapshot) -> bool {
-        if !snapshot
-            .pieces
-            .iter()
-            .all(|p| p.buffer != BufferType::Added || p.start + p.length <= self.added.len())
-        {
+        if !self.snapshot_added_valid(snapshot) {
             return false;
         }
         let mut a_idx = 0usize;
@@ -440,6 +448,7 @@ impl PieceTable {
         self.original = "".into();
         self.orig_checkpoints = Arc::from(&[][..]);
         self.added.clear();
+        self.added_epoch = self.added_epoch.wrapping_add(1);
         self.added_chars = 0;
         self.added_lfs = 0;
         self.pieces = Arc::new(Vec::new());
@@ -1361,6 +1370,7 @@ impl eframe::egui::TextBuffer for PieceTable {
         self.original = Arc::<str>::from(text);
         self.orig_checkpoints = Arc::from(checkpoints);
         self.added.clear();
+        self.added_epoch = self.added_epoch.wrapping_add(1);
         self.added_chars = 0;
         self.added_lfs = 0;
         self.hint.set((0, 0));

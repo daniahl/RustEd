@@ -304,7 +304,7 @@ impl TerminalPane {
                         if self.selecting_in_terminal {
                             true
                         } else {
-                            to_send.push(0x03);
+                            // `Event::Key` for `Ctrl+C` sends `0x03` right after `Event::Copy`.
                             false
                         }
                     }
@@ -412,10 +412,8 @@ impl TerminalPane {
         };
 
         if pty_updated {
-            self.selecting_in_terminal = false;
             ctx.data_mut(|d| {
                 let mut state = d.get_temp::<FastEditorState>(term_id).unwrap_or_default();
-                state.mouse_selection = None;
                 let target_range =
                     egui::text::CCursorRange::one(egui::text::CCursor::new(self.term_cursor_idx));
                 if state.cursor.char_range() != Some(target_range) {

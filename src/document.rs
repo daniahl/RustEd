@@ -116,7 +116,11 @@ fn write_piece_table_atomic(path: &Path, text: &PieceTable) -> std::io::Result<(
             Ok(())
         })();
 
-        if write_res.is_ok() && fs::rename(&temp_path, path).is_ok() {
+        if let Err(err) = write_res {
+            let _ = fs::remove_file(&temp_path);
+            return Err(err);
+        }
+        if fs::rename(&temp_path, path).is_ok() {
             return Ok(());
         }
         let _ = fs::remove_file(&temp_path);
