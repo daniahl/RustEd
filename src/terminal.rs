@@ -18,6 +18,8 @@ use std::{
 
 pub const TERM_ROWS: u16 = 30;
 pub const TERM_COLS: u16 = 120;
+/// Size of the read buffer for PTY output in bytes.
+pub const PTY_READ_BUF_SIZE: usize = 4096;
 
 /// Detects `\x1b[6n` (DSR cursor position request) within `chunk` or split across the
 /// previous chunk's trailing bytes (`tail[..*tail_len]`), updating the trailing buffer.
@@ -154,7 +156,7 @@ impl TerminalPane {
                 let shutdown_flag = Arc::clone(&shutdown);
                 let dsr_writer = pty_writer.clone();
                 thread::spawn(move || {
-                    let mut buf = [0u8; 4096];
+                    let mut buf = [0u8; PTY_READ_BUF_SIZE];
                     let mut dsr_tail = [0u8; 3];
                     let mut dsr_tail_len = 0usize;
                     while !shutdown_flag.load(Ordering::Relaxed) {

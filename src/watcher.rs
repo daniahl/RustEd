@@ -61,25 +61,47 @@ fn component_eq(a: Component<'_>, b: Component<'_>) -> bool {
     }
 }
 
-/// Produces a normalized key for $O(1)$ path deduplication in sets.
-fn path_dedup_key(path: &Path) -> PathBuf {
-    let norm = normalize_verbatim(path);
-    #[cfg(target_os = "windows")]
-    {
-        let mut out = PathBuf::new();
-        for comp in norm.components() {
-            let s = comp.as_os_str().to_string_lossy();
-            if s.is_ascii() {
-                out.push(s.to_ascii_lowercase());
-            } else {
-                out.push(s.to_lowercase());
+/// Normalized, hashable key for a path that ignores Windows verbatim prefixes,
+/// case, and separator differences. Used for O(1) deduplication in `HashSet`s.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct PathKey(PathBuf);
+
+impl PathKey {
+    pub fn new(path: &Path) -> Self {
+        let norm = normalize_verbatim(path);
+        #[cfg(target_os = "windows")]
+        {
+            let mut out = PathBuf::new();
+            for comp in norm.components() {
+                let s = comp.as_os_str().to_string_lossy();
+                if s.is_ascii() {
+                    out.push(s.to_ascii_lowercase());
+                } else {
+                    out.push(s.to_lowercase());
+                }
             }
+            Self(out)
         }
-        out
+        #[cfg(not(target_os = "windows"))]
+        {
+            Self(norm.into_owned())
+        }
     }
-    #[cfg(not(target_os = "windows"))]
-    {
-        norm.into_owned()
+
+    pub fn into_path_buf(self) -> PathBuf {
+        self.0
+    }
+}
+
+impl From<&Path> for PathKey {
+    fn from(path: &Path) -> Self {
+        Self::new(path)
+    }
+}
+
+impl From<&PathBuf> for PathKey {
+    fn from(path: &PathBuf) -> Self {
+        Self::new(path)
     }
 }
 
@@ -125,7 +147,7 @@ pub fn path_strip_prefix(path: &Path, base: &Path) -> Option<PathBuf> {
 #[derive(Default)]
 struct SharedQueue {
     batch: WatchBatch,
-    seen: HashSet<PathBuf>,
+    seen: HashSet<PathKey>,
 }
 
 impl SharedQueue {
@@ -140,7 +162,7 @@ impl SharedQueue {
             self.seen.clear();
         } else if !self.batch.rescan_all {
             for p in paths {
-                let key = path_dedup_key(&p);
+                let key = PathKey::from(&p);
                 if self.seen.insert(key) {
                     if self.batch.paths.len() >= MAX_QUEUED_PATHS {
                         self.batch.rescan_all = true;
@@ -454,13 +476,13 @@ fn run_windows_watch_loop(
 
     let mut io_pending = issue_read(&mut buffer, &mut overlapped);
     let mut pending_paths: Vec<PathBuf> = Vec::new();
-    let mut pending_seen: HashSet<PathBuf> = HashSet::new();
+    let mut pending_seen: HashSet<PathKey> = HashSet::new();
     let mut pending_rescan = false;
     let mut first_event_at: Option<std::time::Instant> = None;
     let mut last_event_at: Option<std::time::Instant> = None;
 
     let flush_pending = |paths: &mut Vec<PathBuf>,
-                         seen: &mut HashSet<PathBuf>,
+                         seen: &mut HashSet<PathKey>,
                          rescan: &mut bool,
                          first_at: &mut Option<std::time::Instant>,
                          last_at: &mut Option<std::time::Instant>| {
@@ -562,7 +584,7 @@ fn run_windows_watch_loop(
                             }
                             let rel = std::ffi::OsString::from_wide(&wide_name);
                             let full_path = dir.join(rel);
-                            let key = path_dedup_key(&full_path);
+                            let key = PathKey::from(&full_path);
                             if pending_seen.insert(key) {
                                 if pending_paths.len() >= MAX_QUEUED_PATHS {
                                     pending_rescan = true;

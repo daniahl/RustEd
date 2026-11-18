@@ -201,7 +201,7 @@ fn test_clean_reload_preserves_clamped_caret_and_dirty_conflict_protects_edits()
     assert!(!app.doc.is_current_dirty);
     fs::remove_file(&file_path).unwrap();
     app.process_fs_events(&ctx, &[file_path], false);
-    assert!(app.doc.path.is_empty());
+    assert!(app.doc.path.as_os_str().is_empty());
 
     let _ = fs::remove_dir_all(&root_dir);
 }

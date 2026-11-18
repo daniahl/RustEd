@@ -538,12 +538,12 @@ fn long_line_ctrl_a_delete_focus(
     });
     ctx.enable_accesskit();
     let mut app = TextEditor::new_headless(&temp_dir);
-    app.text = if no_spaces {
+    app.doc.text = if no_spaces {
         "a".repeat(len).into()
     } else {
         "word ".repeat(len / 5).into()
     };
-    app.text_revision = 1;
+    app.doc.text_revision = 1;
     app.focus_editor_pending = true;
 
     let key = |k: Key| Event::Key {
@@ -618,7 +618,7 @@ fn long_line_ctrl_a_delete_focus(
     for _ in 0..4 {
         frame(vec![], &mut app);
     }
-    assert!(app.text.is_empty());
+    assert!(app.doc.text.is_empty());
     let _ = std::fs::remove_dir_all(&temp_dir);
     history
 }
@@ -742,8 +742,8 @@ fn test_accesskit_selection_resyncs_after_window_refocus() {
     let ctx = egui::Context::default();
     ctx.enable_accesskit();
     let mut app = TextEditor::new_headless(&temp_dir);
-    app.text = "hello world\nsecond line".to_string().into();
-    app.text_revision = 1;
+    app.doc.text = "hello world\nsecond line".to_string().into();
+    app.doc.text_revision = 1;
     app.focus_editor_pending = true;
     let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), Vec2::new(900.0, 600.0));
     let mut tree: Option<accesskit_consumer::Tree> = None;

@@ -16,9 +16,14 @@ fn load_app_icon() -> Option<Arc<egui::IconData>> {
 }
 
 fn main() -> eframe::Result {
+    /// Default window size (width, height) in logical points.
+    const DEFAULT_WINDOW_SIZE: [f32; 2] = [1200.0, 800.0];
+    /// Minimum window size (width, height) in logical points.
+    const MIN_WINDOW_SIZE: [f32; 2] = [640.0, 400.0];
+
     let mut viewport = egui::ViewportBuilder::default()
-        .with_inner_size([1200.0, 800.0])
-        .with_min_inner_size([640.0, 400.0]);
+        .with_inner_size(DEFAULT_WINDOW_SIZE)
+        .with_min_inner_size(MIN_WINDOW_SIZE);
     if let Some(icon) = load_app_icon() {
         viewport = viewport.with_icon(icon);
     }

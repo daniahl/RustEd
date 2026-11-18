@@ -19,6 +19,19 @@ use std::{
 pub const CODE_EDITOR_ID: &str = "code_editor";
 pub const TERMINAL_ID: &str = "conpty_terminal";
 
+/// Inner margin around the editor text area.
+pub const EDITOR_MARGIN: Vec2 = Vec2::new(6.0, 2.0);
+/// Minimum editor wrap width in points.
+pub const MIN_WRAP_WIDTH: f32 = 100.0;
+/// Number of extra lines rendered above/below the viewport in virtualized mode.
+pub const VIRTUALIZED_OVERSCAN: usize = 4;
+/// Initial window size (in chars) for word-boundary scanning.
+pub const WORD_SCAN_WINDOW: usize = 256;
+/// Number of rows to jump for PageUp/PageDown.
+pub const PAGE_JUMP_ROWS: usize = 25;
+/// Tab insertion string (4 spaces).
+pub const TAB_INDENT: &str = "    ";
+
 pub fn code_editor_id() -> Id {
     Id::unique(CODE_EDITOR_ID)
 }
@@ -49,9 +62,65 @@ pub enum UndoSnapshot {
     FullText(Arc<str>),
 }
 
-pub trait EditorBuffer: egui::TextBuffer {
+/// Abstraction over editable text buffers (String, PieceTable).
+///
+/// Unlike `egui::TextBuffer`, this trait uses a closure-based `with_str` API
+/// so that buffers with interior mutability (e.g. PieceTable's lazy cache)
+/// can provide safe `&str` access without `unsafe` code.
+pub trait EditorBuffer {
+    /// Access the full text via a closure. Implementations may use a
+    /// zero-copy borrow (single-piece) or a lazily-built cache.
+    fn with_str<R>(&self, f: impl FnOnce(&str) -> R) -> R;
+
+    /// Insert `text` at character index, returning chars inserted.
+    fn insert_text(&mut self, text: &str, char_index: usize) -> usize;
+
+    /// Delete the character range `start..end`.
+    fn delete_char_range(&mut self, range: Range<usize>);
+
+    /// Replace the entire buffer with `text`.
+    fn replace_with(&mut self, text: &str);
+
+    // --- Convenience methods (formerly from egui::TextBuffer) ---
+
+    /// Delete the selected range, returning the collapsed cursor.
+    fn delete_selected(&mut self, cursor_range: &CCursorRange) -> CCursor {
+        let [min, max] = cursor_range.sorted_cursors();
+        self.delete_char_range(min.index.0..max.index.0);
+        min
+    }
+
+    /// Insert `text` at `ccursor`, advancing the cursor. Returns chars inserted.
+    fn insert_text_at(&mut self, ccursor: &mut CCursor, text: &str, _max_len: usize) -> usize {
+        let inserted = self.insert_text(text, ccursor.index.0);
+        ccursor.index.0 += inserted;
+        inserted
+    }
+
+    /// Delete the character before `ccursor` (Backspace).
+    fn delete_previous_char(&mut self, ccursor: CCursor) -> CCursor {
+        let idx = ccursor.index.0;
+        if idx > 0 {
+            self.delete_char_range((idx - 1)..idx);
+            CCursor::new(idx - 1)
+        } else {
+            ccursor
+        }
+    }
+
+    /// Delete the character at `ccursor` (Delete key).
+    fn delete_next_char(&mut self, ccursor: CCursor) -> CCursor {
+        let idx = ccursor.index.0;
+        if idx < self.char_count() {
+            self.delete_char_range(idx..(idx + 1));
+        }
+        ccursor
+    }
+
+    // --- Higher-level text queries ---
+
     fn undo_snapshot(&self) -> UndoSnapshot {
-        UndoSnapshot::FullText(Arc::from(self.as_str()))
+        UndoSnapshot::FullText(self.with_str(|s| Arc::from(s)))
     }
 
     fn restore_undo_snapshot(&mut self, snapshot: &UndoSnapshot) {
@@ -61,48 +130,50 @@ pub trait EditorBuffer: egui::TextBuffer {
     }
 
     fn char_count(&self) -> usize {
-        self.as_str().chars().count()
+        self.with_str(|s| s.chars().count())
     }
 
     fn line_count(&self) -> usize {
-        self.as_str().bytes().filter(|&b| b == b'\n').count() + 1
+        self.with_str(|s| s.bytes().filter(|&b| b == b'\n').count() + 1)
     }
 
     fn line_to_char(&self, line_idx: usize) -> usize {
         if line_idx == 0 {
             return 0;
         }
-        let s = self.as_str();
-        let mut line = 0usize;
-        let mut chars = 0usize;
-        for c in s.chars() {
-            chars += 1;
-            if c == '\n' {
-                line += 1;
-                if line == line_idx {
-                    return chars;
+        self.with_str(|s| {
+            let mut line = 0usize;
+            let mut chars = 0usize;
+            for c in s.chars() {
+                chars += 1;
+                if c == '\n' {
+                    line += 1;
+                    if line == line_idx {
+                        return chars;
+                    }
                 }
             }
-        }
-        chars
+            chars
+        })
     }
 
     fn char_to_line_col(&self, char_idx: usize) -> (usize, usize) {
-        let s = self.as_str();
-        let mut line = 0usize;
-        let mut col = 0usize;
-        for (i, c) in s.chars().enumerate() {
-            if i == char_idx {
-                return (line, col);
+        self.with_str(|s| {
+            let mut line = 0usize;
+            let mut col = 0usize;
+            for (i, c) in s.chars().enumerate() {
+                if i == char_idx {
+                    return (line, col);
+                }
+                if c == '\n' {
+                    line += 1;
+                    col = 0;
+                } else {
+                    col += 1;
+                }
             }
-            if c == '\n' {
-                line += 1;
-                col = 0;
-            } else {
-                col += 1;
-            }
-        }
-        (line, col)
+            (line, col)
+        })
     }
 
     fn line_char_range(&self, line_idx: usize) -> Range<usize> {
@@ -121,10 +192,11 @@ pub trait EditorBuffer: egui::TextBuffer {
 
     fn extract_char_range(&self, char_range: Range<usize>, out: &mut String) {
         out.clear();
-        let s = self.as_str();
-        for c in s.chars().skip(char_range.start).take(char_range.end.saturating_sub(char_range.start)) {
-            out.push(c);
-        }
+        self.with_str(|s| {
+            for c in s.chars().skip(char_range.start).take(char_range.end.saturating_sub(char_range.start)) {
+                out.push(c);
+            }
+        });
     }
 
     fn slice_chars(&self, char_range: Range<usize>) -> String {
@@ -138,7 +210,7 @@ pub trait EditorBuffer: egui::TextBuffer {
         if end == 0 {
             return CCursor::new(0);
         }
-        let mut window = 256usize;
+        let mut window = WORD_SCAN_WINDOW;
         let mut buf = String::new();
         loop {
             let start = end.saturating_sub(window);
@@ -158,7 +230,7 @@ pub trait EditorBuffer: egui::TextBuffer {
         if start >= total {
             return CCursor::new(total);
         }
-        let mut window = 256usize;
+        let mut window = WORD_SCAN_WINDOW;
         let mut buf = String::new();
         loop {
             let end = (start + window).min(total);
@@ -175,17 +247,62 @@ pub trait EditorBuffer: egui::TextBuffer {
     }
 
     fn delete_prev_word(&mut self, ccursor: CCursor) -> CCursor {
-        egui::TextBuffer::delete_previous_word(self, ccursor)
+        let target = self.prev_word_ccursor(ccursor);
+        let end = ccursor.index.0.min(self.char_count());
+        if target.index.0 < end {
+            self.delete_char_range(target.index.0..end);
+        }
+        target
     }
 
     fn delete_nxt_word(&mut self, ccursor: CCursor) -> CCursor {
-        egui::TextBuffer::delete_next_word(self, ccursor)
+        let start = ccursor.index.0.min(self.char_count());
+        let target = self.next_word_ccursor(ccursor);
+        if target.index.0 > start {
+            self.delete_char_range(start..target.index.0);
+        }
+        CCursor::new(start)
     }
 }
 
-impl EditorBuffer for String {}
+impl EditorBuffer for String {
+    fn with_str<R>(&self, f: impl FnOnce(&str) -> R) -> R {
+        f(self.as_str())
+    }
+
+    fn insert_text(&mut self, text: &str, char_index: usize) -> usize {
+        egui::TextBuffer::insert_text(self, text, egui::text::CharIndex(char_index))
+    }
+
+    fn delete_char_range(&mut self, range: Range<usize>) {
+        egui::TextBuffer::delete_char_range(
+            self,
+            egui::text::CharIndex(range.start)..egui::text::CharIndex(range.end),
+        );
+    }
+
+    fn replace_with(&mut self, text: &str) {
+        egui::TextBuffer::replace_with(self, text);
+    }
+}
 
 impl EditorBuffer for PieceTable {
+    fn with_str<R>(&self, f: impl FnOnce(&str) -> R) -> R {
+        PieceTable::with_str(self, f)
+    }
+
+    fn insert_text(&mut self, text: &str, char_index: usize) -> usize {
+        PieceTable::insert_text(self, text, char_index)
+    }
+
+    fn delete_char_range(&mut self, range: Range<usize>) {
+        PieceTable::delete_char_range(self, range);
+    }
+
+    fn replace_with(&mut self, text: &str) {
+        PieceTable::replace_with(self, text);
+    }
+
     fn undo_snapshot(&self) -> UndoSnapshot {
         UndoSnapshot::PieceTable(self.snapshot())
     }
@@ -195,7 +312,7 @@ impl EditorBuffer for PieceTable {
             UndoSnapshot::PieceTable(snap) => {
                 let _ = self.restore_snapshot(snap);
             }
-            UndoSnapshot::FullText(text) => egui::TextBuffer::replace_with(self, text),
+            UndoSnapshot::FullText(text) => self.replace_with(text),
         }
     }
 
@@ -231,7 +348,7 @@ impl EditorBuffer for PieceTable {
         let target_start = self.prev_word_ccursor(ccursor);
         let end = ccursor.index.0.min(self.char_count());
         if target_start.index.0 < end {
-            self.delete(target_start.index.0..end);
+            self.delete_char_range(target_start.index.0..end);
         }
         target_start
     }
@@ -240,7 +357,7 @@ impl EditorBuffer for PieceTable {
         let start = ccursor.index.0.min(self.char_count());
         let target_end = self.next_word_ccursor(ccursor);
         if target_end.index.0 > start {
-            self.delete(start..target_end.index.0);
+            self.delete_char_range(start..target_end.index.0);
         }
         CCursor::new(start)
     }
@@ -320,10 +437,13 @@ enum Layouter<'a, T> {
     Buffer(&'a mut dyn FnMut(&Ui, &T, f32) -> Arc<Galley>),
 }
 
-impl<'a, T: egui::TextBuffer> Layouter<'a, T> {
+impl<'a, T: EditorBuffer> Layouter<'a, T> {
     fn layout(&mut self, ui: &Ui, buffer: &T, wrap_width: f32) -> Arc<Galley> {
         match self {
-            Layouter::Str(f) => f(ui, buffer.as_str(), wrap_width),
+            Layouter::Str(f) => {
+                // Str layouter expects &str; use with_str to get it safely
+                buffer.with_str(|s| f(ui, s, wrap_width))
+            }
             Layouter::Buffer(f) => f(ui, buffer, wrap_width),
         }
     }
@@ -740,7 +860,7 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
                         self.seed_pre_edit_snapshot(state, cursor_range);
                     }
                     let mut ccursor = self.text.delete_selected(&cursor_range);
-                    self.text.insert_text_at(&mut ccursor, "    ", usize::MAX);
+                    self.text.insert_text_at(&mut ccursor, TAB_INDENT, usize::MAX);
                     EditOutcome::Edited(CCursorRange::one(ccursor))
                 } else {
                     let [min_c, max_c] = cursor_range.sorted_cursors();
@@ -772,8 +892,7 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
                             }
                             any_deleted = true;
                             self.text.delete_char_range(
-                                egui::text::CharIndex(line_range.start)
-                                    ..egui::text::CharIndex(line_range.start + remove_count),
+                                line_range.start..(line_range.start + remove_count),
                             );
                             let del_start = line_range.start;
                             if new_primary > del_start {
@@ -813,7 +932,7 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
                         let idx = cursor.index.0.min(self.text.char_count());
                         if idx >= 2 && self.text.slice_chars(idx - 2..idx) == "\r\n" {
                             self.text
-                                .delete_char_range(egui::text::CharIndex(idx - 2)..egui::text::CharIndex(idx));
+                                .delete_char_range((idx - 2)..idx);
                             CCursor::new(idx - 2)
                         } else {
                             self.text.delete_previous_char(cursor)
@@ -841,7 +960,7 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
                         let total = self.text.char_count();
                         if idx + 2 <= total && self.text.slice_chars(idx..idx + 2) == "\r\n" {
                             self.text
-                                .delete_char_range(egui::text::CharIndex(idx)..egui::text::CharIndex(idx + 2));
+                                .delete_char_range(idx..(idx + 2));
                             CCursor::new(idx)
                         } else {
                             self.text.delete_next_char(cursor)
@@ -906,12 +1025,121 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
         }
     }
 
+    /// Moves the primary cursor `rows` visual rows up/down via `galley`, keeping
+    /// the secondary cursor when `shift` is held (selection extension).
+    fn page_move_cursor(
+        galley: &Galley,
+        cursor_range: &mut CCursorRange,
+        rows: usize,
+        down: bool,
+        shift: bool,
+    ) {
+        let mut h_pos = None;
+        for _ in 0..rows {
+            if down {
+                (cursor_range.primary, h_pos) =
+                    galley.cursor_down_one_row(&cursor_range.primary, h_pos);
+            } else {
+                (cursor_range.primary, h_pos) =
+                    galley.cursor_up_one_row(&cursor_range.primary, h_pos);
+            }
+        }
+        if !shift {
+            cursor_range.secondary = cursor_range.primary;
+        }
+    }
+
+    /// Standard pointer interaction (click & drag moves the text caret).
+    fn handle_caret_pointer(
+        &mut self,
+        ui: &Ui,
+        response: &Response,
+        galley: &Galley,
+        galley_pos: Pos2,
+        state: &mut FastEditorState,
+        cursor_range: &mut CCursorRange,
+    ) {
+        if let Some(pointer_pos) = ui.ctx().pointer_interact_pos() {
+            if response.hovered() || response.dragged() || response.clicked() {
+                let is_being_dragged = ui.ctx().is_being_dragged(self.id);
+                let cursor_at_pointer = galley.cursor_from_pos(pointer_pos - galley_pos);
+                let did_interact = state.cursor.pointer_interaction(
+                    ui,
+                    response,
+                    cursor_at_pointer,
+                    galley,
+                    is_being_dragged,
+                );
+                if did_interact || response.clicked() {
+                    response.request_focus();
+                    state.last_interaction_time = ui.input(|i| i.time);
+                    if let Some(r) = state.cursor.range(galley) {
+                        *cursor_range = r;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Terminal-mode pointer interaction (selection without moving the PTY caret).
+    /// Left-drag selects; copy is deferred to `Event::Copy`/secondary click.
+    fn handle_selection_pointer(
+        &mut self,
+        ui: &Ui,
+        response: &Response,
+        galley: &Galley,
+        galley_pos: Pos2,
+        state: &mut FastEditorState,
+    ) {
+        if response.clicked() || response.secondary_clicked() {
+            response.request_focus();
+            state.last_interaction_time = ui.input(|i| i.time);
+        }
+        if response.secondary_clicked() {
+            if let Some(sel) = state
+                .mouse_selection
+                .take()
+                .filter(|sel| sel.primary != sel.secondary)
+            {
+                let [min_c, max_c] = sel.sorted_cursors();
+                let total = self.text.char_count();
+                let start = min_c.index.0.min(total);
+                let end = max_c.index.0.min(total);
+                if start < end {
+                    ui.ctx().copy_text(self.text.slice_chars(start..end));
+                }
+            }
+        } else if let Some(pointer_pos) = ui.ctx().pointer_interact_pos() {
+            let primary_pressed = ui.input(|i| i.pointer.primary_pressed());
+            let primary_down = ui.input(|i| i.pointer.primary_down());
+            if response.hovered() && primary_pressed {
+                response.request_focus();
+                let c = galley.cursor_from_pos(pointer_pos - galley_pos);
+                state.mouse_selection = Some(CCursorRange::one(c));
+            } else if response.dragged_by(egui::PointerButton::Primary)
+                || (ui.ctx().is_being_dragged(self.id) && primary_down)
+            {
+                if let Some(sel) = &mut state.mouse_selection {
+                    let c = galley.cursor_from_pos(pointer_pos - galley_pos);
+                    sel.primary = c;
+                }
+            }
+        }
+        if response.clicked()
+            && state
+                .mouse_selection
+                .is_some_and(|sel| sel.primary == sel.secondary)
+        {
+            state.mouse_selection = None;
+        }
+    }
+
     pub fn show(mut self, ui: &mut Ui) -> EditorOutput {
         if self.virtualized {
             return self.show_virtualized(ui);
         }
-        const MARGIN: Vec2 = Vec2::new(6.0, 2.0);
-        let wrap_width = (ui.available_width() - MARGIN.x * 2.0).max(100.0);
+        const MARGIN: Vec2 = EDITOR_MARGIN;
+        let wrap_width = (ui.available_width() - MARGIN.x * 2.0).max(MIN_WRAP_WIDTH);
 
         let (mut state, current_pass) = load_editor_state(ui, self.id);
 
@@ -927,7 +1155,7 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
         let text_unchanged = match &state.layout_cache {
             Some(c) => match (self.text_revision, c.text_revision) {
                 (Some(r1), Some(r2)) => r1 == r2,
-                _ => c.galley.text() == self.text.as_str(),
+                _ => self.text.with_str(|s| c.galley.text() == s),
             },
             None => false,
         };
@@ -959,68 +1187,9 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
 
         // Pointer interaction (mouse click & drag)
         if self.pointer_moves_caret {
-            if let Some(pointer_pos) = ui.ctx().pointer_interact_pos() {
-                if response.hovered() || response.dragged() || response.clicked() {
-                    let is_being_dragged = ui.ctx().is_being_dragged(self.id);
-                    let cursor_at_pointer = galley.cursor_from_pos(pointer_pos - galley_pos);
-                    let did_interact = state.cursor.pointer_interaction(
-                        ui,
-                        &response,
-                        cursor_at_pointer,
-                        &galley,
-                        is_being_dragged,
-                    );
-                    if did_interact || response.clicked() {
-                        response.request_focus();
-                        state.last_interaction_time = ui.input(|i| i.time);
-                        if let Some(r) = state.cursor.range(&galley) {
-                            cursor_range = r;
-                        }
-                    }
-                }
-            }
+            self.handle_caret_pointer(ui, &response, &galley, galley_pos, &mut state, &mut cursor_range);
         } else {
-            if response.clicked() || response.secondary_clicked() {
-                response.request_focus();
-                state.last_interaction_time = ui.input(|i| i.time);
-            }
-            if response.secondary_clicked() {
-                if let Some(sel) = state
-                    .mouse_selection
-                    .take()
-                    .filter(|sel| sel.primary != sel.secondary)
-                {
-                    let [min_c, max_c] = sel.sorted_cursors();
-                    let total = self.text.char_count();
-                    let start = min_c.index.0.min(total);
-                    let end = max_c.index.0.min(total);
-                    if start < end {
-                        ui.ctx().copy_text(self.text.slice_chars(start..end));
-                    }
-                }
-            } else if let Some(pointer_pos) = ui.ctx().pointer_interact_pos() {
-                let primary_pressed = ui.input(|i| i.pointer.primary_pressed());
-                let primary_down = ui.input(|i| i.pointer.primary_down());
-                if response.hovered() && primary_pressed {
-                    response.request_focus();
-                    let c = galley.cursor_from_pos(pointer_pos - galley_pos);
-                    state.mouse_selection = Some(CCursorRange::one(c));
-                } else if response.dragged_by(egui::PointerButton::Primary)
-                    || (ui.ctx().is_being_dragged(self.id) && primary_down)
-                {
-                    if let Some(sel) = &mut state.mouse_selection {
-                        let c = galley.cursor_from_pos(pointer_pos - galley_pos);
-                        sel.primary = c;
-                    }
-                }
-            }
-            if response.clicked()
-                && state
-                    .mouse_selection
-                    .is_some_and(|sel| sel.primary == sel.secondary)
-            {
-                state.mouse_selection = None;
-            }
+            self.handle_selection_pointer(ui, &response, &galley, galley_pos, &mut state);
         }
 
         let os = ui.ctx().os();
@@ -1077,15 +1246,13 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
                         modifiers,
                         ..
                     } => {
-                        let rows_to_jump = 25;
-                        let mut h_pos = None;
-                        for _ in 0..rows_to_jump {
-                            (cursor_range.primary, h_pos) =
-                                galley.cursor_up_one_row(&cursor_range.primary, h_pos);
-                        }
-                        if !modifiers.shift {
-                            cursor_range.secondary = cursor_range.primary;
-                        }
+                        Self::page_move_cursor(
+                            &galley,
+                            &mut cursor_range,
+                            PAGE_JUMP_ROWS,
+                            false,
+                            modifiers.shift,
+                        );
                         state.last_interaction_time = now;
                         continue;
                     }
@@ -1095,15 +1262,13 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
                         modifiers,
                         ..
                     } => {
-                        let rows_to_jump = 25;
-                        let mut h_pos = None;
-                        for _ in 0..rows_to_jump {
-                            (cursor_range.primary, h_pos) =
-                                galley.cursor_down_one_row(&cursor_range.primary, h_pos);
-                        }
-                        if !modifiers.shift {
-                            cursor_range.secondary = cursor_range.primary;
-                        }
+                        Self::page_move_cursor(
+                            &galley,
+                            &mut cursor_range,
+                            PAGE_JUMP_ROWS,
+                            true,
+                            modifiers.shift,
+                        );
                         state.last_interaction_time = now;
                         continue;
                     }
@@ -1259,8 +1424,8 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
     }
 
     fn show_virtualized(mut self, ui: &mut Ui) -> EditorOutput {
-        const MARGIN: Vec2 = Vec2::new(6.0, 2.0);
-        const OVERSCAN: usize = 4;
+        const MARGIN: Vec2 = EDITOR_MARGIN;
+        const OVERSCAN: usize = VIRTUALIZED_OVERSCAN;
 
         let font_id = egui::TextStyle::Monospace.resolve(ui.style());
         let text_color = ui.visuals().widgets.inactive.text_color();

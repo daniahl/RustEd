@@ -5,9 +5,9 @@
 //! extend piece descriptors without ever shifting or reallocating existing text in memory.
 
 use std::{
-    cell::{Cell, UnsafeCell},
+    cell::{Cell, RefCell},
     fmt,
-    ops::{Deref, Range},
+    ops::Range,
     sync::Arc,
 };
 
@@ -192,13 +192,10 @@ pub struct PieceTable {
     total_chars: usize,
     total_bytes: usize,
     total_line_feeds: usize,
-    cached_text: UnsafeCell<String>,
-    cached_dirty: Cell<bool>,
+    /// Lazily-flattened text cache. `None` means dirty (needs rebuild).
+    /// Uses `RefCell` for safe single-threaded interior mutability.
+    cached_text: RefCell<Option<String>>,
 }
-
-// Safety: PieceTable does not share interior mutability across threads.
-// Send allows transferring ownership between threads.
-unsafe impl Send for PieceTable {}
 
 impl Clone for PieceTable {
     fn clone(&self) -> Self {
@@ -214,8 +211,7 @@ impl Clone for PieceTable {
             total_chars: self.total_chars,
             total_bytes: self.total_bytes,
             total_line_feeds: self.total_line_feeds,
-            cached_text: UnsafeCell::new(String::new()),
-            cached_dirty: Cell::new(true),
+            cached_text: RefCell::new(None),
         }
     }
 }
@@ -309,8 +305,7 @@ impl PieceTable {
             total_chars: char_count,
             total_bytes: byte_len,
             total_line_feeds: line_feed_cnt,
-            cached_text: UnsafeCell::new(String::new()),
-            cached_dirty: Cell::new(true),
+            cached_text: RefCell::new(None),
         }
     }
 
@@ -348,7 +343,7 @@ impl PieceTable {
         self.total_chars = snapshot.total_chars;
         self.total_bytes = snapshot.total_bytes;
         self.total_line_feeds = snapshot.total_line_feeds;
-        self.cached_dirty.set(true);
+        *self.cached_text.borrow_mut() = None;
         true
     }
 
@@ -413,10 +408,7 @@ impl PieceTable {
 
     /// Releases any lazily flattened string cache without altering buffer contents.
     pub fn drop_cached_text(&mut self) {
-        unsafe {
-            *self.cached_text.get() = String::new();
-        }
-        self.cached_dirty.set(true);
+        *self.cached_text.borrow_mut() = None;
     }
 
     #[inline]
@@ -456,10 +448,7 @@ impl PieceTable {
         self.total_chars = 0;
         self.total_bytes = 0;
         self.total_line_feeds = 0;
-        unsafe {
-            (*self.cached_text.get()).clear();
-        }
-        self.cached_dirty.set(false);
+        *self.cached_text.borrow_mut() = None;
     }
 
     /// Finds the first piece whose end is >= `target` (char index, `<= total_chars`).
@@ -584,7 +573,7 @@ impl PieceTable {
         self.total_chars += text_chars;
         self.total_bytes += text_bytes;
         self.total_line_feeds += text_lf;
-        self.cached_dirty.set(true);
+        *self.cached_text.borrow_mut() = None;
 
         text_chars
     }
@@ -676,7 +665,7 @@ impl PieceTable {
         self.total_chars -= end - start;
         self.total_bytes = self.total_bytes - old_bytes + new_bytes;
         self.total_line_feeds = self.total_line_feeds - old_lfs + new_lfs;
-        self.cached_dirty.set(true);
+        *self.cached_text.borrow_mut() = None;
     }
 
     /// Merges contiguous pieces that point to adjacent regions in the same buffer in a single O(M) pass.
@@ -702,23 +691,23 @@ impl PieceTable {
         pieces.truncate(write + 1);
     }
 
-    /// Returns the flattened string view.
-    /// Zero-copy when the document consists of 0 or 1 piece; otherwise rebuilt on demand when dirty.
-    pub fn as_str(&self) -> &str {
+    /// Safely accesses the flattened text via a closure, using a `RefCell`-backed
+    /// lazy cache for multi-piece tables. For 0 or 1 piece the closure receives a
+    /// direct borrow with zero allocation.
+    pub fn with_str<R>(&self, f: impl FnOnce(&str) -> R) -> R {
         match self.pieces.as_slice() {
-            [] => "",
-            [p] => p.get_text(&self.original, &self.added),
+            [] => f(""),
+            [p] => f(p.get_text(&self.original, &self.added)),
             _ => {
-                if self.cached_dirty.get() {
-                    let s = unsafe { &mut *self.cached_text.get() };
-                    s.clear();
-                    s.reserve(self.total_bytes);
+                if self.cached_text.borrow().is_none() {
+                    let mut s = String::with_capacity(self.total_bytes);
                     for p in self.pieces.iter() {
                         s.push_str(p.get_text(&self.original, &self.added));
                     }
-                    self.cached_dirty.set(false);
+                    *self.cached_text.borrow_mut() = Some(s);
                 }
-                unsafe { (*self.cached_text.get()).as_str() }
+                let cache = self.cached_text.borrow();
+                f(cache.as_deref().unwrap())
             }
         }
     }
@@ -1211,36 +1200,6 @@ impl PieceTable {
 
         None
     }
-
-    #[inline]
-    pub fn as_bytes(&self) -> &[u8] {
-        self.as_str().as_bytes()
-    }
-}
-
-impl Deref for PieceTable {
-    type Target = str;
-
-    #[inline]
-    fn deref(&self) -> &Self::Target {
-        self.as_str()
-    }
-}
-
-impl AsRef<str> for PieceTable {
-    #[inline]
-    fn as_ref(&self) -> &str {
-        self.as_str()
-    }
-}
-
-impl fmt::Display for PieceTable {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for p in self.pieces.iter() {
-            f.write_str(p.get_text(&self.original, &self.added))?;
-        }
-        Ok(())
-    }
 }
 
 impl fmt::Debug for PieceTable {
@@ -1249,16 +1208,46 @@ impl fmt::Debug for PieceTable {
             .field("total_bytes", &self.total_bytes)
             .field("total_chars", &self.total_chars)
             .field("pieces_count", &self.pieces.len())
-            .field("text", &self.as_str())
+            .field("text", &self.build_string())
             .finish()
     }
 }
 
 impl PartialEq for PieceTable {
     fn eq(&self, other: &Self) -> bool {
-        self.total_bytes == other.total_bytes
-            && self.total_chars == other.total_chars
-            && self.as_str() == other.as_str()
+        if self.total_bytes != other.total_bytes || self.total_chars != other.total_chars {
+            return false;
+        }
+        let mut iter_a = self
+            .pieces
+            .iter()
+            .map(|p| p.get_text(&self.original, &self.added).as_bytes());
+        let mut iter_b = other
+            .pieces
+            .iter()
+            .map(|p| p.get_text(&other.original, &other.added).as_bytes());
+        let mut slice_a: &[u8] = &[];
+        let mut slice_b: &[u8] = &[];
+        loop {
+            while slice_a.is_empty() {
+                match iter_a.next() {
+                    Some(next) => slice_a = next,
+                    None => return iter_b.all(|s| s.is_empty()) && slice_b.is_empty(),
+                }
+            }
+            while slice_b.is_empty() {
+                match iter_b.next() {
+                    Some(next) => slice_b = next,
+                    None => return false,
+                }
+            }
+            let n = slice_a.len().min(slice_b.len());
+            if slice_a[..n] != slice_b[..n] {
+                return false;
+            }
+            slice_a = &slice_a[n..];
+            slice_b = &slice_b[n..];
+        }
     }
 }
 
@@ -1266,37 +1255,37 @@ impl Eq for PieceTable {}
 
 impl PartialEq<str> for PieceTable {
     fn eq(&self, other: &str) -> bool {
-        self.total_bytes == other.len() && self.as_str() == other
+        self.total_bytes == other.len() && self.eq_str(other)
     }
 }
 
 impl PartialEq<&str> for PieceTable {
     fn eq(&self, other: &&str) -> bool {
-        self.total_bytes == other.len() && self.as_str() == *other
+        self.total_bytes == other.len() && self.eq_str(other)
     }
 }
 
 impl PartialEq<String> for PieceTable {
     fn eq(&self, other: &String) -> bool {
-        self.total_bytes == other.len() && self.as_str() == other.as_str()
+        self.total_bytes == other.len() && self.eq_str(other.as_str())
     }
 }
 
 impl PartialEq<PieceTable> for str {
     fn eq(&self, other: &PieceTable) -> bool {
-        self.len() == other.total_bytes && self == other.as_str()
+        self.len() == other.total_bytes && other.eq_str(self)
     }
 }
 
 impl PartialEq<PieceTable> for &str {
     fn eq(&self, other: &PieceTable) -> bool {
-        self.len() == other.total_bytes && *self == other.as_str()
+        self.len() == other.total_bytes && other.eq_str(self)
     }
 }
 
 impl PartialEq<PieceTable> for String {
     fn eq(&self, other: &PieceTable) -> bool {
-        self.len() == other.total_bytes && self.as_str() == other.as_str()
+        self.len() == other.total_bytes && other.eq_str(self.as_str())
     }
 }
 
@@ -1338,32 +1327,22 @@ impl From<&PieceTable> for String {
     }
 }
 
-impl eframe::egui::TextBuffer for PieceTable {
-    fn is_mutable(&self) -> bool {
-        true
+// Inherent methods replacing the former `egui::TextBuffer` impl.
+// `EditorBuffer` in editor.rs provides the trait abstraction.
+
+impl PieceTable {
+    /// Inserts `text` at `char_index`, returning the number of characters inserted.
+    pub fn insert_text(&mut self, text: &str, char_index: usize) -> usize {
+        self.insert(char_index, text)
     }
 
-    fn as_str(&self) -> &str {
-        self.as_str()
+    /// Deletes the character range `start..end`.
+    pub fn delete_char_range(&mut self, range: Range<usize>) {
+        self.delete(range);
     }
 
-    fn insert_text(&mut self, text: &str, char_index: eframe::egui::text::CharIndex) -> usize {
-        self.insert(char_index.0, text)
-    }
-
-    fn delete_char_range(&mut self, char_range: Range<eframe::egui::text::CharIndex>) {
-        self.delete(char_range.start.0..char_range.end.0);
-    }
-
-    fn type_id(&self) -> std::any::TypeId {
-        std::any::TypeId::of::<Self>()
-    }
-
-    fn clear(&mut self) {
-        self.clear();
-    }
-
-    fn replace_with(&mut self, text: &str) {
+    /// Replaces the entire buffer contents with `text`.
+    pub fn replace_with(&mut self, text: &str) {
         let byte_len = text.len();
         let (char_count, line_feed_cnt, checkpoints) = scan_str_with_checkpoints(text);
 
@@ -1390,13 +1369,11 @@ impl eframe::egui::TextBuffer for PieceTable {
         self.total_chars = char_count;
         self.total_bytes = byte_len;
         self.total_line_feeds = line_feed_cnt;
-        unsafe {
-            (*self.cached_text.get()).clear();
-        }
-        self.cached_dirty.set(true);
+        *self.cached_text.borrow_mut() = None;
     }
 
-    fn take(&mut self) -> String {
+    /// Takes the buffer contents as an owned `String`, leaving the table empty.
+    pub fn take(&mut self) -> String {
         let s = self.build_string();
         self.clear();
         s

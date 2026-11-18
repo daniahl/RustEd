@@ -4,6 +4,7 @@
 //! of files and folders, context menus, and trash/recycle bin operations.
 
 use crate::{
+    app::{SIDEBAR_DEFAULT_WIDTH, SIDEBAR_MIN_WIDTH},
     document::Document,
     watcher::{path_starts_with, path_strip_prefix, paths_equal},
 };
@@ -507,10 +508,10 @@ fn render_file_node_with_buf(
     } else if row_above_clip {
         ui.add_space(row_height);
     } else {
-        let current_path = Path::new(&doc.path);
+        let current_path = &doc.path;
         let is_selected = match selected_node.as_ref() {
             Some((sel_path, _)) => paths_equal(sel_path, &node.path),
-            None => !doc.path.is_empty() && paths_equal(current_path, &node.path),
+            None => !doc.path.as_os_str().is_empty() && paths_equal(current_path, &node.path),
         };
         let is_dirty = doc.is_file_dirty(&node.path);
         ui.horizontal(|ui| {
@@ -553,7 +554,7 @@ fn render_file_node_with_buf(
 }
 
 pub struct FileExplorer {
-    pub folder_path: String,
+    pub folder_path: PathBuf,
     pub tree_root: Option<FileNode>,
     pub selected_node: Option<(PathBuf, bool)>,
     pub pending_tree_edit: Option<PendingTreeEdit>,
@@ -563,10 +564,9 @@ pub struct FileExplorer {
 
 impl FileExplorer {
     pub fn new(folder: PathBuf) -> Self {
-        let folder_path = folder.to_string_lossy().into_owned();
-        let tree_root = Some(FileNode::new_root(folder));
+        let tree_root = Some(FileNode::new_root(folder.clone()));
         Self {
-            folder_path,
+            folder_path: folder,
             tree_root,
             selected_node: None,
             pending_tree_edit: None,
@@ -579,13 +579,12 @@ impl FileExplorer {
         self.pending_tree_edit = None;
         self.selected_node = None;
         self.last_fs_error = None;
-        self.folder_path = path.to_string_lossy().into_owned();
+        self.folder_path = path.clone();
         self.tree_root = Some(FileNode::new_root(path));
     }
 
     pub fn open_parent_folder(&mut self) {
-        let p = PathBuf::from(&self.folder_path);
-        if let Some(parent) = p.parent() {
+        if let Some(parent) = self.folder_path.parent() {
             if !parent.as_os_str().is_empty() {
                 self.open_folder(parent.to_path_buf());
             }
@@ -891,8 +890,8 @@ impl FileExplorer {
         let ctx = &ctx;
         egui::Panel::left("explorer_sidebar")
             .resizable(true)
-            .default_size(220.0)
-            .min_size(140.0)
+            .default_size(SIDEBAR_DEFAULT_WIDTH)
+            .min_size(SIDEBAR_MIN_WIDTH)
             .show(ui, |ui| {
                 if let Some(err_msg) = self.last_fs_error.as_deref() {
                     let mut clear_err = false;

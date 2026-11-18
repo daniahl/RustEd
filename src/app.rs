@@ -11,7 +11,6 @@ use crate::{
 };
 use eframe::egui;
 use std::{
-    ops::{Deref, DerefMut},
     path::{Path, PathBuf},
 };
 
@@ -21,6 +20,13 @@ pub enum Tab {
     Editor,
     Terminal,
 }
+
+/// Status bar height in points.
+pub const STATUS_BAR_HEIGHT: f32 = 22.0;
+/// Default sidebar width in points.
+pub const SIDEBAR_DEFAULT_WIDTH: f32 = 220.0;
+/// Minimum sidebar width in points.
+pub const SIDEBAR_MIN_WIDTH: f32 = 140.0;
 
 pub struct TextEditor {
     pub tab: Tab,
@@ -35,21 +41,17 @@ pub struct TextEditor {
     pub focus_editor_pending: bool,
 }
 
-impl Deref for TextEditor {
-    type Target = Document;
-
-    fn deref(&self) -> &Self::Target {
+impl TextEditor {
+    /// Access the active document.
+    pub fn doc(&self) -> &Document {
         &self.doc
     }
-}
 
-impl DerefMut for TextEditor {
-    fn deref_mut(&mut self) -> &mut Self::Target {
+    /// Mutably access the active document.
+    pub fn doc_mut(&mut self) -> &mut Document {
         &mut self.doc
     }
-}
 
-impl TextEditor {
     pub fn new(ctx: egui::Context) -> Self {
         Self::new_with_folder(ctx, folder_from_args(std::env::args().skip(1)))
     }
@@ -70,8 +72,8 @@ impl TextEditor {
         let terminal = TerminalPane::new(ctx.clone(), Some(&initial_folder));
         let watcher = Some(FileWatcher::new(ctx, &initial_folder));
         let explorer = FileExplorer::new(initial_folder);
-        let folder_input = explorer.folder_path.clone();
-        let last_synced_folder = explorer.folder_path.clone();
+        let folder_input = explorer.folder_path.to_string_lossy().into_owned();
+        let last_synced_folder = explorer.folder_path.to_string_lossy().into_owned();
         let doc = Document::new();
 
         Self {
@@ -89,8 +91,8 @@ impl TextEditor {
     pub fn new_headless(folder: &Path) -> Self {
         let terminal = TerminalPane::new_headless();
         let explorer = FileExplorer::new(folder.to_path_buf());
-        let folder_input = explorer.folder_path.clone();
-        let last_synced_folder = explorer.folder_path.clone();
+        let folder_input = explorer.folder_path.to_string_lossy().into_owned();
+        let last_synced_folder = explorer.folder_path.to_string_lossy().into_owned();
         let doc = Document::new();
 
         Self {
@@ -132,10 +134,10 @@ impl TextEditor {
     ) -> Option<PathBuf> {
         self.explorer.refresh_watched_paths(paths, rescan_all);
 
-        if self.doc.path.is_empty() {
+        if self.doc.path.as_os_str().is_empty() {
             return None;
         }
-        let doc_path = PathBuf::from(&self.doc.path);
+        let doc_path = self.doc.path.clone();
         let touches_doc = rescan_all
             || paths
                 .iter()
@@ -169,8 +171,8 @@ impl TextEditor {
 
     fn sync_watcher(&mut self) {
         if let Some(watcher) = &mut self.watcher {
-            watcher.watch_root(Path::new(&self.explorer.folder_path));
-            let active = (!self.doc.path.is_empty()).then(|| Path::new(&self.doc.path));
+            watcher.watch_root(&self.explorer.folder_path);
+            let active = if !self.doc.path.as_os_str().is_empty() { Some(self.doc.path.as_path()) } else { None };
             watcher.watch_extra_file(active);
         }
     }
@@ -249,9 +251,11 @@ impl TextEditor {
                 }
 
                 if self.tab == Tab::Editor {
-                    if self.last_synced_folder != self.explorer.folder_path {
-                        self.folder_input = self.explorer.folder_path.clone();
-                        self.last_synced_folder = self.explorer.folder_path.clone();
+                    let current_folder = self.explorer.folder_path.to_string_lossy();
+                    if self.last_synced_folder != current_folder.as_ref() {
+                        let owned = current_folder.into_owned();
+                        self.folder_input = owned.clone();
+                        self.last_synced_folder = owned;
                     }
                     ui.separator();
                     ui.label("Project folder:");
@@ -261,8 +265,8 @@ impl TextEditor {
 
                     if enter_pressed {
                         self.explorer.open_folder(PathBuf::from(&self.folder_input));
-                        self.folder_input = self.explorer.folder_path.clone();
-                        self.last_synced_folder = self.explorer.folder_path.clone();
+                        self.folder_input = self.explorer.folder_path.to_string_lossy().into_owned();
+                        self.last_synced_folder = self.folder_input.clone();
                     }
 
                     if ui
@@ -272,8 +276,8 @@ impl TextEditor {
                     {
                         if let Some(folder) = pick_folder(&self.explorer.folder_path) {
                             self.explorer.open_folder(folder);
-                            self.folder_input = self.explorer.folder_path.clone();
-                            self.last_synced_folder = self.explorer.folder_path.clone();
+                            self.folder_input = self.explorer.folder_path.to_string_lossy().into_owned();
+                            self.last_synced_folder = self.folder_input.clone();
                         }
                     }
 
@@ -295,8 +299,8 @@ impl TextEditor {
                         .on_hover_text("Restart the active terminal")
                         .clicked()
                     {
-                        let cwd = Path::new(&self.explorer.folder_path);
-                        let working_dir = if cwd.is_dir() { Some(cwd) } else { None };
+                        let cwd = &self.explorer.folder_path;
+                        let working_dir = if cwd.is_dir() { Some(cwd.as_path()) } else { None };
                         self.terminal.restart(ctx, working_dir);
                     }
                 }
@@ -304,7 +308,7 @@ impl TextEditor {
         });
 
         egui::Panel::bottom("status_bar")
-            .exact_size(22.0)
+            .exact_size(STATUS_BAR_HEIGHT)
             .show(ui, |ui| {
                 ui.style_mut().override_text_style = Some(egui::TextStyle::Small);
                 ui.style_mut().spacing.item_spacing = egui::vec2(6.0, 0.0);
@@ -395,9 +399,9 @@ pub fn folder_from_args<I: IntoIterator<Item = String>>(args: I) -> Option<PathB
 }
 
 /// Shows the native folder-selection dialog, starting at start_dir when it exists.
-fn pick_folder(start_dir: &str) -> Option<PathBuf> {
+fn pick_folder(start_dir: &Path) -> Option<PathBuf> {
     let mut dialog = rfd::FileDialog::new().set_title("Open project folder");
-    if Path::new(start_dir).is_dir() {
+    if start_dir.is_dir() {
         dialog = dialog.set_directory(start_dir);
     }
     dialog.pick_folder()

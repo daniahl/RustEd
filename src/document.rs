@@ -20,6 +20,32 @@ use std::{
 
 pub const MAX_HIGHLIGHT_BYTES: usize = 65_536;
 
+/// Flag OR'ed into gutter-cache row numbers marking wrapped continuation rows
+/// (logical line continues from the previous visual row).
+pub const WRAPPED_ROW_FLAG: u32 = 0x8000_0000;
+/// Number of initial bytes scanned to detect CRLF line endings.
+pub const CRLF_DETECT_WINDOW: usize = 4096;
+/// Maximum selection length (in chars) that auto-populates the Find dialog.
+pub const MAX_FIND_SEED_CHARS: usize = 1024;
+/// Byte thresholds for human-readable file size formatting.
+const KB: usize = 1024;
+const MB: usize = 1024 * 1024;
+/// Find dialog anchor offset from the top-right corner.
+const FIND_DIALOG_OFFSET_X: f32 = -16.0;
+const FIND_DIALOG_OFFSET_Y: f32 = 36.0;
+/// Default width of the Find dialog input field.
+const FIND_INPUT_WIDTH: f32 = 180.0;
+/// Minimum gutter digit count (so "1" through "999" all get the same width).
+const GUTTER_MIN_DIGITS: usize = 3;
+/// Approximate width of one monospace digit in points.
+const GUTTER_DIGIT_WIDTH: f32 = 9.0;
+/// Extra padding added to the computed gutter width.
+const GUTTER_PADDING: f32 = 20.0;
+/// Right-side offset for the gutter line-number text.
+const GUTTER_TEXT_RIGHT_OFFSET: f32 = 10.0;
+/// Right-side offset for the gutter separator line.
+const GUTTER_SEPARATOR_OFFSET: f32 = 4.0;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DiskStamp {
     pub len: u64,
@@ -147,7 +173,7 @@ pub struct UnsavedFileState {
 }
 
 pub struct Document {
-    pub path: String,
+    pub path: PathBuf,
     pub text: PieceTable,
     pub saved_snapshot: Option<PieceTableSnapshot>,
     pub saved_revision: u64,
@@ -187,7 +213,7 @@ impl Default for Document {
 impl Document {
     pub fn new() -> Self {
         Self {
-            path: String::new(),
+            path: PathBuf::new(),
             text: PieceTable::new(),
             saved_snapshot: None,
             saved_revision: 0,
@@ -225,17 +251,17 @@ impl Document {
     }
 
     pub fn can_save(&self) -> bool {
-        !self.path.is_empty() && self.is_current_dirty
+        !self.path.as_os_str().is_empty() && self.is_current_dirty
     }
 
     pub fn is_file_dirty(&self, path: &Path) -> bool {
-        (self.is_current_dirty && !self.path.is_empty() && paths_equal(Path::new(&self.path), path))
+        (self.is_current_dirty && !self.path.as_os_str().is_empty() && paths_equal(&self.path, path))
             || (!self.unsaved_files.is_empty() && has_unsaved_entry(&self.unsaved_files, path))
     }
 
     pub fn save_current_file(&mut self) {
-        if !self.path.is_empty() && self.is_current_dirty {
-            let path = Path::new(&self.path).to_path_buf();
+        if !self.path.as_os_str().is_empty() && self.is_current_dirty {
+            let path = self.path.clone();
             match write_piece_table_atomic(&path, &self.text) {
                 Ok(()) => {
                     self.saved_snapshot = Some(self.text.snapshot());
@@ -254,7 +280,7 @@ impl Document {
     }
 
     pub fn open_file(&mut self, ctx: &egui::Context, chosen: PathBuf) {
-        if !self.path.is_empty() && paths_equal(Path::new(&self.path), &chosen) {
+        if !self.path.as_os_str().is_empty() && paths_equal(&self.path, &chosen) {
             return;
         }
 
@@ -282,7 +308,7 @@ impl Document {
         };
 
         let editor_id = editor::code_editor_id();
-        if !self.path.is_empty() && self.is_current_dirty {
+        if !self.path.as_os_str().is_empty() && self.is_current_dirty {
             let mut prev_state = ctx.data_mut(|d| d.get_temp::<editor::FastEditorState>(editor_id));
             if let Some(ref mut st) = prev_state {
                 st.layout_cache = None;
@@ -292,7 +318,7 @@ impl Document {
             }
             self.text.drop_cached_text();
             self.unsaved_files.insert(
-                PathBuf::from(&self.path),
+                self.path.clone(),
                 UnsavedFileState {
                     text: std::mem::take(&mut self.text),
                     saved_snapshot: self.saved_snapshot.take(),
@@ -306,7 +332,7 @@ impl Document {
             );
         }
 
-        self.path = chosen.to_string_lossy().into_owned();
+        self.path = chosen.clone();
         self.text_revision = self.text_revision.wrapping_add(1);
         self.gutter_cache = None;
         self.external_conflict = None;
@@ -361,10 +387,10 @@ impl Document {
     /// Clean buffers reload in place while clamping the caret position; dirty buffers set
     /// `external_conflict` instead of overwriting unsaved user edits unless `force` is true.
     pub fn sync_with_disk(&mut self, ctx: &egui::Context, force: bool) -> DiskSyncResult {
-        if self.path.is_empty() {
+        if self.path.as_os_str().is_empty() {
             return DiskSyncResult::Unchanged;
         }
-        let path = PathBuf::from(&self.path);
+        let path = self.path.clone();
         let meta = match fs::metadata(&path) {
             Ok(m) => m,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
@@ -478,8 +504,8 @@ impl Document {
             take_unsaved_entry(&mut self.unsaved_files, path);
         }
 
-        if !self.path.is_empty() {
-            let cur = Path::new(&self.path);
+        if !self.path.as_os_str().is_empty() {
+            let cur = &self.path;
             if paths_equal(cur, path) || (is_dir && path_starts_with(cur, path)) {
                 self.path.clear();
                 self.text.clear();
@@ -506,14 +532,14 @@ impl Document {
     }
 
     pub fn update_path_if_renamed(&mut self, old_path: &Path, new_path: &Path, is_dir: bool) {
-        if !self.path.is_empty() {
-            let cur = Path::new(&self.path);
+        if !self.path.as_os_str().is_empty() {
+            let cur = &self.path;
             if paths_equal(cur, old_path) {
-                self.path = new_path.to_string_lossy().into_owned();
+                self.path = new_path.to_path_buf();
                 self.refresh_file_metadata();
             } else if is_dir {
                 if let Some(rel) = path_strip_prefix(cur, old_path) {
-                    self.path = new_path.join(rel).to_string_lossy().into_owned();
+                    self.path = new_path.join(rel);
                     self.refresh_file_metadata();
                 }
             }
@@ -541,7 +567,7 @@ impl Document {
     }
 
     pub fn refresh_line_ending(&mut self) {
-        self.line_ending = if self.text.has_crlf_in_initial_bytes(4096) {
+        self.line_ending = if self.text.has_crlf_in_initial_bytes(CRLF_DETECT_WINDOW) {
             "CRLF"
         } else {
             "LF"
@@ -549,22 +575,22 @@ impl Document {
     }
 
     pub fn refresh_file_metadata(&mut self) {
-        if self.path.is_empty() {
+        if self.path.as_os_str().is_empty() {
             self.file_name = "Untitled".to_string();
             self.language_ext = "rs".to_string();
         } else {
-            let p = Path::new(&self.path);
+            let p = &self.path;
             self.file_name = p
                 .file_name()
                 .map(|f| f.to_string_lossy().into_owned())
-                .unwrap_or_else(|| self.path.clone());
+                .unwrap_or_else(|| self.path.to_string_lossy().into_owned());
             self.language_ext = p
                 .extension()
                 .and_then(|ext| ext.to_str())
                 .unwrap_or("rs")
                 .to_string();
         }
-        self.language_name = detect_language_name(&self.path);
+        self.language_name = detect_language_name(&self.path.to_string_lossy());
         self.language_salt = hash_language_salt(&self.language_ext);
         self.status_file_cache = None;
         self.refresh_line_ending();
@@ -588,17 +614,17 @@ impl Document {
                 .unwrap_or_else(|| String::with_capacity(64));
             s.clear();
             let file_name = &self.file_name;
-            if bytes >= 1024 * 1024 {
+            if bytes >= MB {
                 let _ = write!(
                     s,
                     "{file_name} — {line_count} lines ({:.1} MB)",
-                    bytes as f64 / (1024.0 * 1024.0)
+                    bytes as f64 / MB as f64
                 );
             } else if bytes >= 1024 {
                 let _ = write!(
                     s,
                     "{file_name} — {line_count} lines ({:.1} KB)",
-                    bytes as f64 / 1024.0
+                    bytes as f64 / KB as f64
                 );
             } else {
                 let _ = write!(s, "{file_name} — {line_count} lines ({bytes} B)");
@@ -643,7 +669,7 @@ impl Document {
                 if range.primary != range.secondary {
                     let [min_c, max_c] = range.sorted_cursors();
                     let count = max_c.index.0 - min_c.index.0;
-                    if count > 0 && count <= 1024 {
+                    if count > 0 && count <= MAX_FIND_SEED_CHARS {
                         let selected = self.text.slice_chars(min_c.index.0..max_c.index.0);
                         if !selected.is_empty()
                             && !selected.contains('\n')
@@ -713,7 +739,7 @@ impl Document {
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
-            .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-16.0, 36.0))
+            .anchor(egui::Align2::RIGHT_TOP, egui::vec2(FIND_DIALOG_OFFSET_X, FIND_DIALOG_OFFSET_Y))
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     let find_id = egui::Id::unique("find_query_input");
@@ -732,7 +758,7 @@ impl Document {
                     let resp = egui::TextEdit::singleline(&mut self.find_query)
                         .id(find_id)
                         .hint_text("Search text...")
-                        .desired_width(180.0)
+                        .desired_width(FIND_INPUT_WIDTH)
                         .show(ui)
                         .response;
 
@@ -800,98 +826,151 @@ impl Document {
         }
     }
 
+    /// Rebuilds the per-row logical line-number table only when the editor's galley changed.
+    fn rebuild_gutter_cache(&mut self, ctx: &egui::Context, output: &editor::EditorOutput) {
+        let stale = match &self.gutter_cache {
+            Some((g, _)) => !Arc::ptr_eq(g, &output.galley),
+            None => true,
+        };
+        if !stale {
+            return;
+        }
+        let mut nums = Vec::with_capacity(output.galley.rows.len());
+        let new_count = if output.virtualized {
+            let base = output.first_line as u32;
+            for i in 0..output.galley.rows.len() {
+                nums.push(base + i as u32 + 1);
+            }
+            self.text.line_count().max(1)
+        } else {
+            let mut line_no = 0u32;
+            let mut new_line = true;
+            for row in &output.galley.rows {
+                if new_line {
+                    line_no += 1;
+                    nums.push(line_no);
+                } else {
+                    nums.push(line_no | WRAPPED_ROW_FLAG);
+                }
+                new_line = row.ends_with_newline;
+            }
+            (line_no as usize).max(1)
+        };
+        if new_count.max(1).ilog10() != self.line_count.max(1).ilog10() {
+            ctx.request_repaint();
+        }
+        self.line_count = new_count;
+        self.gutter_cache = Some((Arc::clone(&output.galley), nums));
+    }
+
+    /// Updates cursor line/column/selection status fields from the editor output,
+    /// returning the active document row index for gutter highlighting.
+    fn update_cursor_status(&mut self, output: &editor::EditorOutput) -> Option<usize> {
+        let cursor_range = output.cursor_range?;
+        let (line, col, active_row) = if output.virtualized {
+            let (line, col) = self.text.char_to_line_col(cursor_range.primary.index.0);
+            (line + 1, col + 1, line)
+        } else {
+            let focus = output.galley.layout_from_cursor(cursor_range.primary);
+            let line = if let Some((_, nums)) = &self.gutter_cache {
+                if nums.is_empty() {
+                    1
+                } else {
+                    let end = focus.row.min(nums.len() - 1);
+                    ((nums[end] & !WRAPPED_ROW_FLAG) as usize).max(1)
+                }
+            } else {
+                focus.row + 1
+            };
+            (line, focus.column.0 + 1, focus.row)
+        };
+        self.cursor_line = line;
+        self.cursor_col = col;
+        self.selected_chars = if cursor_range.is_empty() {
+            0
+        } else {
+            cursor_range
+                .primary
+                .index
+                .0
+                .abs_diff(cursor_range.secondary.index.0)
+        };
+        Some(active_row)
+    }
+
+    /// Renders the save-error and external-conflict banners at the top of the editor panel.
+    fn render_status_banners(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        if let Some(err_msg) = self.last_save_error.as_deref() {
+            let mut clear_err = false;
+            ui.horizontal(|ui| {
+                ui.colored_label(ui.visuals().error_fg_color, err_msg);
+                if ui.button("Dismiss").clicked() {
+                    clear_err = true;
+                }
+            });
+            ui.separator();
+            if clear_err {
+                self.last_save_error = None;
+            }
+        }
+        if let Some(conflict) = self.external_conflict {
+            let mut do_reload = false;
+            let mut do_close = false;
+            let mut do_dismiss = false;
+            ui.horizontal(|ui| {
+                let msg = match conflict {
+                    ExternalConflict::ModifiedOnDisk => {
+                        "File changed on disk while you have unsaved edits."
+                    }
+                    ExternalConflict::DeletedOnDisk => {
+                        "File was deleted on disk while you have unsaved edits."
+                    }
+                };
+                ui.colored_label(ui.visuals().warn_fg_color, msg);
+                match conflict {
+                    ExternalConflict::ModifiedOnDisk => {
+                        if ui.button("Reload from disk").clicked() {
+                            do_reload = true;
+                        }
+                        if ui.button("Keep my edits").clicked() {
+                            do_dismiss = true;
+                        }
+                    }
+                    ExternalConflict::DeletedOnDisk => {
+                        if ui.button("Close file").clicked() {
+                            do_close = true;
+                        }
+                        if ui.button("Keep in editor").clicked() {
+                            do_dismiss = true;
+                        }
+                    }
+                }
+            });
+            ui.separator();
+            if do_reload {
+                self.sync_with_disk(ctx, true);
+            } else if do_close {
+                let p = self.path.clone();
+                self.close_if_deleted(ctx, &p, false);
+            } else if do_dismiss {
+                self.external_conflict = None;
+            }
+        }
+    }
+
     pub fn show_editor(&mut self, ui: &mut egui::Ui, panel_frame: egui::Frame) {
         let ctx = ui.ctx().clone();
         let ctx = &ctx;
         let mut editor_text_changed = false;
         egui::CentralPanel::default().frame(panel_frame).show(ui, |ui| {
-            if let Some(err_msg) = self.last_save_error.as_deref() {
-                let mut clear_err = false;
-                ui.horizontal(|ui| {
-                    ui.colored_label(ui.visuals().error_fg_color, err_msg);
-                    if ui.button("Dismiss").clicked() {
-                        clear_err = true;
-                    }
-                });
-                ui.separator();
-                if clear_err {
-                    self.last_save_error = None;
-                }
-            }
-            if let Some(conflict) = self.external_conflict {
-                let mut do_reload = false;
-                let mut do_close = false;
-                let mut do_dismiss = false;
-                ui.horizontal(|ui| {
-                    let msg = match conflict {
-                        ExternalConflict::ModifiedOnDisk => {
-                            "File changed on disk while you have unsaved edits."
-                        }
-                        ExternalConflict::DeletedOnDisk => {
-                            "File was deleted on disk while you have unsaved edits."
-                        }
-                    };
-                    ui.colored_label(ui.visuals().warn_fg_color, msg);
-                    match conflict {
-                        ExternalConflict::ModifiedOnDisk => {
-                            if ui.button("Reload from disk").clicked() {
-                                do_reload = true;
-                            }
-                            if ui.button("Keep my edits").clicked() {
-                                do_dismiss = true;
-                            }
-                        }
-                        ExternalConflict::DeletedOnDisk => {
-                            if ui.button("Close file").clicked() {
-                                do_close = true;
-                            }
-                            if ui.button("Keep in editor").clicked() {
-                                do_dismiss = true;
-                            }
-                        }
-                    }
-                });
-                ui.separator();
-                if do_reload {
-                    self.sync_with_disk(ctx, true);
-                } else if do_close {
-                    let p = PathBuf::from(&self.path);
-                    self.close_if_deleted(ctx, &p, false);
-                } else if do_dismiss {
-                    self.external_conflict = None;
-                }
-            }
+            self.render_status_banners(ui, ctx);
 
-            let language = self.language_ext.as_str();
             let language_salt = self.language_salt;
             let text_revision = self.text_revision;
 
             let theme = CodeTheme::from_memory(ui.ctx(), ui.style());
             let font_id = egui::TextStyle::Monospace.resolve(ui.style());
             let text_color = ui.visuals().widgets.inactive.text_color();
-            let font_id_for_layout = font_id.clone();
-
-            let mut layouter = |ui: &egui::Ui, text: &PieceTable, wrap_width: f32| {
-                let layout_job = if text.len() <= MAX_HIGHLIGHT_BYTES {
-                    let mut job = syntax_highlighting::highlight(
-                        ui.ctx(),
-                        ui.style(),
-                        &theme,
-                        text.as_str(),
-                        language,
-                    );
-                    job.wrap.max_width = wrap_width;
-                    job
-                } else {
-                    egui::text::LayoutJob::simple(
-                        text.build_string(),
-                        font_id_for_layout.clone(),
-                        text_color,
-                        wrap_width,
-                    )
-                };
-                ui.fonts_mut(|f| f.layout_job(layout_job))
-            };
 
             let available_size = ui.available_size();
             egui::ScrollArea::vertical()
@@ -902,7 +981,7 @@ impl Document {
                     // scanning the whole text every frame.
                     let line_count = self.line_count.max(1);
                     let digits = line_count.ilog10() as usize + 1;
-                    let gutter_width = (digits.max(3) as f32) * 9.0 + 20.0;
+                    let gutter_width = (digits.max(GUTTER_MIN_DIGITS) as f32) * GUTTER_DIGIT_WIDTH + GUTTER_PADDING;
 
                     ui.horizontal_top(|ui| {
                         ui.spacing_mut().item_spacing.x = 0.0;
@@ -918,132 +997,73 @@ impl Document {
 
                         let is_large = self.text.len() > MAX_HIGHLIGHT_BYTES;
                         let newline = if self.line_ending == "CRLF" { "\r\n" } else { "\n" };
-                        let editor = FastEditor::new_with_buffer(
-                            editor::code_editor_id(),
-                            &mut self.text,
-                            editor_min_size,
-                            &mut layouter,
-                        )
-                        .cache_salt(language_salt)
-                        .text_revision(text_revision)
-                        .newline(newline)
-                        .virtualized(is_large);
-                        let output = editor.show(ui);
+                        let output = {
+                            let language = self.language_ext.as_str();
+                            let font_id_for_layout = font_id.clone();
+                            let mut layouter = |ui: &egui::Ui, text: &PieceTable, wrap_width: f32| {
+                                let layout_job = if text.len() <= MAX_HIGHLIGHT_BYTES {
+                                    text.with_str(|s| {
+                                        let mut job = syntax_highlighting::highlight(
+                                            ui.ctx(),
+                                            ui.style(),
+                                            &theme,
+                                            s,
+                                            language,
+                                        );
+                                        job.wrap.max_width = wrap_width;
+                                        job
+                                    })
+                                } else {
+                                    egui::text::LayoutJob::simple(
+                                        text.build_string(),
+                                        font_id_for_layout.clone(),
+                                        text_color,
+                                        wrap_width,
+                                    )
+                                };
+                                ui.fonts_mut(|f| f.layout_job(layout_job))
+                            };
+                            FastEditor::new_with_buffer(
+                                editor::code_editor_id(),
+                                &mut self.text,
+                                editor_min_size,
+                                &mut layouter,
+                            )
+                            .cache_salt(language_salt)
+                            .text_revision(text_revision)
+                            .newline(newline)
+                            .virtualized(is_large)
+                            .show(ui)
+                        };
                         if self.focus_editor {
                             output.response.request_focus();
                             self.focus_editor = false;
                         }
                         editor_text_changed = output.text_changed;
 
-                        const WRAPPED_ROW_FLAG: u32 = 0x8000_0000;
-
-                        // Rebuild the row -> line-number table only when the galley changed.
-                        let stale = match &self.gutter_cache {
-                            Some((g, _)) => !Arc::ptr_eq(g, &output.galley),
-                            None => true,
-                        };
-                        if stale {
-                            let mut nums = Vec::with_capacity(output.galley.rows.len());
-                            let new_count = if output.virtualized {
-                                let base = output.first_line as u32;
-                                for i in 0..output.galley.rows.len() {
-                                    nums.push(base + i as u32 + 1);
-                                }
-                                self.text.line_count().max(1)
-                            } else {
-                                let mut line_no = 0u32;
-                                let mut new_line = true;
-                                for row in &output.galley.rows {
-                                    if new_line {
-                                        line_no += 1;
-                                        nums.push(line_no);
-                                    } else {
-                                        nums.push(line_no | WRAPPED_ROW_FLAG);
-                                    }
-                                    new_line = row.ends_with_newline;
-                                }
-                                (line_no as usize).max(1)
-                            };
-                            if new_count.max(1).ilog10() != self.line_count.max(1).ilog10() {
-                                ui.ctx().request_repaint();
-                            }
-                            self.line_count = new_count;
-                            self.gutter_cache = Some((Arc::clone(&output.galley), nums));
-                        }
-
-                        let active_row = if let Some(cursor_range) = output.cursor_range {
-                            let (line, col, active_row) = if output.virtualized {
-                                let (line, col) = self.text.char_to_line_col(cursor_range.primary.index.0);
-                                (line + 1, col + 1, line)
-                            } else {
-                                let focus = output.galley.layout_from_cursor(cursor_range.primary);
-                                let line = if let Some((_, nums)) = &self.gutter_cache {
-                                    if nums.is_empty() {
-                                        1
-                                    } else {
-                                        let end = focus.row.min(nums.len() - 1);
-                                        ((nums[end] & !WRAPPED_ROW_FLAG) as usize).max(1)
-                                    }
-                                } else {
-                                    focus.row + 1
-                                };
-                                (line, focus.column.0 + 1, focus.row)
-                            };
-                            self.cursor_line = line;
-                            self.cursor_col = col;
-                            self.selected_chars = if cursor_range.is_empty() {
-                                0
-                            } else {
-                                cursor_range
-                                    .primary
-                                    .index
-                                    .0
-                                    .abs_diff(cursor_range.secondary.index.0)
-                            };
-                            Some(active_row)
-                        } else {
-                            None
-                        };
+                        self.rebuild_gutter_cache(ui.ctx(), &output);
+                        let active_row = self.update_cursor_status(&output);
 
                         let clip_rect = ui.clip_rect();
                         let painter = ui.painter();
-                        if let Some((_, nums)) = &self.gutter_cache {
-                            let rows = &output.galley.rows;
-                            // Binary-search the first visible row; draw only visible rows.
-                            let top = clip_rect.min.y - output.galley_pos.y;
-                            let first = rows.partition_point(|r| r.rect().max.y < top);
-                            let mut num_buf = [0u8; 16];
-                            for (row_idx, row) in rows.iter().enumerate().skip(first) {
-                                let y = output.galley_pos.y + row.rect().min.y;
-                                if y > clip_rect.max.y {
-                                    break;
-                                }
-                                let n = nums.get(row_idx).copied().unwrap_or(0);
-                                if n == 0 || (n & WRAPPED_ROW_FLAG) != 0 {
-                                    continue;
-                                }
-                                let doc_row_idx = output.first_line + row_idx;
-                                let color = if active_row == Some(doc_row_idx) {
-                                    ui.visuals().strong_text_color()
-                                } else {
-                                    ui.visuals().weak_text_color()
-                                };
-                                let label_str = format_u32_stack(n, &mut num_buf);
-                                painter.text(
-                                    egui::pos2(gutter_rect.max.x - 10.0, y),
-                                    egui::Align2::RIGHT_TOP,
-                                    label_str,
-                                    font_id.clone(),
-                                    color,
-                                );
-                            }
-                        }
+                        paint_gutter(
+                            painter,
+                            &output.galley,
+                            output.galley_pos,
+                            clip_rect,
+                            gutter_rect,
+                            self.gutter_cache.as_ref().map(|(_, n)| n.as_slice()),
+                            active_row,
+                            output.first_line,
+                            &font_id,
+                            ui.visuals(),
+                        );
 
                         let bottom_y = gutter_rect.max.y.max(output.response.rect.max.y);
                         painter.line_segment(
                             [
-                                egui::pos2(gutter_rect.max.x - 4.0, gutter_rect.min.y),
-                                egui::pos2(gutter_rect.max.x - 4.0, bottom_y),
+                                egui::pos2(gutter_rect.max.x - GUTTER_SEPARATOR_OFFSET, gutter_rect.min.y),
+                                egui::pos2(gutter_rect.max.x - GUTTER_SEPARATOR_OFFSET, bottom_y),
                             ],
                             ui.visuals().widgets.noninteractive.bg_stroke,
                         );
@@ -1062,11 +1082,60 @@ impl Document {
             }
             let was_dirty = self.is_current_dirty;
             self.is_current_dirty =
-                !self.path.is_empty() && self.text_revision != self.saved_revision;
+                !self.path.as_os_str().is_empty() && self.text_revision != self.saved_revision;
             if was_dirty != self.is_current_dirty {
                 ctx.request_repaint();
             }
         }
+    }
+}
+
+/// Paints visible line-number gutter rows without allocating per-line strings.
+///
+/// Binary-searches the first visible row (`partition_point`) and only draws rows
+/// whose numbers are not wrapped-continuation rows (`WRAPPED_ROW_FLAG` unset).
+#[allow(clippy::too_many_arguments)]
+fn paint_gutter(
+    painter: &egui::Painter,
+    galley: &Arc<egui::Galley>,
+    galley_pos: egui::Pos2,
+    clip_rect: egui::Rect,
+    gutter_rect: egui::Rect,
+    nums: Option<&[u32]>,
+    active_row: Option<usize>,
+    first_line: usize,
+    font_id: &egui::FontId,
+    visuals: &egui::Visuals,
+) {
+    let Some(nums) = nums else { return };
+    let rows = &galley.rows;
+    // Binary-search the first visible row; draw only visible rows.
+    let top = clip_rect.min.y - galley_pos.y;
+    let first = rows.partition_point(|r| r.rect().max.y < top);
+    let mut num_buf = [0u8; 16];
+    for (row_idx, row) in rows.iter().enumerate().skip(first) {
+        let y = galley_pos.y + row.rect().min.y;
+        if y > clip_rect.max.y {
+            break;
+        }
+        let n = nums.get(row_idx).copied().unwrap_or(0);
+        if n == 0 || (n & WRAPPED_ROW_FLAG) != 0 {
+            continue;
+        }
+        let doc_row_idx = first_line + row_idx;
+        let color = if active_row == Some(doc_row_idx) {
+            visuals.strong_text_color()
+        } else {
+            visuals.weak_text_color()
+        };
+        let label_str = format_u32_stack(n, &mut num_buf);
+        painter.text(
+            egui::pos2(gutter_rect.max.x - GUTTER_TEXT_RIGHT_OFFSET, y),
+            egui::Align2::RIGHT_TOP,
+            label_str,
+            font_id.clone(),
+            color,
+        );
     }
 }
 

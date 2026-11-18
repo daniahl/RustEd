@@ -317,7 +317,7 @@ fn test_rename_directory_updates_selection_and_open_document() {
         explorer.selected_node.as_ref().unwrap().0,
         new.join("inside.txt")
     );
-    assert_eq!(PathBuf::from(&doc.path), new.join("inside.txt"));
+    assert_eq!(doc.path.clone(), new.join("inside.txt"));
     // Expanded state carries over to the renamed node.
     assert!(explorer.tree_root.as_mut().unwrap().find_mut(&new).unwrap().expanded);
 
@@ -386,12 +386,12 @@ fn test_open_folder_and_parent_reset_state() {
     });
 
     explorer.open_folder(child.clone());
-    assert_eq!(PathBuf::from(&explorer.folder_path), child);
+    assert_eq!(explorer.folder_path.clone(), child);
     assert!(explorer.selected_node.is_none() && explorer.pending_tree_edit.is_none());
     assert_eq!(explorer.tree_root.as_ref().unwrap().path, child);
 
     explorer.open_parent_folder();
-    assert_eq!(PathBuf::from(&explorer.folder_path), dir);
+    assert_eq!(explorer.folder_path.clone(), dir);
 
     let _ = fs::remove_dir_all(&dir);
 }

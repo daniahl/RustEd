@@ -1,7 +1,7 @@
 ﻿//! Unit tests for the `EditorBuffer` abstraction: the `String` default implementation and
 //! the optimized `PieceTable` implementation must behave identically.
 
-use eframe::egui::{text::CCursor, TextBuffer};
+use eframe::egui::text::CCursor;
 use rusted::{
     editor::{EditorBuffer, UndoSnapshot},
     piece_table::PieceTable,
@@ -128,8 +128,8 @@ fn test_piece_table_undo_snapshot_roundtrip() {
     let mut pt = PieceTable::from_str("before");
     let snap = EditorBuffer::undo_snapshot(&pt);
     assert!(matches!(snap, UndoSnapshot::PieceTable(_)));
-    pt.insert_text(" after", eframe::egui::text::CharIndex(6));
-    pt.delete_char_range(eframe::egui::text::CharIndex(0)..eframe::egui::text::CharIndex(2));
+    pt.insert_text(" after", 6);
+    pt.delete_char_range(0..2);
     EditorBuffer::restore_undo_snapshot(&mut pt, &snap);
     assert_eq!(pt, "before");
 }
@@ -156,7 +156,7 @@ fn test_undo_snapshot_equality() {
     let pt = PieceTable::from_str("same");
     assert_eq!(EditorBuffer::undo_snapshot(&pt), EditorBuffer::undo_snapshot(&pt));
     let mut other = pt.clone();
-    other.insert_text("!", eframe::egui::text::CharIndex(4));
+    other.insert_text("!", 4);
     assert_ne!(EditorBuffer::undo_snapshot(&pt), EditorBuffer::undo_snapshot(&other));
 }
 

@@ -34,14 +34,14 @@ fn test_find_dialog_ctrl_f_and_f3_find_next() {
         o.max_passes = std::num::NonZeroUsize::new(4).unwrap();
     });
     let mut app = TextEditor::new_headless(&temp_dir);
-    app.text = "alpha beta alpha gamma alpha".into();
-    app.text_revision = 1;
+    app.doc.text = "alpha beta alpha gamma alpha".into();
+    app.doc.text_revision = 1;
 
     // Render initial frame
     let _ = run_ui(&ctx, egui::RawInput::default(), |ui| {
         app.update_ui(ui);
     });
-    assert!(!app.find_open);
+    assert!(!app.doc.find_open);
 
     // Press Ctrl+F for the very first time in the session to open Find dialog
     let mut ctrl_f_input = egui::RawInput::default();
@@ -55,7 +55,7 @@ fn test_find_dialog_ctrl_f_and_f3_find_next() {
     let _ = run_ui(&ctx, ctrl_f_input, |ui| {
         app.update_ui(ui);
     });
-    assert!(app.find_open, "Ctrl+F should open the Find dialog");
+    assert!(app.doc.find_open, "Ctrl+F should open the Find dialog");
     assert!(
         ctx.memory(|m| m.has_focus(egui::Id::unique("find_query_input"))),
         "Find input should have focus immediately on the first Ctrl+F"
@@ -76,9 +76,9 @@ fn test_find_dialog_ctrl_f_and_f3_find_next() {
     let out_enter = run_ui(&ctx, type_and_enter, |ui| {
         app.update_ui(ui);
     });
-    assert!(!app.find_open, "Pressing Enter in Find dialog should close it");
+    assert!(!app.doc.find_open, "Pressing Enter in Find dialog should close it");
     assert_eq!(
-        app.text, "alpha beta alpha gamma alpha",
+        app.doc.text, "alpha beta alpha gamma alpha",
         "Pressing Enter in Find dialog should not insert a newline into the editor"
     );
 
@@ -185,13 +185,13 @@ fn test_unsaved_state_asterisk_and_file_switching() {
     let mut app = TextEditor::new_headless(&temp_dir);
 
     // 1. Initially no file is open -> Save button cannot save
-    assert!(!app.can_save());
+    assert!(!app.doc.can_save());
 
     // 2. Open file_a -> clean, Save button disabled
     app.open_file(&ctx, file_a.clone());
-    assert_eq!(app.text, "fn a() {}\n");
-    assert!(!app.can_save());
-    assert!(!app.is_file_dirty(&file_a));
+    assert_eq!(app.doc.text, "fn a() {}\n");
+    assert!(!app.doc.can_save());
+    assert!(!app.doc.is_file_dirty(&file_a));
 
     // Focus editor in frame 1
     let _ = run_ui(&ctx, egui::RawInput::default(), |ui| {
@@ -206,10 +206,10 @@ fn test_unsaved_state_asterisk_and_file_switching() {
         app.update_ui(ui);
     });
 
-    assert_eq!(app.text, "// edited\nfn a() {}\n");
-    assert!(app.can_save(), "Save should be enabled after editing");
-    assert!(app.is_file_dirty(&file_a), "file_a should be marked dirty");
-    assert!(!app.is_file_dirty(&file_b), "file_b should still be clean");
+    assert_eq!(app.doc.text, "// edited\nfn a() {}\n");
+    assert!(app.doc.can_save(), "Save should be enabled after editing");
+    assert!(app.doc.is_file_dirty(&file_a), "file_a should be marked dirty");
+    assert!(!app.doc.is_file_dirty(&file_b), "file_b should still be clean");
 
     // Verify FileNode exists for file_a
     let root = app.explorer.tree_root.as_ref().unwrap();
@@ -218,24 +218,24 @@ fn test_unsaved_state_asterisk_and_file_switching() {
 
     // 4. Switch to file_b without saving file_a
     app.open_file(&ctx, file_b.clone());
-    assert_eq!(app.text, "fn b() {}\n");
-    assert!(!app.can_save(), "Save should be disabled on unmodified file_b");
+    assert_eq!(app.doc.text, "fn b() {}\n");
+    assert!(!app.doc.can_save(), "Save should be disabled on unmodified file_b");
     assert!(
-        app.is_file_dirty(&file_a),
+        app.doc.is_file_dirty(&file_a),
         "file_a should remain dirty in state after switching to file_b"
     );
-    assert!(!app.is_file_dirty(&file_b));
+    assert!(!app.doc.is_file_dirty(&file_b));
 
     // 5. Switch back to file_a -> unsaved content is restored and Save is enabled
     app.open_file(&ctx, file_a.clone());
-    assert_eq!(app.text, "// edited\nfn a() {}\n");
-    assert!(app.can_save(), "Save should be enabled when returning to unsaved file_a");
-    assert!(app.is_file_dirty(&file_a));
+    assert_eq!(app.doc.text, "// edited\nfn a() {}\n");
+    assert!(app.doc.can_save(), "Save should be enabled when returning to unsaved file_a");
+    assert!(app.doc.is_file_dirty(&file_a));
 
     // 6. Save file_a -> written to disk, dirty cleared, Save disabled
-    app.save_current_file();
-    assert!(!app.can_save(), "Save should be disabled immediately after saving");
-    assert!(!app.is_file_dirty(&file_a), "file_a should no longer be dirty after saving");
+    app.doc.save_current_file();
+    assert!(!app.doc.can_save(), "Save should be disabled immediately after saving");
+    assert!(!app.doc.is_file_dirty(&file_a), "file_a should no longer be dirty after saving");
     assert_eq!(fs::read_to_string(&file_a).unwrap(), "// edited\nfn a() {}\n");
 
     let _ = fs::remove_dir_all(&temp_dir);
@@ -278,12 +278,12 @@ fn test_tree_new_folder_new_file_rename_and_f2() {
 
     let new_file = nested_dir.join("main.rs");
     assert!(new_file.is_file(), "New file should exist on disk");
-    assert_eq!(Path::new(&app.path), new_file.as_path());
+    assert_eq!(Path::new(&app.doc.path), new_file.as_path());
     assert_eq!(app.explorer.selected_node, Some((new_file.clone(), false)));
 
     // 3. Edit the open file (so it has unsaved state) and press F2 to rename it
-    app.text = "fn main() {}".into();
-    app.is_current_dirty = true;
+    app.doc.text = "fn main() {}".into();
+    app.doc.is_current_dirty = true;
 
     let mut f2_input = egui::RawInput::default();
     f2_input.events.push(egui::Event::Key {
@@ -325,9 +325,9 @@ fn test_tree_new_folder_new_file_rename_and_f2() {
     let renamed_file = nested_dir.join("lib.rs");
     assert!(!new_file.exists());
     assert!(renamed_file.is_file());
-    assert_eq!(Path::new(&app.path), renamed_file.as_path());
-    assert_eq!(app.file_name, "lib.rs");
-    assert!(app.is_file_dirty(&renamed_file));
+    assert_eq!(Path::new(&app.doc.path), renamed_file.as_path());
+    assert_eq!(app.doc.file_name, "lib.rs");
+    assert!(app.doc.is_file_dirty(&renamed_file));
 
     // 4. Select the parent folder `src_dir`, press F2, and rename it to `app_dir`
     app.explorer.selected_node = Some((sub_dir.clone(), true));
@@ -343,7 +343,7 @@ fn test_tree_new_folder_new_file_rename_and_f2() {
     assert!(renamed_dir.is_dir());
     assert!(moved_file.is_file());
     assert_eq!(
-        Path::new(&app.path),
+        Path::new(&app.doc.path),
         moved_file.as_path(),
         "Active file path should update when an ancestor folder is renamed"
     );
@@ -358,10 +358,10 @@ fn test_tree_new_folder_new_file_rename_and_f2() {
     );
     assert!(!renamed_dir.exists(), "Deleted folder should be moved to trash");
     assert!(
-        app.path.is_empty(),
+        app.doc.path.as_os_str().is_empty(),
         "Active editor path should be cleared when its folder is deleted"
     );
-    assert!(!app.can_save());
+    assert!(!app.doc.can_save());
 
     let _ = fs::remove_dir_all(&temp_dir);
 }
@@ -526,7 +526,7 @@ fn test_new_with_folder_uses_given_folder() {
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
     let app = TextEditor::new_with_folder(egui::Context::default(), Some(dir.clone()));
-    assert_eq!(app.explorer.folder_path, dir.to_string_lossy());
+    assert_eq!(app.explorer.folder_path, dir);
     assert_eq!(app.explorer.tree_root.as_ref().unwrap().path, dir);
     let _ = fs::remove_dir_all(&dir);
 }

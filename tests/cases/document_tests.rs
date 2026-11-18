@@ -198,7 +198,7 @@ fn test_document_update_path_if_renamed() {
     // Active file is inside a subdirectory
     let old_dir = PathBuf::from("my_project").join("src");
     let old_file = old_dir.join("main.rs");
-    doc.path = old_file.to_string_lossy().into_owned();
+    doc.path = old_file.clone();
     doc.refresh_file_metadata();
     assert_eq!(doc.file_name, "main.rs");
     assert_eq!(doc.language_name, "Rust");
@@ -226,7 +226,7 @@ fn test_document_update_path_if_renamed() {
     let expected_active = new_project.join("src").join("main.rs");
     let expected_other = new_project.join("src").join("lib.rs");
 
-    assert_eq!(Path::new(&doc.path), expected_active.as_path());
+    assert_eq!(doc.path.as_path(), expected_active.as_path());
     assert_eq!(doc.file_name, "main.rs");
     assert!(doc.unsaved_files.contains_key(&expected_other));
     assert!(!doc.unsaved_files.contains_key(&other_file));
@@ -234,7 +234,7 @@ fn test_document_update_path_if_renamed() {
     // 2. Direct rename of the active file
     let final_file = new_project.join("src").join("app.py");
     doc.update_path_if_renamed(&expected_active, &final_file, false);
-    assert_eq!(Path::new(&doc.path), final_file.as_path());
+    assert_eq!(doc.path.as_path(), final_file.as_path());
     assert_eq!(doc.file_name, "app.py");
     assert_eq!(doc.language_name, "Python");
 }
@@ -249,7 +249,7 @@ fn test_document_close_if_deleted() {
     let other_file = project_dir.join("other.rs");
     let external_file = PathBuf::from("other_proj").join("ext.rs");
 
-    doc.path = active_file.to_string_lossy().into_owned();
+    doc.path = active_file.clone();
     doc.text = "fn main() {}".into();
     doc.is_current_dirty = false;
     doc.refresh_file_metadata();
@@ -284,13 +284,13 @@ fn test_document_close_if_deleted() {
 
     // 1. Deleting an unrelated file does not close active file
     doc.close_if_deleted(&ctx, Path::new("unrelated.rs"), false);
-    assert_eq!(Path::new(&doc.path), active_file.as_path());
+    assert_eq!(doc.path.as_path(), active_file.as_path());
     assert_eq!(doc.text, "fn main() {}");
     assert_eq!(doc.unsaved_files.len(), 2);
 
     // 2. Deleting project_dir closes active file and removes all project_dir unsaved files
     doc.close_if_deleted(&ctx, &project_dir, true);
-    assert!(doc.path.is_empty(), "Active path should be cleared");
+    assert!(doc.path.as_os_str().is_empty(), "Active path should be cleared");
     assert!(doc.text.is_empty(), "Active text should be cleared");
     assert_eq!(doc.file_name, "Untitled");
     assert!(!doc.unsaved_files.contains_key(&other_file));
@@ -385,7 +385,7 @@ fn test_status_pos_label_with_and_without_selection() {
 #[test]
 fn test_refresh_file_metadata_from_path() {
     let mut doc = Document::new();
-    doc.path = "some/dir/script.py".to_string();
+    doc.path = PathBuf::from("some/dir/script.py");
     doc.refresh_file_metadata();
     assert_eq!(doc.file_name, "script.py");
     assert_eq!(doc.language_ext, "py");
@@ -400,7 +400,7 @@ fn test_refresh_file_metadata_from_path() {
 #[test]
 fn test_can_save_and_is_file_dirty() {
     let mut doc = Document::new();
-    doc.path = "a.txt".to_string();
+    doc.path = PathBuf::from("a.txt");
     assert!(!doc.can_save());
     assert!(!doc.is_file_dirty(Path::new("a.txt")));
     doc.is_current_dirty = true;
@@ -416,7 +416,7 @@ fn test_save_current_file_writes_and_clears_dirty() {
     let file = dir.join("out.txt");
 
     let mut doc = Document::new();
-    doc.path = file.to_string_lossy().into_owned();
+    doc.path = file.clone();
     doc.set_text("saved\ncontent é");
     doc.is_current_dirty = true;
     doc.save_current_file();

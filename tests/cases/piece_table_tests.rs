@@ -1,9 +1,8 @@
 ﻿//! Unit and integration tests for the `PieceTable` text buffer.
 //!
 //! Validates piece descriptor management, consecutive typing optimization,
-//! insertions/deletions, UTF-8 char-to-byte mapping, and `egui::TextBuffer` trait compliance.
+//! insertions/deletions, UTF-8 char-to-byte mapping, and inherent buffer-method compliance.
 
-use eframe::egui::TextBuffer;
 use rusted::piece_table::PieceTable;
 
 #[test]
@@ -14,7 +13,7 @@ fn test_piece_table_empty_and_creation() {
     assert_eq!(pt.char_count(), 0);
     assert_eq!(pt.line_count(), 1);
     assert_eq!(pt.piece_count(), 0);
-    assert_eq!(pt.as_str(), "");
+    assert_eq!(pt.build_string(), "");
     assert_eq!(pt, "");
 
     let pt2 = PieceTable::from_str("Hello, world!\nLine 2");
@@ -23,7 +22,7 @@ fn test_piece_table_empty_and_creation() {
     assert_eq!(pt2.char_count(), 20);
     assert_eq!(pt2.line_count(), 2);
     assert_eq!(pt2.piece_count(), 1);
-    assert_eq!(pt2.as_str(), "Hello, world!\nLine 2");
+    assert_eq!(pt2.build_string(), "Hello, world!\nLine 2");
     assert_eq!(pt2, "Hello, world!\nLine 2");
 }
 
@@ -37,7 +36,7 @@ fn test_consecutive_typing_optimization() {
         pt.insert(pt.char_count(), &ch.to_string());
     }
 
-    assert_eq!(pt.as_str(), "Hello, VS Code Piece Table!");
+    assert_eq!(pt.build_string(), "Hello, VS Code Piece Table!");
     assert_eq!(pt.char_count(), 27);
     // Despite 27 individual keystrokes, there should be only 1 piece descriptor!
     assert_eq!(pt.piece_count(), 1);
@@ -49,19 +48,19 @@ fn test_insertions_start_middle_end() {
 
     // Prepend at index 0
     pt.insert(0, "Hello ");
-    assert_eq!(pt.as_str(), "Hello world");
+    assert_eq!(pt.build_string(), "Hello world");
     assert_eq!(pt.piece_count(), 2); // [Hello , world]
 
     // Append at end
     pt.insert(pt.char_count(), "!");
-    assert_eq!(pt.as_str(), "Hello world!");
+    assert_eq!(pt.build_string(), "Hello world!");
     assert_eq!(pt.piece_count(), 3); // [Hello , world, !]
 
     // Insert in middle (inside the original "world" piece)
     // "Hello " is 6 chars. "world" is at 6..11.
     // Insert "beautiful " at index 6:
     pt.insert(6, "beautiful ");
-    assert_eq!(pt.as_str(), "Hello beautiful world!");
+    assert_eq!(pt.build_string(), "Hello beautiful world!");
     // Splitting "world" into "" and "world" or inserting between pieces
     assert_eq!(pt.char_count(), 22);
 }
@@ -72,26 +71,26 @@ fn test_deletions_and_piece_coalescing() {
 
     // Delete "quick " (5..11)
     pt.delete(4..10);
-    assert_eq!(pt.as_str(), "The brown fox jumps over the lazy dog");
+    assert_eq!(pt.build_string(), "The brown fox jumps over the lazy dog");
 
     // Delete spanning multiple words
     // Delete "brown fox "
     pt.delete(4..14);
-    assert_eq!(pt.as_str(), "The jumps over the lazy dog");
+    assert_eq!(pt.build_string(), "The jumps over the lazy dog");
 
     // Delete from start
     pt.delete(0..4);
-    assert_eq!(pt.as_str(), "jumps over the lazy dog");
+    assert_eq!(pt.build_string(), "jumps over the lazy dog");
 
     // Delete to end (" dog" is 4 chars)
     let len = pt.char_count();
     pt.delete(len - 4..len);
-    assert_eq!(pt.as_str(), "jumps over the lazy");
+    assert_eq!(pt.build_string(), "jumps over the lazy");
 
     // Clear all
     pt.clear();
     assert!(pt.is_empty());
-    assert_eq!(pt.as_str(), "");
+    assert_eq!(pt.build_string(), "");
     assert_eq!(pt.piece_count(), 0);
 }
 
@@ -117,28 +116,28 @@ fn test_multibyte_unicode_offsets() {
 
     // Insert an emoji in the middle
     pt.insert(2, "🚀 ");
-    assert_eq!(pt.as_str(), "🦀 🚀 café");
+    assert_eq!(pt.build_string(), "🦀 🚀 café");
     assert_eq!(pt.char_count(), 8);
 
     // Delete the original emoji
     pt.delete(0..2);
-    assert_eq!(pt.as_str(), "🚀 café");
+    assert_eq!(pt.build_string(), "🚀 café");
 }
 
 #[test]
 fn test_egui_text_buffer_trait() {
     let mut pt = PieceTable::from_str("Line 1\nLine 2");
 
-    // Check trait methods
-    assert_eq!(TextBuffer::as_str(&pt), "Line 1\nLine 2");
-    assert_eq!(pt.insert_text("Inserted ", eframe::egui::text::CharIndex(7)), 9);
-    assert_eq!(pt.as_str(), "Line 1\nInserted Line 2");
+    // Check inherent methods (formerly egui::TextBuffer trait methods)
+    assert_eq!(pt.build_string(), "Line 1\nLine 2");
+    assert_eq!(pt.insert_text("Inserted ", 7), 9);
+    assert_eq!(pt.build_string(), "Line 1\nInserted Line 2");
 
-    pt.delete_char_range(eframe::egui::text::CharIndex(7)..eframe::egui::text::CharIndex(16));
-    assert_eq!(pt.as_str(), "Line 1\nLine 2");
+    pt.delete_char_range(7..16);
+    assert_eq!(pt.build_string(), "Line 1\nLine 2");
 
     pt.replace_with("Replaced");
-    assert_eq!(pt.as_str(), "Replaced");
+    assert_eq!(pt.build_string(), "Replaced");
 
     let taken = pt.take();
     assert_eq!(taken, "Replaced");
@@ -163,7 +162,7 @@ fn test_piece_table_large_edit_performance() {
 
     // Fast check: neither original buffer was shifted in memory
     assert!(pt.len() > doc_content.len());
-    assert!(pt.as_str().contains("debugging hot path performance"));
+    assert!(pt.build_string().contains("debugging hot path performance"));
 }
 
 #[test]
@@ -197,22 +196,22 @@ fn test_piece_table_snapshot_and_restore_zero_copy() {
 
     // Edit 2: delete " world" -> "Hello, Rust"
     pt.delete(11..17);
-    assert_eq!(pt.as_str(), "Hello, Rust");
+    assert_eq!(pt.build_string(), "Hello, Rust");
     let snap2 = pt.snapshot();
 
     // Undo to snap1
     pt.restore_snapshot(&snap1);
-    assert_eq!(pt.as_str(), "Hello, Rust world");
+    assert_eq!(pt.build_string(), "Hello, Rust world");
     assert_eq!(pt.char_count(), 17);
 
     // Undo to snap0 (single original piece)
     pt.restore_snapshot(&snap0);
-    assert_eq!(pt.as_str(), "Hello world");
+    assert_eq!(pt.build_string(), "Hello world");
     assert_eq!(pt.piece_count(), 1);
 
     // Redo to snap2
     pt.restore_snapshot(&snap2);
-    assert_eq!(pt.as_str(), "Hello, Rust");
+    assert_eq!(pt.build_string(), "Hello, Rust");
 }
 
 #[test]
@@ -503,7 +502,7 @@ fn test_clone_is_independent() {
 fn test_clear_and_replace_with() {
     let mut pt = PieceTable::from_str("old\ncontent");
     pt.insert(3, "!");
-    TextBuffer::replace_with(&mut pt, "new\n日本");
+    pt.replace_with("new\n日本");
     assert_eq!(pt, "new\n日本");
     assert_eq!(pt.line_count(), 2);
     pt.insert(0, ">");
@@ -511,7 +510,7 @@ fn test_clear_and_replace_with() {
     pt.clear();
     assert!(pt.is_empty());
     assert_eq!(pt.piece_count(), 0);
-    assert_eq!(TextBuffer::take(&mut PieceTable::from_str("xy")), "xy");
+    assert_eq!(PieceTable::from_str("xy").take(), "xy");
 }
 
 #[test]
@@ -550,8 +549,6 @@ fn test_crlf_detection_across_piece_boundary() {
 
 #[test]
 fn test_crlf_line_char_range_and_replace_with() {
-    use eframe::egui::TextBuffer;
-
     let pt = PieceTable::from_str("one\r\ntwo\r\nthree");
     assert_eq!(pt.line_count(), 3);
     assert_eq!(pt.line_char_range(0), 0..3);
@@ -576,4 +573,27 @@ fn test_crlf_line_char_range_and_replace_with() {
     assert_eq!(split.char_count(), 5);
     assert_eq!(split.line_count(), 1);
     assert_eq!(split.piece_count(), 1);
+}
+
+#[test]
+fn test_reentrant_with_str_and_multi_piece_equality() {
+    let mut pt1 = PieceTable::from_str("hello world");
+    pt1.insert(5, ", Rust");
+    assert!(pt1.piece_count() > 1);
+
+    // Re-entrant `with_str` on the same multi-piece table must not panic with BorrowMutError
+    pt1.with_str(|outer| {
+        pt1.with_str(|inner| {
+            assert_eq!(outer, inner);
+            assert_eq!(inner, "hello, Rust world");
+        });
+    });
+
+    // Different piece layouts with identical content must compare equal without flattening
+    let mut pt2 = PieceTable::from_str("hello, ");
+    pt2.insert(7, "Rust ");
+    pt2.insert(12, "world");
+    assert_ne!(pt1.piece_count(), pt2.piece_count());
+    assert_eq!(pt1, pt2);
+    assert_eq!(pt1, pt1);
 }
