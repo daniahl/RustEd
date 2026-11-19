@@ -5,6 +5,7 @@
 //! - `document`: Document state, buffer management, syntax highlighting, line numbers, and Find dialog.
 //! - `editor`: High-performance custom text editor widget with full AccessKit accessibility support.
 //! - `explorer`: File tree sidebar, inline filesystem operations (create/rename), and recycle bin support.
+//! - `folding`: Simple code folding by matching `{ }` braces and indentation levels.
 //! - `terminal`: Embedded ConPTY terminal pane with VT100 emulation.
 //! - `watcher`: Background filesystem watcher for syncing tree and open files with disk.
 
@@ -12,6 +13,7 @@ pub mod app;
 pub mod document;
 pub mod editor;
 pub mod explorer;
+pub mod folding;
 pub mod piece_table;
 pub mod platform;
 pub mod terminal;

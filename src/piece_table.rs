@@ -730,6 +730,13 @@ impl PieceTable {
         writer.flush()
     }
 
+    /// Invokes `f` with each contiguous `&str` piece in order without flattening the buffer.
+    pub fn for_each_chunk(&self, mut f: impl FnMut(&str)) {
+        for p in self.pieces.iter() {
+            f(p.get_text(&self.original, &self.added));
+        }
+    }
+
     /// Compares the piece table contents against `other` without allocating a flattened string.
     pub fn eq_str(&self, other: &str) -> bool {
         if self.total_bytes != other.len() {

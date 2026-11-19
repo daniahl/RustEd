@@ -5,13 +5,14 @@
 
 use crate::{
     editor::{self, EditorBuffer, FastEditor},
+    folding::FoldState,
     piece_table::{PieceTable, PieceTableSnapshot},
     watcher::{path_starts_with, path_strip_prefix, paths_equal},
 };
 use eframe::egui;
 use egui_extras::syntax_highlighting::{self, CodeTheme};
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
     fs,
     path::{Path, PathBuf},
     sync::Arc,
@@ -40,9 +41,11 @@ const GUTTER_MIN_DIGITS: usize = 3;
 /// Approximate width of one monospace digit in points.
 const GUTTER_DIGIT_WIDTH: f32 = 9.0;
 /// Extra padding added to the computed gutter width.
-const GUTTER_PADDING: f32 = 20.0;
-/// Right-side offset for the gutter line-number text.
-const GUTTER_TEXT_RIGHT_OFFSET: f32 = 10.0;
+const GUTTER_PADDING: f32 = 16.0;
+/// Width reserved in the gutter for clickable code-folding chevrons.
+const FOLD_GUTTER_WIDTH: f32 = 16.0;
+/// Right-side offset for the gutter line-number text (before the fold column).
+const GUTTER_TEXT_RIGHT_OFFSET: f32 = 6.0;
 /// Right-side offset for the gutter separator line.
 const GUTTER_SEPARATOR_OFFSET: f32 = 4.0;
 
@@ -166,6 +169,7 @@ pub struct UnsavedFileState {
     pub saved_snapshot: Option<PieceTableSnapshot>,
     pub saved_revision: u64,
     pub editor_state: Option<editor::FastEditorState>,
+    pub folded_lines: BTreeSet<usize>,
     pub line_count: usize,
     pub cursor_line: usize,
     pub cursor_col: usize,
@@ -188,6 +192,8 @@ pub struct Document {
     /// Per-row logical line number (0 = wrapped continuation row), for the gutter.
     /// Rebuilt only when the editor's galley changes.
     pub gutter_cache: Option<(Arc<egui::Galley>, Vec<u32>)>,
+    /// Code folding ranges and collapsed fold state.
+    pub folding: FoldState,
     /// Line count from the last rebuild, used to size the gutter.
     pub line_count: usize,
     pub cursor_line: usize,
@@ -226,6 +232,7 @@ impl Document {
             language_salt: hash_language_salt("rs"),
             line_ending: "LF",
             gutter_cache: None,
+            folding: FoldState::new(),
             line_count: 1,
             cursor_line: 1,
             cursor_col: 1,
@@ -246,6 +253,7 @@ impl Document {
         self.text = text.into();
         self.text_revision = self.text_revision.wrapping_add(1);
         self.gutter_cache = None;
+        self.folding.clear();
         self.line_count = self.text.line_count();
         self.refresh_line_ending();
     }
@@ -324,6 +332,7 @@ impl Document {
                     saved_snapshot: self.saved_snapshot.take(),
                     saved_revision: self.saved_revision,
                     editor_state: prev_state,
+                    folded_lines: self.folding.folded_lines().clone(),
                     line_count: self.line_count,
                     cursor_line: self.cursor_line,
                     cursor_col: self.cursor_col,
@@ -335,6 +344,7 @@ impl Document {
         self.path = chosen.clone();
         self.text_revision = self.text_revision.wrapping_add(1);
         self.gutter_cache = None;
+        self.folding.clear();
         self.external_conflict = None;
         self.last_save_error = None;
 
@@ -344,6 +354,7 @@ impl Document {
                 self.saved_snapshot = unsaved.saved_snapshot;
                 self.saved_revision = unsaved.saved_revision;
                 self.is_current_dirty = self.text_revision != self.saved_revision;
+                self.folding.set_folded_lines(unsaved.folded_lines);
                 self.line_count = unsaved.line_count;
                 self.cursor_line = unsaved.cursor_line;
                 self.cursor_col = unsaved.cursor_col;
@@ -490,6 +501,9 @@ impl Document {
         st.last_undo_snapshot = Some(self.text.undo_snapshot());
 
         let (line, col) = self.text.char_to_line_col(primary_idx);
+        self.folding
+            .ensure_updated_buffer(&self.text, Some(self.text_revision));
+        self.folding.unfold_containing(line);
         self.cursor_line = line + 1;
         self.cursor_col = col + 1;
         self.selected_chars = primary_idx.abs_diff(secondary_idx);
@@ -514,6 +528,7 @@ impl Document {
                 self.text_revision = self.text_revision.wrapping_add(1);
                 self.saved_revision = self.text_revision;
                 self.gutter_cache = None;
+                self.folding.clear();
                 self.line_count = 1;
                 self.cursor_line = 1;
                 self.cursor_col = 1;
@@ -715,6 +730,14 @@ impl Document {
         let match_start_char = self.text.byte_to_char(match_byte);
         let match_end_char = match_start_char + self.find_query.chars().count();
 
+        self.folding
+            .ensure_updated_buffer(&self.text, Some(self.text_revision));
+        let (start_line, _) = self.text.char_to_line_col(match_start_char);
+        let (end_line, _) = self.text.char_to_line_col(match_end_char);
+        for line in start_line..=end_line {
+            self.folding.unfold_containing(line);
+        }
+
         state.cursor.set_char_range(Some(egui::text::CCursorRange::two(
             egui::text::CCursor::new(match_start_char),
             egui::text::CCursor::new(match_end_char),
@@ -724,6 +747,113 @@ impl Document {
         editor::request_editor_focus(ctx, editor_id);
         ctx.request_repaint();
         true
+    }
+
+    fn current_cursor_doc_line(&self, ctx: &egui::Context) -> usize {
+        let editor_id = editor::code_editor_id();
+        if let Some(state) = ctx.data_mut(|d| d.get_temp::<editor::FastEditorState>(editor_id)) {
+            if let Some(range) = state.cursor.char_range() {
+                return self.text.char_to_line_col(range.primary.index.0).0;
+            }
+        }
+        self.cursor_line.saturating_sub(1)
+    }
+
+    fn clamp_cursor_out_of_hidden(&mut self, ctx: &egui::Context) {
+        if !self.folding.has_active_folds() {
+            return;
+        }
+        let editor_id = editor::code_editor_id();
+        let Some(mut state) = ctx.data_mut(|d| d.get_temp::<editor::FastEditorState>(editor_id))
+        else {
+            return;
+        };
+        let Some(range) = state.cursor.char_range() else {
+            return;
+        };
+        let (cur_line, _) = self.text.char_to_line_col(range.primary.index.0);
+        if self.folding.is_line_hidden(cur_line) {
+            let ancestor = self.folding.outermost_visible_ancestor(cur_line);
+            let target_char = self.text.line_char_range(ancestor).end;
+            let c = egui::text::CCursor::new(target_char);
+            state.cursor.set_char_range(Some(egui::text::CCursorRange::one(c)));
+            state.scroll_to_cursor = true;
+            let (line, col) = self.text.char_to_line_col(target_char);
+            self.cursor_line = line + 1;
+            self.cursor_col = col + 1;
+            self.selected_chars = 0;
+            ctx.data_mut(|d| d.insert_temp(editor_id, state));
+        }
+    }
+
+    /// Toggles the fold starting at 0-based `doc_line`.
+    pub fn toggle_fold_at(&mut self, ctx: &egui::Context, doc_line: usize) -> bool {
+        self.folding
+            .ensure_updated_buffer(&self.text, Some(self.text_revision));
+        if self.folding.toggle_fold(doc_line) {
+            self.clamp_cursor_out_of_hidden(ctx);
+            ctx.request_repaint();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Folds the region at the cursor line or its innermost enclosing foldable region.
+    pub fn fold_current(&mut self, ctx: &egui::Context) -> bool {
+        self.folding
+            .ensure_updated_buffer(&self.text, Some(self.text_revision));
+        let cur_line = self.current_cursor_doc_line(ctx);
+        if self.folding.fold_at_or_enclosing(cur_line).is_some() {
+            self.clamp_cursor_out_of_hidden(ctx);
+            ctx.request_repaint();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Unfolds the region at the cursor line or its innermost enclosing folded region.
+    pub fn unfold_current(&mut self, ctx: &egui::Context) -> bool {
+        self.folding
+            .ensure_updated_buffer(&self.text, Some(self.text_revision));
+        let cur_line = self.current_cursor_doc_line(ctx);
+        if self.folding.unfold_at_or_enclosing(cur_line).is_some() {
+            ctx.request_repaint();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Collapses all foldable regions in the document.
+    pub fn fold_all(&mut self, ctx: &egui::Context) -> bool {
+        self.folding
+            .ensure_updated_buffer(&self.text, Some(self.text_revision));
+        if self.folding.fold_all() {
+            self.clamp_cursor_out_of_hidden(ctx);
+            ctx.request_repaint();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Expands all collapsed folds in the document.
+    pub fn unfold_all(&mut self, ctx: &egui::Context) -> bool {
+        if self.folding.unfold_all() {
+            let editor_id = editor::code_editor_id();
+            ctx.data_mut(|d| {
+                if let Some(mut state) = d.get_temp::<editor::FastEditorState>(editor_id) {
+                    state.scroll_to_cursor = true;
+                    d.insert_temp(editor_id, state);
+                }
+            });
+            ctx.request_repaint();
+            true
+        } else {
+            false
+        }
     }
 
     pub fn show_find_dialog(&mut self, ctx: &egui::Context) {
@@ -835,13 +965,39 @@ impl Document {
         if !stale {
             return;
         }
+        let doc_lines = self.text.line_count().max(1);
+        let has_folds = self.folding.has_active_folds();
         let mut nums = Vec::with_capacity(output.galley.rows.len());
-        let new_count = if output.virtualized {
-            let base = output.first_line as u32;
-            for i in 0..output.galley.rows.len() {
-                nums.push(base + i as u32 + 1);
+        if output.virtualized {
+            if has_folds {
+                let vis = self.folding.visible_lines(doc_lines);
+                for i in 0..output.galley.rows.len() {
+                    let vis_idx = output.first_line + i;
+                    let doc_line = vis.get(vis_idx).copied().unwrap_or(vis_idx);
+                    nums.push((doc_line + 1) as u32);
+                }
+            } else {
+                let base = output.first_line as u32;
+                for i in 0..output.galley.rows.len() {
+                    nums.push(base + i as u32 + 1);
+                }
             }
-            self.text.line_count().max(1)
+        } else if has_folds {
+            let vis = self.folding.visible_lines(doc_lines);
+            let mut vis_idx = 0usize;
+            let mut line_no = 1u32;
+            let mut new_line = true;
+            for row in &output.galley.rows {
+                if new_line {
+                    let doc_line = vis.get(vis_idx).copied().unwrap_or(vis_idx);
+                    vis_idx += 1;
+                    line_no = (doc_line + 1) as u32;
+                    nums.push(line_no);
+                } else {
+                    nums.push(line_no | WRAPPED_ROW_FLAG);
+                }
+                new_line = row.ends_with_newline;
+            }
         } else {
             let mut line_no = 0u32;
             let mut new_line = true;
@@ -854,8 +1010,8 @@ impl Document {
                 }
                 new_line = row.ends_with_newline;
             }
-            (line_no as usize).max(1)
-        };
+        }
+        let new_count = doc_lines;
         if new_count.max(1).ilog10() != self.line_count.max(1).ilog10() {
             ctx.request_repaint();
         }
@@ -863,29 +1019,14 @@ impl Document {
         self.gutter_cache = Some((Arc::clone(&output.galley), nums));
     }
 
-    /// Updates cursor line/column/selection status fields from the editor output,
-    /// returning the active document row index for gutter highlighting.
-    fn update_cursor_status(&mut self, output: &editor::EditorOutput) -> Option<usize> {
-        let cursor_range = output.cursor_range?;
-        let (line, col, active_row) = if output.virtualized {
-            let (line, col) = self.text.char_to_line_col(cursor_range.primary.index.0);
-            (line + 1, col + 1, line)
-        } else {
-            let focus = output.galley.layout_from_cursor(cursor_range.primary);
-            let line = if let Some((_, nums)) = &self.gutter_cache {
-                if nums.is_empty() {
-                    1
-                } else {
-                    let end = focus.row.min(nums.len() - 1);
-                    ((nums[end] & !WRAPPED_ROW_FLAG) as usize).max(1)
-                }
-            } else {
-                focus.row + 1
-            };
-            (line, focus.column.0 + 1, focus.row)
+    /// Updates cursor line/column/selection status fields from the editor output.
+    fn update_cursor_status(&mut self, output: &editor::EditorOutput) {
+        let Some(cursor_range) = output.cursor_range else {
+            return;
         };
-        self.cursor_line = line;
-        self.cursor_col = col;
+        let (line, col) = self.text.char_to_line_col(cursor_range.primary.index.0);
+        self.cursor_line = line + 1;
+        self.cursor_col = col + 1;
         self.selected_chars = if cursor_range.is_empty() {
             0
         } else {
@@ -895,7 +1036,6 @@ impl Document {
                 .0
                 .abs_diff(cursor_range.secondary.index.0)
         };
-        Some(active_row)
     }
 
     /// Renders the save-error and external-conflict banners at the top of the editor panel.
@@ -981,7 +1121,9 @@ impl Document {
                     // scanning the whole text every frame.
                     let line_count = self.line_count.max(1);
                     let digits = line_count.ilog10() as usize + 1;
-                    let gutter_width = (digits.max(GUTTER_MIN_DIGITS) as f32) * GUTTER_DIGIT_WIDTH + GUTTER_PADDING;
+                    let gutter_width = (digits.max(GUTTER_MIN_DIGITS) as f32) * GUTTER_DIGIT_WIDTH
+                        + GUTTER_PADDING
+                        + FOLD_GUTTER_WIDTH;
 
                     ui.horizontal_top(|ui| {
                         ui.spacing_mut().item_spacing.x = 0.0;
@@ -995,27 +1137,28 @@ impl Document {
                             available_size.y,
                         );
 
+                        self.folding
+                            .ensure_updated_buffer(&self.text, Some(text_revision));
+
                         let is_large = self.text.len() > MAX_HIGHLIGHT_BYTES;
                         let newline = if self.line_ending == "CRLF" { "\r\n" } else { "\n" };
                         let output = {
                             let language = self.language_ext.as_str();
                             let font_id_for_layout = font_id.clone();
-                            let mut layouter = |ui: &egui::Ui, text: &PieceTable, wrap_width: f32| {
-                                let layout_job = if text.len() <= MAX_HIGHLIGHT_BYTES {
-                                    text.with_str(|s| {
-                                        let mut job = syntax_highlighting::highlight(
-                                            ui.ctx(),
-                                            ui.style(),
-                                            &theme,
-                                            s,
-                                            language,
-                                        );
-                                        job.wrap.max_width = wrap_width;
-                                        job
-                                    })
+                            let mut layouter = |ui: &egui::Ui, s: &str, wrap_width: f32| {
+                                let layout_job = if s.len() <= MAX_HIGHLIGHT_BYTES {
+                                    let mut job = syntax_highlighting::highlight(
+                                        ui.ctx(),
+                                        ui.style(),
+                                        &theme,
+                                        s,
+                                        language,
+                                    );
+                                    job.wrap.max_width = wrap_width;
+                                    job
                                 } else {
                                     egui::text::LayoutJob::simple(
-                                        text.build_string(),
+                                        s.to_owned(),
                                         font_id_for_layout.clone(),
                                         text_color,
                                         wrap_width,
@@ -1023,7 +1166,7 @@ impl Document {
                                 };
                                 ui.fonts_mut(|f| f.layout_job(layout_job))
                             };
-                            FastEditor::new_with_buffer(
+                            FastEditor::new(
                                 editor::code_editor_id(),
                                 &mut self.text,
                                 editor_min_size,
@@ -1033,6 +1176,7 @@ impl Document {
                             .text_revision(text_revision)
                             .newline(newline)
                             .virtualized(is_large)
+                            .fold_state(&mut self.folding)
                             .show(ui)
                         };
                         if self.focus_editor {
@@ -1042,24 +1186,34 @@ impl Document {
                         editor_text_changed = output.text_changed;
 
                         self.rebuild_gutter_cache(ui.ctx(), &output);
-                        let active_row = self.update_cursor_status(&output);
+                        self.update_cursor_status(&output);
+
+                        let bottom_y = gutter_rect.max.y.max(output.response.rect.max.y);
+                        let full_gutter_rect = egui::Rect::from_min_max(
+                            gutter_rect.min,
+                            egui::pos2(gutter_rect.max.x, bottom_y),
+                        );
+                        let gutter_resp = ui.interact(
+                            full_gutter_rect,
+                            egui::Id::unique("editor_gutter"),
+                            egui::Sense::click(),
+                        );
 
                         let clip_rect = ui.clip_rect();
-                        let painter = ui.painter();
-                        paint_gutter(
-                            painter,
+                        let clicked_fold_line = paint_gutter(
+                            ui,
                             &output.galley,
                             output.galley_pos,
                             clip_rect,
                             gutter_rect,
+                            &gutter_resp,
                             self.gutter_cache.as_ref().map(|(_, n)| n.as_slice()),
-                            active_row,
-                            output.first_line,
+                            self.cursor_line,
+                            &self.folding,
                             &font_id,
-                            ui.visuals(),
                         );
 
-                        let bottom_y = gutter_rect.max.y.max(output.response.rect.max.y);
+                        let painter = ui.painter();
                         painter.line_segment(
                             [
                                 egui::pos2(gutter_rect.max.x - GUTTER_SEPARATOR_OFFSET, gutter_rect.min.y),
@@ -1067,6 +1221,11 @@ impl Document {
                             ],
                             ui.visuals().widgets.noninteractive.bg_stroke,
                         );
+
+                        if let Some(doc_line) = clicked_fold_line {
+                            self.toggle_fold_at(ctx, doc_line);
+                            editor::request_editor_focus(ctx, editor::code_editor_id());
+                        }
                     });
                 });
         });
@@ -1090,53 +1249,117 @@ impl Document {
     }
 }
 
-/// Paints visible line-number gutter rows without allocating per-line strings.
+/// Paints visible line-number gutter rows and interactive fold chevrons without allocating
+/// per-line strings. Returns `Some(doc_line)` (0-based) if the user clicked a fold chevron.
 ///
 /// Binary-searches the first visible row (`partition_point`) and only draws rows
 /// whose numbers are not wrapped-continuation rows (`WRAPPED_ROW_FLAG` unset).
 #[allow(clippy::too_many_arguments)]
 fn paint_gutter(
-    painter: &egui::Painter,
+    ui: &egui::Ui,
     galley: &Arc<egui::Galley>,
     galley_pos: egui::Pos2,
     clip_rect: egui::Rect,
     gutter_rect: egui::Rect,
+    gutter_resp: &egui::Response,
     nums: Option<&[u32]>,
-    active_row: Option<usize>,
-    first_line: usize,
+    active_line: usize,
+    folding: &FoldState,
     font_id: &egui::FontId,
-    visuals: &egui::Visuals,
-) {
-    let Some(nums) = nums else { return };
+) -> Option<usize> {
+    let nums = nums?;
     let rows = &galley.rows;
+    let painter = ui.painter();
+    let visuals = ui.visuals();
+
+    let num_right_x = gutter_rect.max.x - GUTTER_SEPARATOR_OFFSET - FOLD_GUTTER_WIDTH - GUTTER_TEXT_RIGHT_OFFSET;
+    let fold_left_x = gutter_rect.max.x - GUTTER_SEPARATOR_OFFSET - FOLD_GUTTER_WIDTH;
+    let fold_right_x = gutter_rect.max.x - GUTTER_SEPARATOR_OFFSET;
+
+    let hover_pos = ui.ctx().pointer_hover_pos();
+    let click_pos = if gutter_resp.clicked() {
+        gutter_resp.interact_pointer_pos()
+    } else {
+        None
+    };
+
     // Binary-search the first visible row; draw only visible rows.
     let top = clip_rect.min.y - galley_pos.y;
     let first = rows.partition_point(|r| r.rect().max.y < top);
     let mut num_buf = [0u8; 16];
+    let mut clicked_fold_line = None;
+
     for (row_idx, row) in rows.iter().enumerate().skip(first) {
-        let y = galley_pos.y + row.rect().min.y;
-        if y > clip_rect.max.y {
+        let row_top = galley_pos.y + row.rect().min.y;
+        if row_top > clip_rect.max.y {
             break;
         }
         let n = nums.get(row_idx).copied().unwrap_or(0);
         if n == 0 || (n & WRAPPED_ROW_FLAG) != 0 {
             continue;
         }
-        let doc_row_idx = first_line + row_idx;
-        let color = if active_row == Some(doc_row_idx) {
+        let color = if n as usize == active_line {
             visuals.strong_text_color()
         } else {
             visuals.weak_text_color()
         };
         let label_str = format_u32_stack(n, &mut num_buf);
         painter.text(
-            egui::pos2(gutter_rect.max.x - GUTTER_TEXT_RIGHT_OFFSET, y),
+            egui::pos2(num_right_x, row_top),
             egui::Align2::RIGHT_TOP,
             label_str,
             font_id.clone(),
             color,
         );
+
+        let doc_line = (n - 1) as usize;
+        if folding.fold_range_at(doc_line).is_some() {
+            let row_bottom = galley_pos.y + row.rect().max.y;
+            let hit_rect = egui::Rect::from_min_max(
+                egui::pos2(fold_left_x, row_top),
+                egui::pos2(fold_right_x, row_bottom),
+            );
+            let is_folded = folding.is_folded(doc_line);
+            let is_hovered = hover_pos.is_some_and(|p| hit_rect.contains(p));
+            if is_hovered {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                painter.rect_filled(hit_rect.shrink(1.0), 2.0, visuals.widgets.hovered.bg_fill);
+            }
+            if click_pos.is_some_and(|p| hit_rect.contains(p)) {
+                clicked_fold_line = Some(doc_line);
+            }
+
+            let center = hit_rect.center();
+            let r = 3.5_f32;
+            let points = if is_folded {
+                // Right-pointing triangle (collapsed)
+                vec![
+                    egui::pos2(center.x - r * 0.55, center.y - r),
+                    egui::pos2(center.x + r * 0.85, center.y),
+                    egui::pos2(center.x - r * 0.55, center.y + r),
+                ]
+            } else {
+                // Downward-pointing triangle (expanded)
+                vec![
+                    egui::pos2(center.x - r, center.y - r * 0.55),
+                    egui::pos2(center.x + r, center.y - r * 0.55),
+                    egui::pos2(center.x, center.y + r * 0.85),
+                ]
+            };
+            let tri_color = if is_folded || is_hovered {
+                visuals.strong_text_color()
+            } else {
+                visuals.weak_text_color()
+            };
+            painter.add(egui::Shape::convex_polygon(
+                points,
+                tri_color,
+                egui::Stroke::NONE,
+            ));
+        }
     }
+
+    clicked_fold_line
 }
 
 pub fn hash_language_salt(lang: &str) -> u64 {

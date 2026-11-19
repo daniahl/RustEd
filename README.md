@@ -18,6 +18,7 @@ RustEd is built from the ground up with assistive technologies—especially **Wi
 - **Revision-Cached Text Layout:** Reuses `Galley` layouts in $O(1)$ across unchanged frames and coalesces multiple input events within a single frame into one layout pass.
 - **Viewport-Culled Selection & Gutter Rendering:** Binary-searches visible rows (`partition_point`) for both text selection highlights and line-number gutter rendering without cloning the underlying `Galley` or allocating per-line strings.
 - **Syntax Highlighting:** Automatic language detection and syntax highlighting via `egui_extras` + `syntect` for files up to 16 KB, seamlessly falling back to plain monospace layout on larger files to keep typing latency minimal.
+- **Code Folding (`Alt+Left` / `Alt+Right` / `Alt+Shift+Left` / `Alt+Shift+Right`):** Collapse and expand code blocks by matching `{ }` braces and indentation levels via clickable gutter chevrons, inline `...` badges, or keyboard shortcuts—`Alt+Left` to fold the current/enclosing block (repeat to fold outward), `Alt+Right` to unfold, `Alt+Shift+Left` to fold all, and `Alt+Shift+Right` to unfold all. Search matches (`Ctrl+F` / `F3`) automatically unfold containing blocks, and true document line numbers remain visible in the gutter.
 - **Find & Find Next (`Ctrl+F` / `F3`):** Open the floating **Find** dialog via the top-bar **Find** button or `Ctrl+F` (pre-populated with the current single-line selection). Press `Enter` or click **Find** to close the dialog, jump to, and select the match in the editor. Press `F3` at any time to cycle through subsequent matches (wrapping around the document).
 - **Multi-File Unsaved State Tracking:** Switch freely between files in the project tree without losing unsaved edits, cursor positions, selections, or undo/redo history. Modified files are marked with an asterisk (`*`) in the file tree, and the **Save** button dynamically enables only when the active file has unsaved changes.
 - **Undo / Redo & Clipboard Support:** Full `Ctrl+Z` / `Ctrl+Y` history backed by shared `Arc<String>` snapshots, plus `Ctrl+C`, `Ctrl+X`, `Ctrl+V`, word-wise deletion (`Ctrl+Backspace`, `Ctrl+Delete`), and `PageUp` / `PageDown` navigation.
@@ -42,9 +43,10 @@ RustEd is built from the ground up with assistive technologies—especially **Wi
 - `src/editor.rs` — Custom `FastEditor` widget with layout caching, windowed virtualization, CRLF-aware navigation/editing, coalesced event handling, undo/redo history, and AccessKit `TextRun` generation.
 - `src/piece_table.rs` — Rope/chunk-cached `PieceTable` buffer with line-feed checkpoints, CRLF-aware line indexing, zero-flatten incremental search (`find_from_byte`), and structural snapshots.
 - `src/explorer.rs` — Lazy-loading `FileExplorer` tree with case-insensitive sorting, inline create/rename, and Windows Recycle Bin deletion.
+- `src/folding.rs` — Single-pass `{ }` brace and indentation-level code folding (`FoldState`, `FoldView`) with display-to-document coordinate projection.
 - `src/terminal.rs` — Windows ConPTY `TerminalPane` with background I/O threads, `vt100` screen parsing, DSR cursor query replies (`contains_dsr_request`), and clean PTY shutdown on drop/restart.
 - `src/watcher.rs` — Windows `ReadDirectoryChangesW` filesystem watcher and Windows-aware path comparison helpers (`paths_equal`, `path_starts_with`, `path_strip_prefix`).
-- `tests/cases/` — Unit and headless GUI integration tests (`app_integration.rs`, `document_tests.rs`, `editor_buffer_tests.rs`, `editor_integration.rs`, `explorer_tests.rs`, `piece_table_tests.rs`, `terminal_tests.rs`, `watcher_tests.rs`).
+- `tests/cases/` — Unit and headless GUI integration tests (`app_integration.rs`, `document_tests.rs`, `editor_buffer_tests.rs`, `editor_integration.rs`, `explorer_tests.rs`, `folding_tests.rs`, `piece_table_tests.rs`, `terminal_tests.rs`, `watcher_tests.rs`).
 
 ---
 

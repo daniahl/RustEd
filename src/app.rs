@@ -215,14 +215,36 @@ impl TextEditor {
         }
 
         if self.tab == Tab::Editor {
-            let (ctrl_s, ctrl_f, f3) = ctx.input_mut(|i| {
-                let ctrl_s = i.consume_key(egui::Modifiers::COMMAND, egui::Key::S)
-                    || i.consume_key(egui::Modifiers::CTRL, egui::Key::S);
-                let ctrl_f = i.consume_key(egui::Modifiers::COMMAND, egui::Key::F)
-                    || i.consume_key(egui::Modifiers::CTRL, egui::Key::F);
-                let f3 = i.consume_key(egui::Modifiers::NONE, egui::Key::F3);
-                (ctrl_s, ctrl_f, f3)
-            });
+            let (ctrl_s, ctrl_f, f3, fold_cur, unfold_cur, fold_all, unfold_all) =
+                ctx.input_mut(|i| {
+                    let ctrl_s = i.consume_key(egui::Modifiers::COMMAND, egui::Key::S)
+                        || i.consume_key(egui::Modifiers::CTRL, egui::Key::S);
+                    let ctrl_f = i.consume_key(egui::Modifiers::COMMAND, egui::Key::F)
+                        || i.consume_key(egui::Modifiers::CTRL, egui::Key::F);
+                    let f3 = i.consume_key(egui::Modifiers::NONE, egui::Key::F3);
+
+                    let (fold_cur, unfold_cur, fold_all, unfold_all) =
+                        if !self.doc.find_open && self.explorer.pending_tree_edit.is_none() {
+                            let alt = egui::Modifiers::ALT;
+                            let alt_shift = egui::Modifiers {
+                                alt: true,
+                                shift: true,
+                                ..Default::default()
+                            };
+                            // Check Alt+Shift before Alt because egui's `consume_key` matches
+                            // logically and can treat Shift as optional on arrow keys.
+                            let fold_all = i.consume_key(alt_shift, egui::Key::ArrowLeft);
+                            let unfold_all = i.consume_key(alt_shift, egui::Key::ArrowRight);
+                            let fold_cur = i.consume_key(alt, egui::Key::ArrowLeft);
+                            let unfold_cur = i.consume_key(alt, egui::Key::ArrowRight);
+                            (fold_cur, unfold_cur, fold_all, unfold_all)
+                        } else {
+                            (false, false, false, false)
+                        };
+                    (
+                        ctrl_s, ctrl_f, f3, fold_cur, unfold_cur, fold_all, unfold_all,
+                    )
+                });
             if ctrl_s && self.doc.can_save() {
                 self.doc.save_current_file();
             }
@@ -235,6 +257,18 @@ impl TextEditor {
                 } else {
                     self.doc.find_next(ctx);
                 }
+            }
+            if fold_cur {
+                self.doc.fold_current(ctx);
+            }
+            if unfold_cur {
+                self.doc.unfold_current(ctx);
+            }
+            if fold_all {
+                self.doc.fold_all(ctx);
+            }
+            if unfold_all {
+                self.doc.unfold_all(ctx);
             }
         }
 
