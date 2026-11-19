@@ -168,6 +168,7 @@ pub struct UnsavedFileState {
     pub text: PieceTable,
     pub saved_snapshot: Option<PieceTableSnapshot>,
     pub saved_revision: u64,
+    pub disk_stamp: Option<DiskStamp>,
     pub editor_state: Option<editor::FastEditorState>,
     pub folded_lines: BTreeSet<usize>,
     pub line_count: usize,
@@ -262,6 +263,40 @@ impl Document {
         !self.path.as_os_str().is_empty() && self.is_current_dirty
     }
 
+    pub fn has_unsaved_changes(&self) -> bool {
+        self.can_save() || !self.unsaved_files.is_empty()
+    }
+
+    pub fn save_all(&mut self) -> bool {
+        let mut all_ok = true;
+        if self.can_save() {
+            self.save_current_file();
+            if self.is_current_dirty {
+                all_ok = false;
+            }
+        }
+        let pending_paths: Vec<PathBuf> = self.unsaved_files.keys().cloned().collect();
+        for path in pending_paths {
+            let Some(state) = self.unsaved_files.get(&path) else {
+                continue;
+            };
+            match write_piece_table_atomic(&path, &state.text) {
+                Ok(()) => {
+                    self.unsaved_files.remove(&path);
+                }
+                Err(err) => {
+                    let name = path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("file");
+                    self.last_save_error = Some(format!("Failed to save {name}: {err}"));
+                    all_ok = false;
+                }
+            }
+        }
+        all_ok
+    }
+
     pub fn is_file_dirty(&self, path: &Path) -> bool {
         (self.is_current_dirty && !self.path.as_os_str().is_empty() && paths_equal(&self.path, path))
             || (!self.unsaved_files.is_empty() && has_unsaved_entry(&self.unsaved_files, path))
@@ -331,6 +366,7 @@ impl Document {
                     text: std::mem::take(&mut self.text),
                     saved_snapshot: self.saved_snapshot.take(),
                     saved_revision: self.saved_revision,
+                    disk_stamp: self.disk_stamp.clone(),
                     editor_state: prev_state,
                     folded_lines: self.folding.folded_lines().clone(),
                     line_count: self.line_count,
@@ -359,7 +395,26 @@ impl Document {
                 self.cursor_line = unsaved.cursor_line;
                 self.cursor_col = unsaved.cursor_col;
                 self.selected_chars = unsaved.selected_chars;
-                self.disk_stamp = read_disk_stamp(&chosen);
+                let current_stamp = read_disk_stamp(&chosen);
+                match (&unsaved.disk_stamp, &current_stamp) {
+                    (Some(_), None) => {
+                        self.disk_stamp = unsaved.disk_stamp;
+                        self.external_conflict = Some(ExternalConflict::DeletedOnDisk);
+                    }
+                    (Some(prev), Some(curr)) if prev != curr => {
+                        if fs::read_to_string(&chosen)
+                            .is_ok_and(|disk_text| self.text.eq_str(&disk_text))
+                        {
+                            self.disk_stamp = current_stamp;
+                        } else {
+                            self.disk_stamp = unsaved.disk_stamp;
+                            self.external_conflict = Some(ExternalConflict::ModifiedOnDisk);
+                        }
+                    }
+                    _ => {
+                        self.disk_stamp = current_stamp;
+                    }
+                }
                 self.refresh_file_metadata();
 
                 let editor_state = unsaved.editor_state;
@@ -771,9 +826,12 @@ impl Document {
         let Some(range) = state.cursor.char_range() else {
             return;
         };
-        let (cur_line, _) = self.text.char_to_line_col(range.primary.index.0);
-        if self.folding.is_line_hidden(cur_line) {
-            let ancestor = self.folding.outermost_visible_ancestor(cur_line);
+        let (pri_line, _) = self.text.char_to_line_col(range.primary.index.0);
+        let (sec_line, _) = self.text.char_to_line_col(range.secondary.index.0);
+        let pri_hidden = self.folding.is_line_hidden(pri_line);
+        let sec_hidden = self.folding.is_line_hidden(sec_line);
+        if pri_hidden {
+            let ancestor = self.folding.outermost_visible_ancestor(pri_line);
             let target_char = self.text.line_char_range(ancestor).end;
             let c = egui::text::CCursor::new(target_char);
             state.cursor.set_char_range(Some(egui::text::CCursorRange::one(c)));
@@ -782,6 +840,16 @@ impl Document {
             self.cursor_line = line + 1;
             self.cursor_col = col + 1;
             self.selected_chars = 0;
+            ctx.data_mut(|d| d.insert_temp(editor_id, state));
+        } else if sec_hidden {
+            let ancestor = self.folding.outermost_visible_ancestor(sec_line);
+            let sec_target = self.text.line_char_range(ancestor).end;
+            let new_sec = egui::text::CCursor::new(sec_target);
+            state.cursor.set_char_range(Some(egui::text::CCursorRange::two(
+                new_sec,
+                range.primary,
+            )));
+            self.selected_chars = range.primary.index.0.abs_diff(sec_target);
             ctx.data_mut(|d| d.insert_temp(editor_id, state));
         }
     }
@@ -922,7 +990,7 @@ impl Document {
                         .add_enabled(!self.find_query.is_empty(), egui::Button::new("Find"))
                         .on_hover_text("Find (Enter)")
                         .clicked()
-                        || enter_pressed
+                        || (enter_pressed && !self.find_query.is_empty())
                     {
                         trigger_find_next = true;
                         close_dialog = true;
@@ -1020,10 +1088,11 @@ impl Document {
     }
 
     /// Updates cursor line/column/selection status fields from the editor output.
-    fn update_cursor_status(&mut self, output: &editor::EditorOutput) {
+    fn update_cursor_status(&mut self, ctx: &egui::Context, output: &editor::EditorOutput) {
         let Some(cursor_range) = output.cursor_range else {
             return;
         };
+        let prev = (self.cursor_line, self.cursor_col, self.selected_chars);
         let (line, col) = self.text.char_to_line_col(cursor_range.primary.index.0);
         self.cursor_line = line + 1;
         self.cursor_col = col + 1;
@@ -1036,6 +1105,9 @@ impl Document {
                 .0
                 .abs_diff(cursor_range.secondary.index.0)
         };
+        if (self.cursor_line, self.cursor_col, self.selected_chars) != prev {
+            ctx.request_repaint();
+        }
     }
 
     /// Renders the save-error and external-conflict banners at the top of the editor panel.
@@ -1186,7 +1258,7 @@ impl Document {
                         editor_text_changed = output.text_changed;
 
                         self.rebuild_gutter_cache(ui.ctx(), &output);
-                        self.update_cursor_status(&output);
+                        self.update_cursor_status(ui.ctx(), &output);
 
                         let bottom_y = gutter_rect.max.y.max(output.response.rect.max.y);
                         let full_gutter_rect = egui::Rect::from_min_max(
@@ -1239,12 +1311,9 @@ impl Document {
             {
                 self.saved_revision = self.text_revision;
             }
-            let was_dirty = self.is_current_dirty;
             self.is_current_dirty =
                 !self.path.as_os_str().is_empty() && self.text_revision != self.saved_revision;
-            if was_dirty != self.is_current_dirty {
-                ctx.request_repaint();
-            }
+            ctx.request_repaint();
         }
     }
 }

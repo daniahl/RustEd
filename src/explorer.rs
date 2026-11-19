@@ -61,7 +61,9 @@ pub fn move_to_trash(path: &Path) -> bool {
     };
 
     let mut path_str = abs_path.to_string_lossy().into_owned();
-    if let Some(stripped) = path_str.strip_prefix(r"\\?\") {
+    if let Some(stripped) = path_str.strip_prefix(r"\\?\UNC\") {
+        path_str = format!(r"\\{stripped}");
+    } else if let Some(stripped) = path_str.strip_prefix(r"\\?\") {
         path_str = stripped.to_string();
     }
     while path_str.len() > 3 && (path_str.ends_with('\\') || path_str.ends_with('/')) {
@@ -252,9 +254,12 @@ impl FileNode {
                 let child = &self.children[idx];
                 if child.is_dir {
                     if paths_equal(changed_path, &child.path) {
-                        // Direct child directory created/deleted/renamed: refresh parent if missing
-                        // on disk, or refresh the directory itself if loaded.
-                        if !child.path.exists() {
+                        // Direct child directory created/deleted/renamed/replaced: refresh parent
+                        // if missing, replaced by a file, or case-renamed; else refresh if loaded.
+                        let name_changed = changed_path
+                            .file_name()
+                            .is_some_and(|n| n.to_string_lossy() != child.name);
+                        if !child.path.exists() || !child.path.is_dir() || name_changed {
                             if !refreshed.iter().any(|d| paths_equal(d, &self.path)) {
                                 self.load_children();
                                 refreshed.push(self.path.clone());
@@ -268,9 +273,12 @@ impl FileNode {
                     // If !child.children_loaded and changed_path is strictly inside it (e.g.
                     // `target\debug\...`), skip reloading so unexpanded trees stay fast.
                 } else {
-                    // Existing file child changed or was deleted; reload parent only if deleted/new
-                    // metadata changed directory listing.
-                    if (!child.path.exists() || child.path.is_dir())
+                    // Existing file child changed, deleted, replaced by a directory, or case-renamed.
+                    let name_changed = paths_equal(changed_path, &child.path)
+                        && changed_path
+                            .file_name()
+                            .is_some_and(|n| n.to_string_lossy() != child.name);
+                    if (!child.path.exists() || child.path.is_dir() || name_changed)
                         && !refreshed.iter().any(|d| paths_equal(d, &self.path))
                     {
                         self.load_children();
@@ -749,16 +757,16 @@ impl FileExplorer {
 
     pub fn create_folder_in(&mut self, parent_path: &Path, name: &str) -> Option<PathBuf> {
         let name = name.trim();
-        if name.is_empty() || name.contains(['/', '\\']) {
+        if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\\']) {
             return None;
         }
         let new_path = parent_path.join(name);
-        if new_path.exists() {
-            self.last_fs_error = Some(format!("Folder already exists: {name}"));
-            return None;
-        }
         if let Err(err) = fs::create_dir(&new_path) {
-            self.last_fs_error = Some(format!("Failed to create folder {name}: {err}"));
+            if err.kind() == std::io::ErrorKind::AlreadyExists {
+                self.last_fs_error = Some(format!("Folder already exists: {name}"));
+            } else {
+                self.last_fs_error = Some(format!("Failed to create folder {name}: {err}"));
+            }
             return None;
         }
         self.last_fs_error = None;
@@ -780,17 +788,24 @@ impl FileExplorer {
         name: &str,
     ) -> Option<PathBuf> {
         let name = name.trim();
-        if name.is_empty() || name.contains(['/', '\\']) {
+        if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\\']) {
             return None;
         }
         let new_path = parent_path.join(name);
-        if new_path.exists() {
-            self.last_fs_error = Some(format!("File already exists: {name}"));
-            return None;
-        }
-        if let Err(err) = fs::write(&new_path, "") {
-            self.last_fs_error = Some(format!("Failed to create file {name}: {err}"));
-            return None;
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&new_path)
+        {
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                self.last_fs_error = Some(format!("File already exists: {name}"));
+                return None;
+            }
+            Err(err) => {
+                self.last_fs_error = Some(format!("Failed to create file {name}: {err}"));
+                return None;
+            }
         }
         self.last_fs_error = None;
         if let Some(root) = &mut self.tree_root {
@@ -812,7 +827,7 @@ impl FileExplorer {
         is_dir: bool,
     ) -> Option<PathBuf> {
         let new_name = new_name.trim();
-        if new_name.is_empty() || new_name.contains(['/', '\\']) {
+        if new_name.is_empty() || new_name == "." || new_name == ".." || new_name.contains(['/', '\\']) {
             return None;
         }
         let parent = old_path.parent()?;
@@ -909,6 +924,7 @@ impl FileExplorer {
 
                 if !doc.find_open
                     && self.pending_tree_edit.is_none()
+                    && !ui.memory(|m| m.has_focus(crate::app::project_folder_input_id()))
                     && ui.input(|i| i.key_pressed(egui::Key::F2))
                 {
                     self.start_rename_selected();

@@ -62,6 +62,29 @@ pub fn contains_dsr_request(tail: &mut [u8; 3], tail_len: &mut usize, chunk: &[u
     found
 }
 
+pub fn default_shell() -> String {
+    #[cfg(windows)]
+    {
+        "cmd.exe".to_string()
+    }
+    #[cfg(not(windows))]
+    {
+        std::env::var("SHELL")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "/bin/sh".to_string())
+    }
+}
+
+fn format_shell_label(shell: &str) -> String {
+    let display = Path::new(shell)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .filter(|n| !n.is_empty())
+        .unwrap_or(shell);
+    format!("Terminal — {display}")
+}
+
 pub struct TerminalState {
     pub parser: vt100::Parser,
     pub pty_updated: bool,
@@ -75,7 +98,9 @@ pub struct TerminalPane {
     pub rows: u16,
     pub cols: u16,
     pub size_text: String,
+    shell_label: String,
     pub pty_writer: Option<mpsc::Sender<Vec<u8>>>,
+    dsr_writer: Arc<Mutex<Option<mpsc::Sender<Vec<u8>>>>>,
     pub _pty_master: Option<Box<dyn portable_pty::MasterPty + Send>>,
     pub _pty_child: Option<Box<dyn portable_pty::Child + Send + Sync>>,
     pub shutdown: Arc<AtomicBool>,
@@ -93,6 +118,10 @@ impl TerminalPane {
     fn shutdown_session(&mut self) {
         self.shutdown.store(true, Ordering::Relaxed);
         self.pty_writer = None;
+        self.dsr_writer
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
         if let Some(mut child) = self._pty_child.take() {
             let _ = child.kill();
             let _ = child.try_wait();
@@ -111,8 +140,12 @@ impl TerminalPane {
         }));
         let shutdown = Arc::new(AtomicBool::new(false));
         let mut pty_writer = None;
+        let dsr_writer_slot: Arc<Mutex<Option<mpsc::Sender<Vec<u8>>>>> =
+            Arc::new(Mutex::new(None));
         let mut pty_master = None;
         let mut pty_child = None;
+        let shell = default_shell();
+        let shell_label = format_shell_label(&shell);
 
         let pty_system = native_pty_system();
         if let Ok(pair) = pty_system.openpty(PtySize {
@@ -121,7 +154,7 @@ impl TerminalPane {
             pixel_width: 0,
             pixel_height: 0,
         }) {
-            let mut cmd = CommandBuilder::new("cmd.exe");
+            let mut cmd = CommandBuilder::new(&shell);
             let cwd = working_dir
                 .map(Path::to_path_buf)
                 .or_else(|| std::env::current_dir().ok());
@@ -148,13 +181,14 @@ impl TerminalPane {
                         let _ = writer.flush();
                     }
                 });
+                *dsr_writer_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx.clone());
                 pty_writer = Some(tx);
             }
 
             if let Ok(mut reader) = pair.master.try_clone_reader() {
                 let term_clone = Arc::clone(&term);
                 let shutdown_flag = Arc::clone(&shutdown);
-                let dsr_writer = pty_writer.clone();
+                let dsr_writer = Arc::clone(&dsr_writer_slot);
                 thread::spawn(move || {
                     let mut buf = [0u8; PTY_READ_BUF_SIZE];
                     let mut dsr_tail = [0u8; 3];
@@ -176,8 +210,12 @@ impl TerminalPane {
                                 });
                         let was_updated = std::mem::replace(&mut lock.pty_updated, true);
                         drop(lock);
-                        if let (Some(tx), Some(reply)) = (&dsr_writer, cpr_reply) {
-                            let _ = tx.send(reply);
+                        if let Some(reply) = cpr_reply {
+                            if let Some(tx) =
+                                dsr_writer.lock().unwrap_or_else(|e| e.into_inner()).as_ref()
+                            {
+                                let _ = tx.send(reply);
+                            }
                         }
                         if !was_updated {
                             ctx.request_repaint();
@@ -200,7 +238,9 @@ impl TerminalPane {
             rows: TERM_ROWS,
             cols: TERM_COLS,
             size_text: format!("{TERM_COLS}x{TERM_ROWS}"),
+            shell_label,
             pty_writer,
+            dsr_writer: dsr_writer_slot,
             _pty_master: pty_master,
             _pty_child: pty_child,
             shutdown,
@@ -210,6 +250,7 @@ impl TerminalPane {
     }
 
     pub fn new_headless() -> Self {
+        let shell = default_shell();
         Self {
             term: Arc::new(Mutex::new(TerminalState {
                 parser: vt100::Parser::new(
@@ -225,13 +266,19 @@ impl TerminalPane {
             rows: TERM_ROWS,
             cols: TERM_COLS,
             size_text: format!("{TERM_COLS}x{TERM_ROWS}"),
+            shell_label: format_shell_label(&shell),
             pty_writer: None,
+            dsr_writer: Arc::new(Mutex::new(None)),
             _pty_master: None,
             _pty_child: None,
             shutdown: Arc::new(AtomicBool::new(false)),
             focus_terminal: false,
             selecting_in_terminal: false,
         }
+    }
+
+    pub fn shell_label(&self) -> &str {
+        &self.shell_label
     }
 
     pub fn size_label(&self) -> &str {
@@ -461,6 +508,7 @@ impl TerminalPane {
                         FastEditor::new(term_id, screen_text, available_size, &mut layouter)
                             .text_revision(term_revision)
                             .pointer_moves_caret(false)
+                            .read_only(true)
                             .show(ui);
 
                     if *focus_terminal {
@@ -471,7 +519,11 @@ impl TerminalPane {
         });
 
         if let Some((new_rows, new_cols)) = target_grid {
+            let prev = (self.rows, self.cols);
             self.resize(new_rows, new_cols);
+            if (self.rows, self.cols) != prev {
+                ctx.request_repaint();
+            }
         }
     }
 }

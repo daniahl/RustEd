@@ -194,7 +194,30 @@ impl FoldScanner {
             })
             .collect();
         ranges.sort_unstable_by_key(|r| r.start_line);
-        ranges
+
+        // Enforce laminar (non-crossing) nesting so `visible_lines`, `is_line_hidden`, and
+        // `outermost_visible_ancestor` always agree even when indentation and brace folds diverge.
+        let mut outer_ends: Vec<usize> = Vec::new();
+        let mut normalized: Vec<FoldRange> = Vec::with_capacity(ranges.len());
+        for mut r in ranges {
+            while let Some(&outer_end) = outer_ends.last() {
+                if r.start_line > outer_end {
+                    outer_ends.pop();
+                } else {
+                    break;
+                }
+            }
+            if let Some(&outer_end) = outer_ends.last() {
+                if r.end_line > outer_end {
+                    r.end_line = outer_end;
+                }
+            }
+            if r.end_line > r.start_line {
+                outer_ends.push(r.end_line);
+                normalized.push(r);
+            }
+        }
+        normalized
     }
 }
 
@@ -320,6 +343,12 @@ impl FoldState {
         self.apply_ranges(ranges, text_revision);
     }
 
+    /// Records the cached text revision without rescanning when ranges were already computed
+    /// for the current buffer contents.
+    pub fn set_cached_revision(&mut self, text_revision: u64) {
+        self.cached_revision = Some(text_revision);
+    }
+
     fn apply_ranges(&mut self, new_ranges: Vec<FoldRange>, rev: Option<u64>) {
         let had_folds = !self.folded.is_empty();
         let ranges_changed = self.ranges != new_ranges;
@@ -366,17 +395,7 @@ impl FoldState {
 
     /// Returns `true` if `line` is hidden inside any currently collapsed fold.
     pub fn is_line_hidden(&self, line: usize) -> bool {
-        if self.folded.is_empty() {
-            return false;
-        }
-        for &start in self.folded.range(..line) {
-            if let Some(r) = self.fold_range_at(start) {
-                if line <= r.end_line {
-                    return true;
-                }
-            }
-        }
-        false
+        self.outermost_visible_ancestor(line) != line
     }
 
     /// If `line` is hidden inside one or more collapsed folds, returns the outermost collapsed
@@ -385,11 +404,18 @@ impl FoldState {
         if self.folded.is_empty() {
             return line;
         }
+        let mut hidden_until: Option<usize> = None;
         for &start in self.folded.range(..line) {
+            if let Some(end) = hidden_until {
+                if start <= end {
+                    continue;
+                }
+            }
             if let Some(r) = self.fold_range_at(start) {
                 if line <= r.end_line {
                     return start;
                 }
+                hidden_until = Some(r.end_line);
             }
         }
         line
@@ -547,6 +573,19 @@ impl FoldState {
         edit_end_line: usize,
         line_delta: isize,
     ) {
+        self.adjust_for_edit_with_col(edit_start_line, usize::MAX, edit_end_line, line_delta);
+    }
+
+    /// Like [`Self::adjust_for_edit`], also taking the 0-based column where the edit began on
+    /// `edit_start_line` so inserting newlines before column 0 of a folded header shifts it down
+    /// and merging a folded header upward shifts it with its line.
+    pub fn adjust_for_edit_with_col(
+        &mut self,
+        edit_start_line: usize,
+        edit_start_col: usize,
+        edit_end_line: usize,
+        line_delta: isize,
+    ) {
         self.cached_revision = None;
         if self.folded.is_empty() {
             return;
@@ -564,7 +603,14 @@ impl FoldState {
                 }
             }
 
-            let shifted = if start > edit_end_line {
+            let should_shift = start > edit_end_line
+                || (start == edit_start_line
+                    && start == edit_end_line
+                    && line_delta > 0
+                    && edit_start_col == 0)
+                || (start == edit_end_line && edit_start_line < start && line_delta < 0);
+
+            let shifted = if should_shift {
                 let s = start as isize + line_delta;
                 if s < 0 {
                     continue;

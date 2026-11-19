@@ -790,3 +790,130 @@ fn test_undo_back_to_saved_state_clears_dirty() {
 
     let _ = fs::remove_dir_all(&temp_dir);
 }
+
+#[test]
+fn test_close_requested_with_unsaved_changes_opens_confirmation_and_cancels_close() {
+    let temp_dir =
+        std::env::temp_dir().join(format!("rusted_close_guard_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+    let file_path = temp_dir.join("dirty.txt");
+    fs::write(&file_path, "orig").unwrap();
+
+    let ctx = egui::Context::default();
+    let mut app = TextEditor::new_headless(&temp_dir);
+    app.open_file(&ctx, file_path.clone());
+    app.doc.set_text("modified");
+    app.doc.is_current_dirty = true;
+    assert!(app.doc.has_unsaved_changes());
+
+    let mut raw = egui::RawInput::default();
+    raw.viewports.entry(egui::ViewportId::ROOT).or_default().events.push(egui::ViewportEvent::Close);
+    let out = run_ui(&ctx, raw, |ui| app.update_ui(ui));
+
+    assert!(
+        app.confirm_close_open,
+        "Close request with unsaved edits must open confirmation dialog"
+    );
+    let cmds = &out.viewport_output[&egui::ViewportId::ROOT].commands;
+    assert!(
+        cmds.contains(&egui::ViewportCommand::CancelClose),
+        "Close request with unsaved edits must send CancelClose"
+    );
+
+    assert!(app.doc.save_all());
+    assert!(!app.doc.has_unsaved_changes());
+    assert_eq!(fs::read_to_string(&file_path).unwrap(), "modified");
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_switching_back_to_stashed_dirty_file_detects_external_modification() {
+    let temp_dir =
+        std::env::temp_dir().join(format!("rusted_stash_conflict_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+    let file_a = temp_dir.join("a.txt");
+    let file_b = temp_dir.join("b.txt");
+    fs::write(&file_a, "v1").unwrap();
+    fs::write(&file_b, "b").unwrap();
+
+    let ctx = egui::Context::default();
+    let mut app = TextEditor::new_headless(&temp_dir);
+    app.open_file(&ctx, file_a.clone());
+    app.doc.set_text("unsaved edit");
+    app.doc.is_current_dirty = true;
+
+    // Switch to file_b, stashing dirty file_a
+    app.open_file(&ctx, file_b);
+    assert!(app.doc.unsaved_files.contains_key(&file_a));
+
+    // Modify file_a externally on disk (different length guarantees different DiskStamp)
+    fs::write(&file_a, "external disk change!").unwrap();
+
+    // Switch back to file_a -> must flag ModifiedOnDisk conflict
+    app.open_file(&ctx, file_a);
+    assert_eq!(
+        app.doc.external_conflict,
+        Some(rusted::document::ExternalConflict::ModifiedOnDisk)
+    );
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_terminal_read_only_prevents_direct_text_mutation_on_focus_click() {
+    let ctx = egui::Context::default();
+    let mut pane = rusted::terminal::TerminalPane::new_headless();
+    {
+        let mut lock = pane.term.lock().unwrap();
+        lock.parser.process(b"C:\\>");
+        lock.pty_updated = true;
+    }
+
+    let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::Vec2::new(600.0, 400.0));
+    // Run two warm-up frames so the initial resize settles to the viewport grid size.
+    for _ in 0..2 {
+        let _ = run_ui(
+            &ctx,
+            egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            },
+            |ui| pane.show(ui, egui::Frame::default()),
+        );
+    }
+    let before = pane.term_screen_text.clone();
+
+    // Click to focus AND send a Text event on the very same frame
+    let click_pos = egui::Pos2::new(20.0, 20.0);
+    let _ = run_ui(
+        &ctx,
+        egui::RawInput {
+            screen_rect: Some(screen),
+            events: vec![
+                egui::Event::PointerMoved(click_pos),
+                egui::Event::PointerButton {
+                    pos: click_pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::PointerButton {
+                    pos: click_pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::Text("INJECTED".to_string()),
+            ],
+            ..Default::default()
+        },
+        |ui| pane.show(ui, egui::Frame::default()),
+    );
+    assert_eq!(
+        pane.term_screen_text, before,
+        "Terminal screen text must remain read-only even on the click-to-focus frame"
+    );
+}

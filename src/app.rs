@@ -28,6 +28,10 @@ pub const SIDEBAR_DEFAULT_WIDTH: f32 = 220.0;
 /// Minimum sidebar width in points.
 pub const SIDEBAR_MIN_WIDTH: f32 = 140.0;
 
+pub fn project_folder_input_id() -> egui::Id {
+    egui::Id::unique("project_folder_input")
+}
+
 pub struct TextEditor {
     pub tab: Tab,
     pub doc: Document,
@@ -39,6 +43,9 @@ pub struct TextEditor {
     last_synced_folder: String,
     /// When set, the next editor frame grabs keyboard focus so the caret is active at startup.
     pub focus_editor_pending: bool,
+    /// Shown when the user attempts to close the window with unsaved changes.
+    pub confirm_close_open: bool,
+    allow_close: bool,
 }
 
 impl TextEditor {
@@ -85,6 +92,8 @@ impl TextEditor {
             folder_input,
             last_synced_folder,
             focus_editor_pending: true,
+            confirm_close_open: false,
+            allow_close: false,
         }
     }
 
@@ -104,6 +113,8 @@ impl TextEditor {
             folder_input,
             last_synced_folder,
             focus_editor_pending: false,
+            confirm_close_open: false,
+            allow_close: false,
         }
     }
 
@@ -177,9 +188,68 @@ impl TextEditor {
         }
     }
 
+    fn handle_close_confirmation(&mut self, ctx: &egui::Context) {
+        if ctx.input(|i| i.viewport().close_requested())
+            && !self.allow_close
+            && self.doc.has_unsaved_changes()
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.confirm_close_open = true;
+        }
+
+        if !self.confirm_close_open {
+            return;
+        }
+
+        let mut open = self.confirm_close_open;
+        let mut save_and_close = false;
+        let mut discard_and_close = false;
+        let mut cancel = false;
+
+        egui::Window::new("Unsaved Changes")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.label("You have unsaved changes. Save before closing?");
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Save & Close").clicked() {
+                        save_and_close = true;
+                    }
+                    if ui.button("Discard & Close").clicked() {
+                        discard_and_close = true;
+                    }
+                    if ui.button("Cancel").clicked()
+                        || ui.input(|i| i.key_pressed(egui::Key::Escape))
+                    {
+                        cancel = true;
+                    }
+                });
+            });
+
+        if save_and_close {
+            if self.doc.save_all() {
+                self.allow_close = true;
+                self.confirm_close_open = false;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            } else {
+                self.confirm_close_open = false;
+            }
+        } else if discard_and_close {
+            self.allow_close = true;
+            self.confirm_close_open = false;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        } else if cancel || !open {
+            self.confirm_close_open = false;
+        }
+    }
+
     pub fn update_ui(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         let ctx = &ctx;
+        self.handle_close_confirmation(ctx);
         self.poll_watcher(ctx);
         let ctrl_tab = ctx.input_mut(|i| {
             let ctrl = i.consume_key(egui::Modifiers::CTRL, egui::Key::Tab)
@@ -215,6 +285,7 @@ impl TextEditor {
         }
 
         if self.tab == Tab::Editor {
+            let folder_input_focused = ctx.memory(|m| m.has_focus(project_folder_input_id()));
             let (ctrl_s, ctrl_f, f3, fold_cur, unfold_cur, fold_all, unfold_all) =
                 ctx.input_mut(|i| {
                     let ctrl_s = i.consume_key(egui::Modifiers::COMMAND, egui::Key::S)
@@ -224,7 +295,11 @@ impl TextEditor {
                     let f3 = i.consume_key(egui::Modifiers::NONE, egui::Key::F3);
 
                     let (fold_cur, unfold_cur, fold_all, unfold_all) =
-                        if !self.doc.find_open && self.explorer.pending_tree_edit.is_none() {
+                        if !self.doc.find_open
+                            && !self.confirm_close_open
+                            && self.explorer.pending_tree_edit.is_none()
+                            && !folder_input_focused
+                        {
                             let alt = egui::Modifiers::ALT;
                             let alt_shift = egui::Modifiers {
                                 alt: true,
@@ -293,12 +368,21 @@ impl TextEditor {
                     }
                     ui.separator();
                     ui.label("Project folder:");
-                    let resp = ui.text_edit_singleline(&mut self.folder_input);
+                    let resp = ui.add(
+                        egui::TextEdit::singleline(&mut self.folder_input)
+                            .id(project_folder_input_id()),
+                    );
                     let enter_pressed =
                         resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
 
                     if enter_pressed {
-                        self.explorer.open_folder(PathBuf::from(&self.folder_input));
+                        let candidate = PathBuf::from(self.folder_input.trim());
+                        if candidate.is_dir() {
+                            self.explorer.open_folder(candidate);
+                        } else {
+                            self.explorer.last_fs_error =
+                                Some(format!("Folder not found: {}", candidate.display()));
+                        }
                         self.folder_input = self.explorer.folder_path.to_string_lossy().into_owned();
                         self.last_synced_folder = self.folder_input.clone();
                     }
@@ -374,7 +458,7 @@ impl TextEditor {
                             );
                         }
                         Tab::Terminal => {
-                            ui.label("Terminal — cmd.exe");
+                            ui.label(self.terminal.shell_label());
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {

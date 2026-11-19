@@ -500,6 +500,7 @@ fn run_windows_watch_loop(
     };
 
     let handles = [stop_event.0, io_event];
+    let mut stopped_by_request = false;
     while io_pending {
         let wait_ms = if let (Some(first_at), Some(last_at)) = (first_event_at, last_event_at) {
             let now = std::time::Instant::now();
@@ -516,11 +517,7 @@ fn run_windows_watch_loop(
         let wait_res = unsafe { WaitForMultipleObjects(&handles, false, wait_ms) };
         match wait_res.0 {
             x if x == WAIT_OBJECT_0.0 => {
-                unsafe {
-                    let _ = CancelIoEx(dir_handle, Some(&overlapped));
-                    let mut cancelled_bytes = 0u32;
-                    let _ = GetOverlappedResult(dir_handle, &overlapped, &mut cancelled_bytes, true);
-                }
+                stopped_by_request = true;
                 break;
             }
             x if x == WAIT_TIMEOUT.0 => {
@@ -533,6 +530,7 @@ fn run_windows_watch_loop(
                 );
             }
             WAIT_OBJECT_1 => {
+                io_pending = false;
                 let mut bytes_transferred = 0u32;
                 let res = unsafe {
                     GetOverlappedResult(dir_handle, &overlapped, &mut bytes_transferred, false)
@@ -577,10 +575,12 @@ fn run_windows_watch_loop(
                         let u16_count = file_name_bytes / 2;
                         if name_start + u16_count * 2 <= byte_slice.len() {
                             let mut wide_name = Vec::with_capacity(u16_count);
-                            for chunk in
-                                byte_slice[name_start..name_start + u16_count * 2].chunks_exact(2)
+                            for &chunk in
+                                byte_slice[name_start..name_start + u16_count * 2]
+                                    .as_chunks::<2>()
+                                    .0
                             {
-                                wide_name.push(u16::from_le_bytes([chunk[0], chunk[1]]));
+                                wide_name.push(u16::from_le_bytes(chunk));
                             }
                             let rel = std::ffi::OsString::from_wide(&wide_name);
                             let full_path = dir.join(rel);
@@ -598,7 +598,10 @@ fn run_windows_watch_loop(
                         if next_entry_offset == 0 {
                             break;
                         }
-                        offset += next_entry_offset as usize;
+                        let Some(next_off) = offset.checked_add(next_entry_offset as usize) else {
+                            break;
+                        };
+                        offset = next_off;
                     }
                 }
 
@@ -625,13 +628,23 @@ fn run_windows_watch_loop(
         }
     }
 
-    flush_pending(
-        &mut pending_paths,
-        &mut pending_seen,
-        &mut pending_rescan,
-        &mut first_event_at,
-        &mut last_event_at,
-    );
+    if io_pending {
+        unsafe {
+            let _ = CancelIoEx(dir_handle, Some(&overlapped));
+            let mut cancelled_bytes = 0u32;
+            let _ = GetOverlappedResult(dir_handle, &overlapped, &mut cancelled_bytes, true);
+        }
+    }
+
+    if !stopped_by_request {
+        flush_pending(
+            &mut pending_paths,
+            &mut pending_seen,
+            &mut pending_rescan,
+            &mut first_event_at,
+            &mut last_event_at,
+        );
+    }
 
     unsafe {
         let _ = CloseHandle(io_event);

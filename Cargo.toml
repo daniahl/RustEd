@@ -18,11 +18,11 @@ test = false
 eframe = "0.37"
 egui_extras = { version = "0.37.0", features = ["syntect"] }
 portable-pty = "0.9.0"
+raw-window-handle = "0.6"
 rfd = "0.18.0"
 vt100 = "0.18.1"
 
 [target.'cfg(windows)'.dependencies]
-raw-window-handle = "0.6"
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",

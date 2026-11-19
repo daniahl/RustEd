@@ -757,18 +757,19 @@ fn paint_fold_placeholders(
     }
 }
 
-/// Determines the inclusive 0-based document line range potentially modified by `event` before it runs.
+/// Determines the inclusive 0-based `(start_line, start_col, end_line)` potentially modified by
+/// `event` before it runs.
 fn edit_affected_lines<T: EditorBuffer>(
     text: &T,
     event: &Event,
     cursor_range: CCursorRange,
     fold_state: Option<&FoldState>,
-) -> (usize, usize) {
+) -> (usize, usize, usize) {
     let total = text.char_count();
     let [min_c, max_c] = cursor_range.sorted_cursors();
     let min_idx = min_c.index.0.min(total);
     let max_idx = max_c.index.0.min(total);
-    let (mut start_line, start_col) = text.char_to_line_col(min_idx);
+    let (mut start_line, mut start_col) = text.char_to_line_col(min_idx);
     let (mut end_line, _) = text.char_to_line_col(max_idx);
 
     if cursor_range.is_empty() {
@@ -781,9 +782,10 @@ fn edit_affected_lines<T: EditorBuffer>(
             } => {
                 if modifiers.ctrl {
                     let prev = text.prev_word_ccursor(cursor_range.primary).index.0;
-                    start_line = text.char_to_line_col(prev).0;
+                    (start_line, start_col) = text.char_to_line_col(prev);
                 } else if start_col == 0 && start_line > 0 {
                     start_line -= 1;
+                    start_col = usize::MAX;
                 }
             }
             Event::Key {
@@ -815,7 +817,7 @@ fn edit_affected_lines<T: EditorBuffer>(
             _ => {}
         }
     }
-    (start_line, end_line)
+    (start_line, start_col, end_line)
 }
 
 fn finish_cursor_and_scroll(
@@ -892,6 +894,7 @@ pub struct FastEditor<'a, T: EditorBuffer = String> {
     text_revision: Option<u64>,
     virtualized: bool,
     pointer_moves_caret: bool,
+    read_only: bool,
     newline: &'static str,
     fold_state: Option<&'a mut FoldState>,
 }
@@ -919,6 +922,7 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
             text_revision: None,
             virtualized: false,
             pointer_moves_caret: true,
+            read_only: false,
             newline: "\n",
             fold_state: None,
         }
@@ -939,9 +943,17 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
             text_revision: None,
             virtualized: false,
             pointer_moves_caret: true,
+            read_only: false,
             newline: "\n",
             fold_state: None,
         }
+    }
+
+    /// Prevents text mutations (typing, paste, cut, delete, enter, tab, undo/redo) while still
+    /// allowing copying. Used for terminal views where the PTY owns buffer contents.
+    pub fn read_only(mut self, enabled: bool) -> Self {
+        self.read_only = enabled;
+        self
     }
 
     /// Attaches optional code-folding state to hide collapsed line ranges and auto-update folds on edit.
@@ -980,10 +992,62 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
 
     /// Optional monotonic revision number for `text`. When provided, layout cache
     /// hits check the revision in O(1) instead of comparing the full text buffer.
+    ///
+    /// Callers using `text_revision` must increment their stored revision by `wrapping_add(1)`
+    /// whenever `EditorOutput::text_changed` is `true` so the updated cache entry matches on the
+    /// next frame.
     #[allow(dead_code)]
     pub fn text_revision(mut self, revision: u64) -> Self {
         self.text_revision = Some(revision);
         self
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn apply_edit_outcome(
+        &mut self,
+        outcome: EditOutcome,
+        now: f64,
+        old_line_count: usize,
+        affected_lines: (usize, usize, usize),
+        state: &mut FastEditorState,
+        cursor_range: &mut CCursorRange,
+        text_changed: &mut bool,
+        should_feed_undoer: &mut bool,
+    ) -> bool {
+        match outcome {
+            EditOutcome::Edited(new_ccursor_range) => {
+                *text_changed = true;
+                *should_feed_undoer = true;
+                state.last_interaction_time = now;
+                *cursor_range = new_ccursor_range;
+                if let Some(fs) = self.fold_state.as_deref_mut() {
+                    let line_delta = self.text.line_count() as isize - old_line_count as isize;
+                    fs.adjust_for_edit_with_col(
+                        affected_lines.0,
+                        affected_lines.1,
+                        affected_lines.2,
+                        line_delta,
+                    );
+                    fs.ensure_updated_buffer(self.text, None);
+                    let cur_line = self.text.char_to_line_col(cursor_range.primary.index.0).0;
+                    fs.unfold_containing(cur_line);
+                }
+                true
+            }
+            EditOutcome::Restored(new_ccursor_range) => {
+                *text_changed = true;
+                *should_feed_undoer = false;
+                state.last_interaction_time = now;
+                *cursor_range = new_ccursor_range;
+                if let Some(fs) = self.fold_state.as_deref_mut() {
+                    fs.ensure_updated_buffer(self.text, None);
+                    let cur_line = self.text.char_to_line_col(cursor_range.primary.index.0).0;
+                    fs.unfold_containing(cur_line);
+                }
+                true
+            }
+            EditOutcome::Unchanged => false,
+        }
     }
 
     fn seed_pre_edit_snapshot(&self, state: &mut FastEditorState, cursor_range: CCursorRange) {
@@ -1006,6 +1070,9 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
         cursor_range: CCursorRange,
         text_changed: bool,
     ) -> EditOutcome {
+        if self.read_only && !matches!(event, Event::Copy) {
+            return EditOutcome::Unchanged;
+        }
         match event {
             Event::Copy => {
                 let copy_range = if !self.pointer_moves_caret {
@@ -1597,6 +1664,19 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
                     pending_relayout = false;
                 }
 
+                // In read-only terminal mode (`read_only && !pointer_moves_caret`), only Copy is
+                // handled by FastEditor; caret movement is owned by the PTY.
+                if self.read_only && !self.pointer_moves_caret {
+                    let _ = self.handle_common_edit_event(
+                        ui,
+                        event,
+                        &mut state,
+                        cursor_range,
+                        text_changed,
+                    );
+                    continue;
+                }
+
                 // Select All should always select the full document, even if trailing lines are folded.
                 if matches!(
                     event,
@@ -1644,7 +1724,7 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
                 let affected_lines = if self.fold_state.is_some() {
                     edit_affected_lines(self.text, event, cursor_range, self.fold_state.as_deref())
                 } else {
-                    (0, 0)
+                    (0, usize::MAX, 0)
                 };
 
                 let outcome = match event {
@@ -1735,37 +1815,17 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
                     ),
                 };
 
-                match outcome {
-                    EditOutcome::Edited(new_ccursor_range) => {
-                        text_changed = true;
-                        should_feed_undoer = true;
-                        state.last_interaction_time = now;
-                        cursor_range = new_ccursor_range;
-                        if let Some(fs) = self.fold_state.as_deref_mut() {
-                            let line_delta =
-                                self.text.line_count() as isize - old_line_count as isize;
-                            fs.adjust_for_edit(affected_lines.0, affected_lines.1, line_delta);
-                            fs.ensure_updated_buffer(self.text, None);
-                            let cur_line =
-                                self.text.char_to_line_col(cursor_range.primary.index.0).0;
-                            fs.unfold_containing(cur_line);
-                        }
-                        pending_relayout = true;
-                    }
-                    EditOutcome::Restored(new_ccursor_range) => {
-                        text_changed = true;
-                        should_feed_undoer = false;
-                        state.last_interaction_time = now;
-                        cursor_range = new_ccursor_range;
-                        if let Some(fs) = self.fold_state.as_deref_mut() {
-                            fs.ensure_updated_buffer(self.text, None);
-                            let cur_line =
-                                self.text.char_to_line_col(cursor_range.primary.index.0).0;
-                            fs.unfold_containing(cur_line);
-                        }
-                        pending_relayout = true;
-                    }
-                    EditOutcome::Unchanged => {}
+                if self.apply_edit_outcome(
+                    outcome,
+                    now,
+                    old_line_count,
+                    affected_lines,
+                    &mut state,
+                    &mut cursor_range,
+                    &mut text_changed,
+                    &mut should_feed_undoer,
+                ) {
+                    pending_relayout = true;
                 }
             }
 
@@ -1892,7 +1952,7 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
             .map_or(0, FoldState::fold_version);
         if text_changed {
             if let (Some(fs), Some(rev)) = (self.fold_state.as_deref_mut(), self.text_revision) {
-                fs.ensure_updated_buffer(self.text, Some(rev.wrapping_add(1)));
+                fs.set_cached_revision(rev.wrapping_add(1));
             }
         }
         if layout_dirty {
@@ -2031,14 +2091,20 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
             self.cache_salt,
         );
         let rev = self.text_revision.unwrap_or(0);
+        let text_unchanged = match &state.virtual_layout_cache {
+            Some(c) => self.text_revision.is_some() && c.text_revision == rev,
+            None => false,
+        };
+        if !text_unchanged {
+            state.last_undo_snapshot = None;
+        }
         let mut window_buf = String::new();
 
         let (mut galley, mut window_start_char, mut window_end_char, mut fold_view, mut layout_dirty) =
             match &state.virtual_layout_cache {
                 Some(c)
                     if c.key == cache_key
-                        && self.text_revision.is_some()
-                        && c.text_revision == rev
+                        && text_unchanged
                         && c.fold_version == fold_version
                         && c.first_line == first_line
                         && c.last_line == last_line =>
@@ -2063,10 +2129,6 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
                     (g, ws, we, fv, true)
                 }
             };
-
-        if layout_dirty {
-            state.last_undo_snapshot = None;
-        }
 
         let prev_ccursor_range = state
             .cursor
@@ -2214,6 +2276,16 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
             let events = collect_relevant_events(ui);
 
             for event in &events {
+                if self.read_only && !self.pointer_moves_caret {
+                    let _ = self.handle_common_edit_event(
+                        ui,
+                        event,
+                        &mut state,
+                        ccursor_range,
+                        text_changed,
+                    );
+                    continue;
+                }
                 let cur_total = self.text.char_count();
 
                 match event {
@@ -2233,8 +2305,24 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
                         modifiers,
                         ..
                     } => {
-                        let next = if modifiers.ctrl || modifiers.command {
-                            self.text.prev_word_ccursor(ccursor_range.primary).index.0
+                        let next = if !modifiers.shift
+                            && !(modifiers.ctrl || modifiers.command)
+                            && !ccursor_range.is_empty()
+                        {
+                            ccursor_range.sorted_cursors()[0].index.0.min(cur_total)
+                        } else if modifiers.ctrl || modifiers.command {
+                            let mut target =
+                                self.text.prev_word_ccursor(ccursor_range.primary).index.0;
+                            if let Some(fs) = self.fold_state.as_deref() {
+                                if fs.has_active_folds() {
+                                    let (target_line, _) = self.text.char_to_line_col(target);
+                                    if fs.is_line_hidden(target_line) {
+                                        let ancestor = fs.outermost_visible_ancestor(target_line);
+                                        target = self.text.line_char_range(ancestor).end;
+                                    }
+                                }
+                            }
+                            target
                         } else {
                             let cur = ccursor_range.primary.index.0.min(cur_total);
                             let mut jumped = None;
@@ -2272,8 +2360,32 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
                         modifiers,
                         ..
                     } => {
-                        let next = if modifiers.ctrl || modifiers.command {
-                            self.text.next_word_ccursor(ccursor_range.primary).index.0
+                        let next = if !modifiers.shift
+                            && !(modifiers.ctrl || modifiers.command)
+                            && !ccursor_range.is_empty()
+                        {
+                            ccursor_range.sorted_cursors()[1].index.0.min(cur_total)
+                        } else if modifiers.ctrl || modifiers.command {
+                            let mut target =
+                                self.text.next_word_ccursor(ccursor_range.primary).index.0;
+                            if let Some(fs) = self.fold_state.as_deref_mut() {
+                                if fs.has_active_folds() {
+                                    let (target_line, _) = self.text.char_to_line_col(target);
+                                    if fs.is_line_hidden(target_line) {
+                                        let total_l = self.text.line_count().max(1);
+                                        let vis = fs.visible_lines(total_l);
+                                        let vis_idx = vis.partition_point(|&l| l < target_line);
+                                        if let Some(&next_vis) = vis.get(vis_idx) {
+                                            target = self.text.line_char_range(next_vis).start;
+                                        } else {
+                                            let ancestor =
+                                                fs.outermost_visible_ancestor(target_line);
+                                            target = self.text.line_char_range(ancestor).end;
+                                        }
+                                    }
+                                }
+                            }
+                            target
                         } else {
                             let cur = ccursor_range.primary.index.0.min(cur_total);
                             let mut jumped = None;
@@ -2423,48 +2535,25 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
                                 self.fold_state.as_deref(),
                             )
                         } else {
-                            (0, 0)
+                            (0, usize::MAX, 0)
                         };
-                        match self.handle_common_edit_event(
+                        let outcome = self.handle_common_edit_event(
                             ui,
                             event,
                             &mut state,
                             ccursor_range,
                             text_changed,
-                        ) {
-                            EditOutcome::Edited(new_ccursor_range) => {
-                                text_changed = true;
-                                should_feed_undoer = true;
-                                state.last_interaction_time = now;
-                                ccursor_range = new_ccursor_range;
-                                if let Some(fs) = self.fold_state.as_deref_mut() {
-                                    let line_delta =
-                                        self.text.line_count() as isize - old_line_count as isize;
-                                    fs.adjust_for_edit(
-                                        affected_lines.0,
-                                        affected_lines.1,
-                                        line_delta,
-                                    );
-                                    fs.ensure_updated_buffer(self.text, None);
-                                    let cur_line =
-                                        self.text.char_to_line_col(ccursor_range.primary.index.0).0;
-                                    fs.unfold_containing(cur_line);
-                                }
-                            }
-                            EditOutcome::Restored(new_ccursor_range) => {
-                                text_changed = true;
-                                should_feed_undoer = false;
-                                state.last_interaction_time = now;
-                                ccursor_range = new_ccursor_range;
-                                if let Some(fs) = self.fold_state.as_deref_mut() {
-                                    fs.ensure_updated_buffer(self.text, None);
-                                    let cur_line =
-                                        self.text.char_to_line_col(ccursor_range.primary.index.0).0;
-                                    fs.unfold_containing(cur_line);
-                                }
-                            }
-                            EditOutcome::Unchanged => {}
-                        }
+                        );
+                        self.apply_edit_outcome(
+                            outcome,
+                            now,
+                            old_line_count,
+                            affected_lines,
+                            &mut state,
+                            &mut ccursor_range,
+                            &mut text_changed,
+                            &mut should_feed_undoer,
+                        );
                     }
                 }
             }
@@ -2615,7 +2704,7 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
             .map_or(0, FoldState::fold_version);
         if text_changed {
             if let (Some(fs), Some(r)) = (self.fold_state.as_deref_mut(), self.text_revision) {
-                fs.ensure_updated_buffer(self.text, Some(r.wrapping_add(1)));
+                fs.set_cached_revision(r.wrapping_add(1));
             }
         }
         if layout_dirty {

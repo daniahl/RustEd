@@ -8,8 +8,18 @@ use std::{
     cell::{Cell, RefCell},
     fmt,
     ops::Range,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
 };
+
+static NEXT_TABLE_ID: AtomicU64 = AtomicU64::new(1);
+
+#[inline]
+fn next_table_id() -> u64 {
+    NEXT_TABLE_ID.fetch_add(1, Ordering::Relaxed)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BufferType {
@@ -169,6 +179,7 @@ impl Piece {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PieceTableSnapshot {
+    table_id: u64,
     original: Arc<str>,
     orig_checkpoints: Arc<[LineCheckpoint]>,
     pieces: Arc<Vec<Piece>>,
@@ -179,6 +190,7 @@ pub struct PieceTableSnapshot {
 }
 
 pub struct PieceTable {
+    table_id: u64,
     original: Arc<str>,
     orig_checkpoints: Arc<[LineCheckpoint]>,
     added: String,
@@ -200,6 +212,7 @@ pub struct PieceTable {
 impl Clone for PieceTable {
     fn clone(&self) -> Self {
         Self {
+            table_id: next_table_id(),
             original: Arc::clone(&self.original),
             orig_checkpoints: Arc::clone(&self.orig_checkpoints),
             added: self.added.clone(),
@@ -294,6 +307,7 @@ impl PieceTable {
         }
 
         Self {
+            table_id: next_table_id(),
             original,
             orig_checkpoints: Arc::from(checkpoints),
             added: String::new(),
@@ -312,6 +326,7 @@ impl PieceTable {
     /// Captures a lightweight O(P) snapshot of piece descriptors without copying text buffers.
     pub fn snapshot(&self) -> PieceTableSnapshot {
         PieceTableSnapshot {
+            table_id: self.table_id,
             original: Arc::clone(&self.original),
             orig_checkpoints: Arc::clone(&self.orig_checkpoints),
             pieces: Arc::clone(&self.pieces),
@@ -325,13 +340,14 @@ impl PieceTable {
     fn snapshot_added_valid(&self, snapshot: &PieceTableSnapshot) -> bool {
         snapshot.pieces.iter().all(|p| {
             p.buffer != BufferType::Added
-                || (snapshot.added_epoch == self.added_epoch
+                || (snapshot.table_id == self.table_id
+                    && snapshot.added_epoch == self.added_epoch
                     && p.start + p.length <= self.added.len())
         })
     }
 
     /// Restores piece descriptors from a previously captured `PieceTableSnapshot` in O(P) time.
-    /// Returns `false` if the snapshot references `added` buffer offsets from a different epoch.
+    /// Returns `false` if the snapshot references `added` buffer offsets from another table or epoch.
     pub fn restore_snapshot(&mut self, snapshot: &PieceTableSnapshot) -> bool {
         if !self.snapshot_added_valid(snapshot) {
             return false;
@@ -353,6 +369,9 @@ impl PieceTable {
             || self.total_chars != snapshot.total_chars
             || self.total_line_feeds != snapshot.total_line_feeds
         {
+            return false;
+        }
+        if !self.snapshot_added_valid(snapshot) {
             return false;
         }
         if Arc::ptr_eq(&self.original, &snapshot.original)
@@ -906,21 +925,12 @@ impl PieceTable {
 
         let mut curr_char = 0usize;
         let mut curr_line = 0usize;
-        let mut last_line_start_char = 0usize;
+        let mut last_nl_piece: Option<(&Piece, usize)> = None;
 
         for p in self.pieces.iter() {
             if curr_char + p.char_count < target {
                 if p.line_feed_cnt > 0 {
-                    let text = p.get_text(&self.original, &self.added);
-                    if let Some(last_nl_byte) = text.as_bytes().iter().rposition(|&b| b == b'\n') {
-                        let byte_after_nl = last_nl_byte + 1;
-                        let chars_before_nl_end = if p.char_count == p.length {
-                            byte_after_nl
-                        } else {
-                            p.char_count - text[byte_after_nl..].chars().count()
-                        };
-                        last_line_start_char = curr_char + chars_before_nl_end;
-                    }
+                    last_nl_piece = Some((p, curr_char));
                     curr_line += p.line_feed_cnt;
                 }
                 curr_char += p.char_count;
@@ -967,7 +977,7 @@ impl PieceTable {
                 let total_lf = base_lf + tail_lf;
                 if total_lf > 0 {
                     curr_line += total_lf;
-                    if tail_lf > 0 {
+                    let last_line_start_char = if tail_lf > 0 {
                         let rel_nl = tail_bytes.iter().rposition(|&b| b == b'\n').unwrap() + 1;
                         let chars_in_tail = if p.char_count == p.length {
                             rel_nl
@@ -976,15 +986,33 @@ impl PieceTable {
                                 .chars()
                                 .count()
                         };
-                        last_line_start_char = curr_char + base_char_offset + chars_in_tail;
+                        curr_char + base_char_offset + chars_in_tail
                     } else {
-                        last_line_start_char = curr_char + base_char_offset;
-                    }
+                        curr_char + base_char_offset
+                    };
+                    return (curr_line, target - last_line_start_char);
                 }
             }
 
-            return (curr_line, target - last_line_start_char);
+            break;
         }
+
+        let last_line_start_char = if let Some((p, p_char_start)) = last_nl_piece {
+            let text = p.get_text(&self.original, &self.added);
+            if let Some(last_nl_byte) = text.as_bytes().iter().rposition(|&b| b == b'\n') {
+                let byte_after_nl = last_nl_byte + 1;
+                let chars_before_nl_end = if p.char_count == p.length {
+                    byte_after_nl
+                } else {
+                    p.char_count - text[byte_after_nl..].chars().count()
+                };
+                p_char_start + chars_before_nl_end
+            } else {
+                0
+            }
+        } else {
+            0
+        };
 
         (curr_line, target - last_line_start_char)
     }

@@ -806,3 +806,200 @@ fn test_clicking_inline_placeholder_and_gutter_chevron_toggles_fold() {
     let _ = fs::remove_dir_all(&temp_dir);
 }
 
+#[test]
+fn test_crossing_brace_and_indent_folds_stay_consistent() {
+    // Line 0..=2 is a brace fold (closing `}` indented at 8 spaces on line 3),
+    // while line 1 (indent 4) would form an indentation fold spanning 1..=4.
+    let code = "\
+fn a() {
+    let x = 1;
+        let y = 2;
+        }
+        let z = 3;";
+    let mut state = FoldState::new();
+    state.ensure_updated_str(code, 1);
+    assert!(state.fold_all());
+
+    let visible: Vec<usize> = state.visible_lines(5).to_vec();
+    for line in 0..5 {
+        let in_visible = visible.contains(&line);
+        assert_eq!(
+            !state.is_line_hidden(line),
+            in_visible,
+            "is_line_hidden({line}) must agree with visible_lines {visible:?}"
+        );
+        let ancestor = state.outermost_visible_ancestor(line);
+        assert!(
+            visible.contains(&ancestor),
+            "outermost_visible_ancestor({line}) = {ancestor} must be visible in {visible:?}"
+        );
+    }
+}
+
+#[test]
+fn test_fold_header_shifts_on_enter_and_backspace_at_col_0() {
+    let code = "\
+fn a() {
+    let x = 1;
+    let y = 2;
+}
+fn b() {
+    let z = 3;
+}";
+    let mut state = FoldState::new();
+    state.ensure_updated_str(code, 1);
+    assert!(state.fold_line(0));
+
+    // Inserting a blank line at col 0 of folded line 0 shifts the fold to line 1.
+    state.adjust_for_edit_with_col(0, 0, 0, 1);
+    assert!(state.is_folded(1));
+    assert!(!state.is_folded(0));
+
+    // Backspacing at col 0 of folded line 1 (merging onto line 0) shifts it back to line 0.
+    state.adjust_for_edit_with_col(0, usize::MAX, 1, -1);
+    assert!(state.is_folded(0));
+    assert!(!state.is_folded(1));
+}
+
+#[test]
+fn test_toggle_fold_clamps_secondary_cursor_out_of_hidden_lines() {
+    let ctx = egui::Context::default();
+    let mut doc = rusted::document::Document::new();
+    doc.set_text("fn a() {\n    let x = 1;\n    let y = 2;\n}\n");
+
+    // Selection with primary on visible line 0 and secondary inside soon-to-be-hidden line 2.
+    let line2_char = doc.text.line_to_char(2) + 4;
+    ctx.data_mut(|d| {
+        let mut st = FastEditorState::default();
+        st.cursor.set_char_range(Some(egui::text::CCursorRange::two(
+            egui::text::CCursor::new(line2_char),
+            egui::text::CCursor::new(0),
+        )));
+        d.insert_temp(code_editor_id(), st);
+    });
+
+    assert!(doc.toggle_fold_at(&ctx, 0));
+    let range = ctx
+        .data_mut(|d| d.get_temp::<FastEditorState>(code_editor_id()))
+        .unwrap()
+        .cursor
+        .char_range()
+        .unwrap();
+    let (sec_line, _) = doc.text.char_to_line_col(range.secondary.index.0);
+    assert!(
+        !doc.folding.is_line_hidden(sec_line),
+        "Secondary cursor must be clamped out of hidden lines"
+    );
+}
+
+#[test]
+fn test_virtualized_ctrl_arrows_skip_folded_lines_and_plain_arrows_collapse_selection() {
+    let ctx = egui::Context::default();
+    let mut big = String::with_capacity(80_000);
+    for i in 0..1200 {
+        big.push_str(&format!(
+            "fn func_{i:04}() {{\n    let value_{i:04} = \"some padding text for size\";\n    println!(\"{{value_{i:04}}}\");\n}}\n"
+        ));
+    }
+    let mut pt = PieceTable::from_string(big);
+    let mut fold_state = FoldState::new();
+    fold_state.ensure_updated_buffer(&pt, Some(1));
+    assert!(fold_state.fold_line(0)); // hides lines 1..=2
+
+    let id = Id::unique("test_virtualized_ctrl_arrows");
+    let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), Vec2::new(600.0, 300.0));
+    let run_frame = |pt: &mut PieceTable, fold_state: &mut FoldState, events: Vec<Event>| {
+        let input = egui::RawInput {
+            screen_rect: Some(screen),
+            events,
+            ..Default::default()
+        };
+        let mut cursor_pos = None;
+        let mut out = ctx.run_ui(input, |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .animated(false)
+                    .show(ui, |ui| {
+                        let mut dummy = |_ui: &Ui, _s: &str, _w: f32| unreachable!();
+                        let output = FastEditor::new(id, pt, Vec2::new(500.0, 280.0), &mut dummy)
+                            .text_revision(1)
+                            .virtualized(true)
+                            .fold_state(fold_state)
+                            .show(ui);
+                        output.response.request_focus();
+                        cursor_pos = output.cursor_range;
+                    });
+            });
+        });
+        out.textures_delta.clear();
+        cursor_pos.unwrap()
+    };
+
+    // Place caret at end of folded line 0
+    let line0_end = pt.line_char_range(0).end;
+    ctx.data_mut(|d| {
+        let mut st = FastEditorState::default();
+        st.cursor
+            .set_char_range(Some(egui::text::CCursorRange::one(egui::text::CCursor::new(
+                line0_end,
+            ))));
+        d.insert_temp(id, st);
+    });
+    let _ = run_frame(&mut pt, &mut fold_state, vec![]);
+
+    // Ctrl+ArrowRight from end of folded line 0 must jump to line 3 (`}`), not into hidden line 1
+    let cur = run_frame(
+        &mut pt,
+        &mut fold_state,
+        vec![Event::Key {
+            key: Key::ArrowRight,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::CTRL,
+        }],
+    );
+    let (line_after_right, _) = pt.char_to_line_col(cur.primary.index.0);
+    assert!(!fold_state.is_line_hidden(line_after_right));
+    assert_eq!(line_after_right, 3);
+
+    // Ctrl+ArrowLeft from start of line 3 must jump back to end of line 0, not into hidden line 2
+    let cur = run_frame(
+        &mut pt,
+        &mut fold_state,
+        vec![Event::Key {
+            key: Key::ArrowLeft,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::CTRL,
+        }],
+    );
+    let (line_after_left, _) = pt.char_to_line_col(cur.primary.index.0);
+    assert!(!fold_state.is_line_hidden(line_after_left));
+    assert_eq!(line_after_left, 0);
+
+    // With selection 0..5, plain ArrowLeft collapses to 0 and plain ArrowRight collapses to 5
+    ctx.data_mut(|d| {
+        let mut st = d.get_temp::<FastEditorState>(id).unwrap_or_default();
+        st.cursor.set_char_range(Some(egui::text::CCursorRange::two(
+            egui::text::CCursor::new(0),
+            egui::text::CCursor::new(5),
+        )));
+        d.insert_temp(id, st);
+    });
+    let cur = run_frame(
+        &mut pt,
+        &mut fold_state,
+        vec![Event::Key {
+            key: Key::ArrowLeft,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::NONE,
+        }],
+    );
+    assert_eq!((cur.secondary.index.0, cur.primary.index.0), (0, 0));
+}
+

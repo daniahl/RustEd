@@ -597,3 +597,23 @@ fn test_reentrant_with_str_and_multi_piece_equality() {
     assert_eq!(pt1, pt2);
     assert_eq!(pt1, pt1);
 }
+
+#[test]
+fn test_snapshot_rejects_divergent_clone_added_buffer() {
+    let base = PieceTable::from_str("hello");
+    let mut a = base.clone();
+    let mut b = base.clone();
+    a.insert(5, "X");
+    b.insert(5, "Y");
+
+    let snap_a = a.snapshot();
+    assert!(
+        !b.matches_snapshot(&snap_a),
+        "matches_snapshot must not treat divergent clones as equal"
+    );
+    assert!(
+        !b.restore_snapshot(&snap_a),
+        "restore_snapshot must reject snapshot from another PieceTable's added buffer"
+    );
+    assert_eq!(b, "helloY");
+}
