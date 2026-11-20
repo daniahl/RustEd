@@ -917,3 +917,283 @@ fn test_terminal_read_only_prevents_direct_text_mutation_on_focus_click() {
         "Terminal screen text must remain read-only even on the click-to-focus frame"
     );
 }
+
+#[test]
+fn test_ai_explain_shortcut_alt_e_and_button() {
+    use std::sync::mpsc;
+
+    let temp_dir =
+        std::env::temp_dir().join(format!("rusted_ai_explain_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&temp_dir);
+    let src_dir = temp_dir.join("src");
+    fs::create_dir_all(&src_dir).unwrap();
+    let file_path = src_dir.join("main.rs");
+    fs::write(&file_path, "fn main() {\n    let x = 42;\n    println!(\"{x}\");\n}\n").unwrap();
+
+    let ctx = egui::Context::default();
+    ctx.enable_accesskit();
+    let mut app = TextEditor::new_headless(&temp_dir);
+    let (tx, rx) = mpsc::channel();
+    app.terminal.pty_writer = Some(tx);
+    app.open_file(&ctx, file_path.clone());
+
+    let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::Vec2::new(1000.0, 600.0));
+    let take_sent = || {
+        let mut out = Vec::new();
+        while let Ok(chunk) = rx.try_recv() {
+            out.extend_from_slice(&chunk);
+        }
+        String::from_utf8(out).unwrap()
+    };
+
+    // Frame 1: no selection -> AI Explain button is disabled and Alt+E does nothing
+    let out1 = run_ui(
+        &ctx,
+        egui::RawInput {
+            screen_rect: Some(screen),
+            ..Default::default()
+        },
+        |ui| app.update_ui(ui),
+    );
+    let ak1 = out1.platform_output.accesskit_update.unwrap();
+    let explain_node_disabled = ak1
+        .nodes
+        .iter()
+        .find(|(_, n)| n.label() == Some("AI Explain"))
+        .map(|(_, n)| n)
+        .expect("Top bar should render an 'AI Explain' button");
+    assert!(
+        explain_node_disabled.is_disabled(),
+        "AI Explain button should be disabled when no text is selected"
+    );
+
+    let _ = run_ui(
+        &ctx,
+        egui::RawInput {
+            screen_rect: Some(screen),
+            events: vec![egui::Event::Key {
+                key: egui::Key::E,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::ALT,
+            }],
+            ..Default::default()
+        },
+        |ui| app.update_ui(ui),
+    );
+    assert_eq!(app.tab, rusted::app::Tab::Editor);
+    assert!(take_sent().is_empty());
+
+    // Select lines 2-3 ("    let x = 42;\n    println!(\"{x}\");")
+    let editor_id = rusted::editor::code_editor_id();
+    let set_selection = |ctx: &egui::Context, start: usize, end: usize| {
+        ctx.data_mut(|d| {
+            let mut st = d.get_temp::<FastEditorState>(editor_id).unwrap_or_default();
+            st.cursor.set_char_range(Some(egui::text::CCursorRange::two(
+                egui::text::CCursor::new(start),
+                egui::text::CCursor::new(end),
+            )));
+            d.insert_temp(editor_id, st);
+        });
+    };
+    let start_idx = "fn main() {\n".chars().count();
+    let selected_slice = "    let x = 42;\n    println!(\"{x}\");";
+    let end_idx = start_idx + selected_slice.chars().count();
+    set_selection(&ctx, start_idx, end_idx);
+
+    // Press Alt+E -> switches to Terminal tab, focuses terminal, sends formatted prompt + Enter
+    let _ = run_ui(
+        &ctx,
+        egui::RawInput {
+            screen_rect: Some(screen),
+            events: vec![egui::Event::Key {
+                key: egui::Key::E,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::ALT,
+            }],
+            ..Default::default()
+        },
+        |ui| app.update_ui(ui),
+    );
+    assert_eq!(app.tab, rusted::app::Tab::Terminal);
+    assert!(
+        ctx.memory(|m| m.has_focus(rusted::editor::terminal_id())),
+        "AI Explain should focus the terminal"
+    );
+    assert_eq!(
+        take_sent(),
+        format!("Explain src/main.rs:2-3: {selected_slice}\r")
+    );
+
+    // Switch back to Editor, enable bracketed paste on terminal (like agy), and click the AI Explain button
+    app.tab = rusted::app::Tab::Editor;
+    {
+        let mut lock = app.terminal.term.lock().unwrap();
+        lock.parser.process(b"\x1b[?2004h");
+    }
+    set_selection(&ctx, 0, "fn main()".chars().count());
+
+    let out_enabled = run_ui(
+        &ctx,
+        egui::RawInput {
+            screen_rect: Some(screen),
+            ..Default::default()
+        },
+        |ui| app.update_ui(ui),
+    );
+    let ak_enabled = out_enabled.platform_output.accesskit_update.unwrap();
+    let explain_node = ak_enabled
+        .nodes
+        .iter()
+        .find(|(_, n)| n.label() == Some("AI Explain"))
+        .map(|(_, n)| n)
+        .expect("AI Explain button should be present");
+    assert!(
+        !explain_node.is_disabled(),
+        "AI Explain button should be enabled when text is selected"
+    );
+    let bounds = explain_node.bounds().expect("AI Explain button should have bounds");
+    let click_pos = egui::pos2(
+        ((bounds.x0 + bounds.x1) * 0.5) as f32,
+        ((bounds.y0 + bounds.y1) * 0.5) as f32,
+    );
+
+    // Press and release pointer on the AI Explain button
+    let _ = run_ui(
+        &ctx,
+        egui::RawInput {
+            screen_rect: Some(screen),
+            events: vec![
+                egui::Event::PointerMoved(click_pos),
+                egui::Event::PointerButton {
+                    pos: click_pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            ..Default::default()
+        },
+        |ui| app.update_ui(ui),
+    );
+    let _ = run_ui(
+        &ctx,
+        egui::RawInput {
+            screen_rect: Some(screen),
+            events: vec![egui::Event::PointerButton {
+                pos: click_pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            ..Default::default()
+        },
+        |ui| app.update_ui(ui),
+    );
+
+    assert_eq!(app.tab, rusted::app::Tab::Terminal);
+    assert!(
+        ctx.memory(|m| m.has_focus(rusted::editor::terminal_id())),
+        "Clicking AI Explain should focus the terminal"
+    );
+    assert_eq!(
+        take_sent(),
+        "\x1b[200~Explain src/main.rs:1-1: fn main()\x1b[201~\r"
+    );
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_ai_explain_from_scrolled_long_file_does_not_panic() {
+    use std::fmt::Write;
+    use std::sync::mpsc;
+
+    let temp_dir =
+        std::env::temp_dir().join(format!("rusted_ai_explain_scroll_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+    let file_path = temp_dir.join("long.rs");
+    let mut content = String::new();
+    for i in 1..=250 {
+        let _ = writeln!(content, "let line_{i} = {i};");
+    }
+    fs::write(&file_path, &content).unwrap();
+
+    let ctx = egui::Context::default();
+    ctx.enable_accesskit();
+    let mut app = TextEditor::new_headless(&temp_dir);
+    let (tx, rx) = mpsc::channel();
+    app.terminal.pty_writer = Some(tx);
+    app.open_file(&ctx, file_path.clone());
+
+    let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::Vec2::new(1000.0, 500.0));
+    let _ = run_ui(
+        &ctx,
+        egui::RawInput {
+            screen_rect: Some(screen),
+            ..Default::default()
+        },
+        |ui| app.update_ui(ui),
+    );
+
+    // Select line 200 and scroll the editor far down (past the terminal's total height)
+    let target_line = "let line_200 = 200;";
+    let start_char = content.find(target_line).unwrap();
+    let end_char = start_char + target_line.len();
+    let editor_id = rusted::editor::code_editor_id();
+    ctx.data_mut(|d| {
+        let mut st = d.get_temp::<FastEditorState>(editor_id).unwrap_or_default();
+        st.cursor.set_char_range(Some(egui::text::CCursorRange::two(
+            egui::text::CCursor::new(start_char),
+            egui::text::CCursor::new(end_char),
+        )));
+        st.scroll_to_cursor = true;
+        d.insert_temp(editor_id, st);
+    });
+
+    // Run a couple frames so the editor ScrollArea actually scrolls down to line 200
+    for _ in 0..3 {
+        let _ = run_ui(
+            &ctx,
+            egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            },
+            |ui| app.update_ui(ui),
+        );
+    }
+
+    // Trigger AI Explain while scrolled far down -> must not panic on inverted clip rect
+    let out = run_ui(
+        &ctx,
+        egui::RawInput {
+            screen_rect: Some(screen),
+            events: vec![egui::Event::Key {
+                key: egui::Key::E,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::ALT,
+            }],
+            ..Default::default()
+        },
+        |ui| app.update_ui(ui),
+    );
+    assert!(out.platform_output.accesskit_update.is_some());
+    assert_eq!(app.tab, rusted::app::Tab::Terminal);
+
+    let mut sent = Vec::new();
+    while let Ok(chunk) = rx.try_recv() {
+        sent.extend_from_slice(&chunk);
+    }
+    assert_eq!(
+        String::from_utf8(sent).unwrap(),
+        format!("Explain long.rs:200-200: {target_line}\r")
+    );
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}

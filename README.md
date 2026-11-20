@@ -24,6 +24,7 @@ RustEd is built from the ground up with assistive technologies—especially **Wi
 - **Undo / Redo & Clipboard Support:** Full `Ctrl+Z` / `Ctrl+Y` history backed by shared `Arc<String>` snapshots, plus `Ctrl+C`, `Ctrl+X`, `Ctrl+V`, word-wise deletion (`Ctrl+Backspace`, `Ctrl+Delete`), and `PageUp` / `PageDown` navigation.
 
 ### Integrated ConPTY Terminal for AI CLI Workflows
+- **AI Explain (`Alt+E`):** Select code in the editor and click **AI Explain** (or press `Alt+E`) to switch focus to the integrated terminal, paste `Explain {filename}:{from_line}-{to_line}: {selected_text}`, and press `Enter` directly into your active AI CLI shell (e.g., `agy`).
 - **Built-in Terminal Tab:** Spawns a native shell (`cmd.exe` via `portable-pty`) parsed through a `vt100` virtual screen (`120x30`), making it easy to run CLI-based AI agents, build tools, and Git commands right next to your code.
 - **Keyboard & Selection Mode:** Supports standard terminal control sequences (`Ctrl+C`, `Ctrl+D`, `Ctrl+Z`, `Ctrl+L`, arrow keys, `Home`/`End`, `PageUp`/`PageDown`), plus `Shift`+Arrow selection mode for copying terminal output.
 

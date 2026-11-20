@@ -263,6 +263,38 @@ impl Document {
         !self.path.as_os_str().is_empty() && self.is_current_dirty
     }
 
+    /// Returns `true` if the editor currently has a non-empty text selection.
+    pub fn has_selection(&self, ctx: &egui::Context) -> bool {
+        let editor_id = editor::code_editor_id();
+        ctx.data(|d| d.get_temp::<editor::FastEditorState>(editor_id))
+            .and_then(|state| state.cursor.char_range())
+            .is_some_and(|range| {
+                let total = self.text.char_count();
+                let [min_c, max_c] = range.sorted_cursors();
+                min_c.index.0.min(total) < max_c.index.0.min(total)
+            })
+    }
+
+    /// Returns `(from_line, to_line, selected_text)` for the current editor selection,
+    /// where `from_line` and `to_line` are 1-based inclusive line numbers.
+    /// Returns `None` when there is no non-empty selection.
+    pub fn selected_text_with_lines(&self, ctx: &egui::Context) -> Option<(usize, usize, String)> {
+        let editor_id = editor::code_editor_id();
+        let state = ctx.data(|d| d.get_temp::<editor::FastEditorState>(editor_id))?;
+        let range = state.cursor.char_range()?;
+        let total = self.text.char_count();
+        let [min_c, max_c] = range.sorted_cursors();
+        let start_char = min_c.index.0.min(total);
+        let end_char = max_c.index.0.min(total);
+        if start_char >= end_char {
+            return None;
+        }
+        let from_line = self.text.char_to_line_col(start_char).0 + 1;
+        let to_line = self.text.char_to_line_col(end_char - 1).0 + 1;
+        let selected = self.text.slice_chars(start_char..end_char);
+        Some((from_line, to_line, selected))
+    }
+
     pub fn has_unsaved_changes(&self) -> bool {
         self.can_save() || !self.unsaved_files.is_empty()
     }
@@ -1186,6 +1218,7 @@ impl Document {
 
             let available_size = ui.available_size();
             egui::ScrollArea::vertical()
+                .id_salt("editor_scroll_area")
                 .auto_shrink([false, false])
                 .animated(false)
                 .show(ui, |ui| {

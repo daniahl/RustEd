@@ -327,6 +327,51 @@ impl TerminalPane {
         }
     }
 
+    pub fn is_bracketed_paste(&self) -> bool {
+        self.term
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .parser
+            .screen()
+            .bracketed_paste()
+    }
+
+    fn clear_terminal_selection(&mut self, ctx: &egui::Context) {
+        let term_id = terminal_id();
+        self.selecting_in_terminal = false;
+        ctx.data_mut(|d| {
+            if let Some(mut state) = d.get_temp::<FastEditorState>(term_id) {
+                state.mouse_selection = None;
+                d.insert_temp(term_id, state);
+            }
+        });
+    }
+
+    /// Pastes `text` into the terminal (honoring bracketed paste mode when enabled)
+    /// and presses Enter (`\r`) to submit it.
+    pub fn paste_and_submit(&mut self, ctx: &egui::Context, text: &str) {
+        self.clear_terminal_selection(ctx);
+        let payload = encode_paste_bytes(text, self.is_bracketed_paste());
+        if !payload.is_empty() {
+            self.write_to_pty(&payload);
+        }
+        if self._pty_master.is_some() {
+            // Live ConPTY TUIs (e.g. agy / Ink / crossterm) can miss or absorb `\r`
+            // if it arrives in the exact same pipe read as the bracketed-paste terminator.
+            if let Some(tx) = self.pty_writer.clone() {
+                let shutdown = Arc::clone(&self.shutdown);
+                thread::spawn(move || {
+                    thread::sleep(std::time::Duration::from_millis(50));
+                    if !shutdown.load(Ordering::Relaxed) {
+                        let _ = tx.send(b"\r".to_vec());
+                    }
+                });
+            }
+        } else {
+            self.write_to_pty(b"\r");
+        }
+    }
+
     pub fn handle_terminal_input(&mut self, ctx: &egui::Context, term_focused: bool) {
         if !term_focused {
             return;
@@ -334,6 +379,7 @@ impl TerminalPane {
 
         let mut to_send: Vec<u8> = Vec::new();
         let mut clear_selection = false;
+        let bracketed_paste = self.is_bracketed_paste();
 
         ctx.input_mut(|i| {
             i.events.retain(|event| {
@@ -344,7 +390,7 @@ impl TerminalPane {
                         false
                     }
                     egui::Event::Paste(text) => {
-                        to_send.extend_from_slice(text.as_bytes());
+                        to_send.extend_from_slice(&encode_paste_bytes(text, bracketed_paste));
                         clear_selection = true;
                         false
                     }
@@ -418,14 +464,7 @@ impl TerminalPane {
         });
 
         if clear_selection {
-            let term_id = terminal_id();
-            self.selecting_in_terminal = false;
-            ctx.data_mut(|d| {
-                if let Some(mut state) = d.get_temp::<FastEditorState>(term_id) {
-                    state.mouse_selection = None;
-                    d.insert_temp(term_id, state);
-                }
-            });
+            self.clear_terminal_selection(ctx);
         }
         if !to_send.is_empty() {
             self.write_to_pty(&to_send);
@@ -501,6 +540,7 @@ impl TerminalPane {
             target_grid = Some((new_rows, new_cols));
 
             egui::ScrollArea::vertical()
+                .id_salt("terminal_scroll_area")
                 .auto_shrink([false, false])
                 .animated(false)
                 .show(ui, |ui| {
@@ -600,6 +640,23 @@ pub fn render_vt100_screen_into(screen: &vt100::Screen, full_text: &mut String) 
     }
 
     cursor_char_idx
+}
+
+/// Encodes text for pasting into a PTY, normalizing CRLF/CR line endings to LF so
+/// multi-line Windows files do not prematurely trigger Enter mid-paste, and wrapping
+/// in bracketed-paste sequences (`\x1b[200~` ... `\x1b[201~`) when active.
+pub fn encode_paste_bytes(text: &str, bracketed_paste: bool) -> Vec<u8> {
+    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+    if bracketed_paste {
+        let safe = normalized.replace("\x1b[201~", "");
+        let mut out = Vec::with_capacity(safe.len() + 12);
+        out.extend_from_slice(b"\x1b[200~");
+        out.extend_from_slice(safe.as_bytes());
+        out.extend_from_slice(b"\x1b[201~");
+        out
+    } else {
+        normalized.into_bytes()
+    }
 }
 
 fn ctrl_key_byte(key: egui::Key) -> Option<u8> {

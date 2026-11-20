@@ -613,3 +613,50 @@ fn test_terminal_resize_and_wide_char_cursor() {
     assert!(text.starts_with("你好ab"));
     assert_eq!(cursor_idx, 4);
 }
+
+#[test]
+fn test_encode_paste_bytes_and_paste_and_submit() {
+    use rusted::terminal::encode_paste_bytes;
+
+    // Plain mode normalizes CRLF / CR to LF
+    assert_eq!(
+        encode_paste_bytes("Explain a.rs:1-2: foo\r\nbar", false),
+        b"Explain a.rs:1-2: foo\nbar"
+    );
+
+    // Bracketed paste mode wraps in ESC[200~ ... ESC[201~ and strips embedded ESC[201~
+    assert_eq!(
+        encode_paste_bytes("Explain a.rs:1-2: foo\r\n\x1b[201~bar", true),
+        b"\x1b[200~Explain a.rs:1-2: foo\nbar\x1b[201~"
+    );
+
+    let ctx = egui::Context::default();
+    let mut pane = TerminalPane::new_headless();
+    let (tx, rx) = mpsc::channel();
+    pane.pty_writer = Some(tx);
+
+    let take_sent = || {
+        let mut out = Vec::new();
+        while let Ok(chunk) = rx.try_recv() {
+            out.extend_from_slice(&chunk);
+        }
+        out
+    };
+
+    // Bracketed paste disabled by default -> sends text then '\r'
+    assert!(!pane.is_bracketed_paste());
+    pane.paste_and_submit(&ctx, "Explain main.rs:1-1: let x = 1;");
+    assert_eq!(take_sent(), b"Explain main.rs:1-1: let x = 1;\r");
+
+    // Enable bracketed paste mode via DECSET 2004 -> wraps paste and then sends '\r'
+    {
+        let mut lock = pane.term.lock().unwrap();
+        lock.parser.process(b"\x1b[?2004h");
+    }
+    assert!(pane.is_bracketed_paste());
+    pane.paste_and_submit(&ctx, "Explain main.rs:1-2: a\r\nb");
+    assert_eq!(
+        take_sent(),
+        b"\x1b[200~Explain main.rs:1-2: a\nb\x1b[201~\r"
+    );
+}

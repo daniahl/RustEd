@@ -551,3 +551,68 @@ fn test_find_next_across_multi_piece_buffer() {
         .unwrap();
     assert_eq!((sel4.secondary.index.0, sel4.primary.index.0), (0, 5));
 }
+
+#[test]
+fn test_selected_text_with_lines_single_multi_crlf_and_trailing_newline() {
+    use rusted::editor::{code_editor_id, FastEditorState};
+
+    let ctx = egui::Context::default();
+    let mut doc = Document::new();
+    doc.text = "line1\nline2\nline3\n".into();
+    doc.text_revision = 1;
+
+    let set_sel = |ctx: &egui::Context, a: usize, b: usize| {
+        ctx.data_mut(|d| {
+            let mut st = d
+                .get_temp::<FastEditorState>(code_editor_id())
+                .unwrap_or_default();
+            st.cursor.set_char_range(Some(egui::text::CCursorRange::two(
+                egui::text::CCursor::new(a),
+                egui::text::CCursor::new(b),
+            )));
+            d.insert_temp(code_editor_id(), st);
+        });
+    };
+
+    // No state / collapsed cursor -> no selection
+    assert!(!doc.has_selection(&ctx));
+    assert_eq!(doc.selected_text_with_lines(&ctx), None);
+    set_sel(&ctx, 3, 3);
+    assert!(!doc.has_selection(&ctx));
+    assert_eq!(doc.selected_text_with_lines(&ctx), None);
+
+    // Single-line selection
+    set_sel(&ctx, 0, 5);
+    assert!(doc.has_selection(&ctx));
+    assert_eq!(
+        doc.selected_text_with_lines(&ctx),
+        Some((1, 1, "line1".to_string()))
+    );
+
+    // Whole-line selection including trailing '\n' does not spill onto line 2
+    set_sel(&ctx, 0, 6);
+    assert_eq!(
+        doc.selected_text_with_lines(&ctx),
+        Some((1, 1, "line1\n".to_string()))
+    );
+
+    // Multi-line selection (and reversed anchor/primary)
+    set_sel(&ctx, 17, 6);
+    assert_eq!(
+        doc.selected_text_with_lines(&ctx),
+        Some((2, 3, "line2\nline3".to_string()))
+    );
+
+    // CRLF whole-line selection including "\r\n" stays on line 1
+    doc.text = "alpha\r\nbeta\r\ngamma".into();
+    set_sel(&ctx, 0, 7);
+    assert_eq!(
+        doc.selected_text_with_lines(&ctx),
+        Some((1, 1, "alpha\r\n".to_string()))
+    );
+    set_sel(&ctx, 7, 18);
+    assert_eq!(
+        doc.selected_text_with_lines(&ctx),
+        Some((2, 3, "beta\r\ngamma".to_string()))
+    );
+}

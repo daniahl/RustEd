@@ -2838,10 +2838,26 @@ fn update_accesskit(
             row_max.y = row_min.y + line_height;
         }
 
-        row_min.y = row_min.y.clamp(text_clip_rect.min.y, text_clip_rect.max.y);
-        row_max.y = row_max.y.clamp(row_min.y, text_clip_rect.max.y);
-        row_min.x = row_min.x.clamp(text_clip_rect.min.x, text_clip_rect.max.x);
-        row_max.x = row_max.x.clamp(row_min.x, text_clip_rect.max.x);
+        if text_clip_rect.min.y.is_finite()
+            && text_clip_rect.max.y.is_finite()
+            && text_clip_rect.min.y <= text_clip_rect.max.y
+        {
+            row_min.y = row_min.y.clamp(text_clip_rect.min.y, text_clip_rect.max.y);
+            row_max.y = row_max.y.clamp(row_min.y, text_clip_rect.max.y);
+        } else if text_clip_rect.min.y.is_finite() {
+            row_min.y = text_clip_rect.min.y;
+            row_max.y = text_clip_rect.min.y;
+        }
+        if text_clip_rect.min.x.is_finite()
+            && text_clip_rect.max.x.is_finite()
+            && text_clip_rect.min.x <= text_clip_rect.max.x
+        {
+            row_min.x = row_min.x.clamp(text_clip_rect.min.x, text_clip_rect.max.x);
+            row_max.x = row_max.x.clamp(row_min.x, text_clip_rect.max.x);
+        } else if text_clip_rect.min.x.is_finite() {
+            row_min.x = text_clip_rect.min.x;
+            row_max.x = text_clip_rect.min.x;
+        }
         if row_max.x - row_min.x < 2.0 {
             row_max.x = row_min.x + 2.0;
         }

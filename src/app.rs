@@ -7,7 +7,7 @@ use crate::{
     document::{DiskSyncResult, Document},
     explorer::{FileExplorer, PendingTreeEdit, TreeAction},
     terminal::TerminalPane,
-    watcher::{path_starts_with, paths_equal, FileWatcher},
+    watcher::{path_starts_with, path_strip_prefix, paths_equal, FileWatcher},
 };
 use eframe::egui;
 use std::{
@@ -133,6 +133,35 @@ impl TextEditor {
 
     pub fn start_rename_selected(&mut self) {
         self.explorer.start_rename_selected();
+    }
+
+    fn explain_filename(&self) -> String {
+        if self.doc.path.as_os_str().is_empty() {
+            return self.doc.file_name.clone();
+        }
+        if let Some(rel) = path_strip_prefix(&self.doc.path, &self.explorer.folder_path)
+            .filter(|p| !p.as_os_str().is_empty())
+        {
+            return rel.to_string_lossy().replace('\\', "/");
+        }
+        self.doc.path.to_string_lossy().into_owned()
+    }
+
+    /// Sends the current editor selection to the integrated terminal as an AI Explain prompt,
+    /// switches focus to the terminal tab, and submits it with Enter.
+    /// Returns `true` when a non-empty selection was sent.
+    pub fn ai_explain(&mut self, ctx: &egui::Context) -> bool {
+        let Some((from_line, to_line, selected_text)) = self.doc.selected_text_with_lines(ctx)
+        else {
+            return false;
+        };
+        let filename = self.explain_filename();
+        let prompt = format_ai_explain_prompt(&filename, from_line, to_line, &selected_text);
+        self.tab = Tab::Terminal;
+        self.terminal.focus_terminal = true;
+        self.terminal.paste_and_submit(ctx, &prompt);
+        ctx.request_repaint();
+        true
     }
 
     /// Applies a batch of filesystem change paths to the explorer tree and the active document.
@@ -286,7 +315,7 @@ impl TextEditor {
 
         if self.tab == Tab::Editor {
             let folder_input_focused = ctx.memory(|m| m.has_focus(project_folder_input_id()));
-            let (ctrl_s, ctrl_f, f3, fold_cur, unfold_cur, fold_all, unfold_all) =
+            let (ctrl_s, ctrl_f, f3, fold_cur, unfold_cur, fold_all, unfold_all, ai_explain) =
                 ctx.input_mut(|i| {
                     let ctrl_s = i.consume_key(egui::Modifiers::COMMAND, egui::Key::S)
                         || i.consume_key(egui::Modifiers::CTRL, egui::Key::S);
@@ -294,7 +323,7 @@ impl TextEditor {
                         || i.consume_key(egui::Modifiers::CTRL, egui::Key::F);
                     let f3 = i.consume_key(egui::Modifiers::NONE, egui::Key::F3);
 
-                    let (fold_cur, unfold_cur, fold_all, unfold_all) =
+                    let (fold_cur, unfold_cur, fold_all, unfold_all, ai_explain) =
                         if !self.doc.find_open
                             && !self.confirm_close_open
                             && self.explorer.pending_tree_edit.is_none()
@@ -312,12 +341,13 @@ impl TextEditor {
                             let unfold_all = i.consume_key(alt_shift, egui::Key::ArrowRight);
                             let fold_cur = i.consume_key(alt, egui::Key::ArrowLeft);
                             let unfold_cur = i.consume_key(alt, egui::Key::ArrowRight);
-                            (fold_cur, unfold_cur, fold_all, unfold_all)
+                            let ai_explain = i.consume_key(alt, egui::Key::E);
+                            (fold_cur, unfold_cur, fold_all, unfold_all, ai_explain)
                         } else {
-                            (false, false, false, false)
+                            (false, false, false, false, false)
                         };
                     (
-                        ctrl_s, ctrl_f, f3, fold_cur, unfold_cur, fold_all, unfold_all,
+                        ctrl_s, ctrl_f, f3, fold_cur, unfold_cur, fold_all, unfold_all, ai_explain,
                     )
                 });
             if ctrl_s && self.doc.can_save() {
@@ -344,6 +374,9 @@ impl TextEditor {
             }
             if unfold_all {
                 self.doc.unfold_all(ctx);
+            }
+            if ai_explain {
+                self.ai_explain(ctx);
             }
         }
 
@@ -409,6 +442,14 @@ impl TextEditor {
 
                     if ui.button("Find").on_hover_text("Find (Ctrl+F)").clicked() {
                         self.doc.open_find_dialog(ctx);
+                    }
+
+                    if ui
+                        .add_enabled(self.doc.has_selection(ctx), egui::Button::new("AI Explain"))
+                        .on_hover_text("AI Explain (Alt+E)")
+                        .clicked()
+                    {
+                        self.ai_explain(ctx);
                     }
                 } else if self.tab == Tab::Terminal {
                     ui.separator();
@@ -494,6 +535,16 @@ impl TextEditor {
         }
         self.sync_watcher();
     }
+}
+
+/// Formats the prompt sent to the integrated terminal by the AI Explain feature.
+pub fn format_ai_explain_prompt(
+    filename: &str,
+    from_line: usize,
+    to_line: usize,
+    selected_text: &str,
+) -> String {
+    format!("Explain {filename}:{from_line}-{to_line}: {selected_text}")
 }
 
 /// Returns the first command-line argument that names an existing folder, made absolute.
