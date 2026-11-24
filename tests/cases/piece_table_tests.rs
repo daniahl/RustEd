@@ -617,3 +617,85 @@ fn test_snapshot_rejects_divergent_clone_added_buffer() {
     );
     assert_eq!(b, "helloY");
 }
+
+#[test]
+fn test_snapshot_rejects_other_table_even_for_original_only_pieces() {
+    let mut a = PieceTable::from_str("alpha beta");
+    let mut b = PieceTable::from_str("gamma delta");
+    a.delete(5..10); // Only BufferType::Original pieces remain
+    let snap_a = a.snapshot();
+    assert!(
+        !b.restore_snapshot(&snap_a),
+        "restore_snapshot must reject snapshot from a different PieceTable even without Added pieces"
+    );
+    assert_eq!(b, "gamma delta");
+}
+
+#[test]
+fn test_find_from_byte_non_utf8_boundary_does_not_panic() {
+    // Single-piece table with 4-byte emoji at bytes 0..4
+    let pt_single = PieceTable::from_str("🦀hello🦀world");
+    assert_eq!(pt_single.find_from_byte("hello", 1), Some(4));
+    assert_eq!(pt_single.find_from_byte("world", 10), Some(13));
+    assert_eq!(pt_single.find_from_byte("🦀", 1), Some(9));
+
+    // Multi-piece table with multibyte characters spanning piece boundaries
+    let mut pt_multi = PieceTable::from_str("🦀alpha");
+    pt_multi.insert(6, "🦀beta");
+    pt_multi.insert(3, "é");
+    // "🦀alépha🦀beta"
+    let flat = pt_multi.build_string();
+    let expected_beta = flat.find("beta").unwrap();
+    assert_eq!(pt_multi.find_from_byte("beta", 1), Some(expected_beta));
+    assert_eq!(pt_multi.find_from_byte("beta", 2), Some(expected_beta));
+    let expected_al = flat.find("alé").unwrap();
+    assert_eq!(pt_multi.find_from_byte("alé", 1), Some(expected_al));
+}
+
+#[test]
+fn test_hint_accelerated_coordinate_queries_match_reference() {
+    let mut pt = PieceTable::from_str("line0\nline1 é\nline2 🦀\nline3\n");
+    for i in 0..40 {
+        let pos = if i % 2 == 0 {
+            1 + (i % 5)
+        } else {
+            pt.char_count().saturating_sub(2)
+        };
+        pt.insert(pos, &format!("ins{i}é\n"));
+    }
+    pt.delete(15..35);
+    assert!(pt.piece_count() > 20, "expected >20 pieces, got {}", pt.piece_count());
+
+    let flat = pt.build_string();
+    let char_count = flat.chars().count();
+    let byte_offsets: Vec<usize> = flat
+        .char_indices()
+        .map(|(b, _)| b)
+        .chain(std::iter::once(flat.len()))
+        .collect();
+
+    // Jump forward, backward, and randomly across char_to_byte / byte_to_char / char_to_line_col / line_to_char
+    let probe_chars = [0, char_count, char_count / 2, 1, char_count - 1, 13, 120, 7, 200.min(char_count)];
+    for &c in &probe_chars {
+        let b = pt.char_to_byte(c);
+        assert_eq!(b, byte_offsets[c], "char_to_byte mismatch at {c}");
+        assert_eq!(pt.byte_to_char(b), c, "byte_to_char mismatch at byte {b}");
+
+        let prefix = &flat[..b];
+        let exp_line = prefix.bytes().filter(|&x| x == b'\n').count();
+        let exp_col = prefix
+            .rsplit('\n')
+            .next()
+            .unwrap()
+            .chars()
+            .count();
+        assert_eq!(pt.char_to_line_col(c), (exp_line, exp_col), "char_to_line_col mismatch at {c}");
+    }
+
+    let total_lines = pt.line_count();
+    for line in [total_lines - 1, 0, total_lines / 2, 1, total_lines.saturating_sub(2), 3.min(total_lines - 1)] {
+        let start_char = pt.line_to_char(line);
+        let (got_line, got_col) = pt.char_to_line_col(start_char);
+        assert_eq!((got_line, got_col), (line, 0), "line_to_char round-trip failed for line {line}");
+    }
+}

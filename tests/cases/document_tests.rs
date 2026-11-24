@@ -400,7 +400,14 @@ fn test_refresh_file_metadata_from_path() {
     doc.path.clear();
     doc.refresh_file_metadata();
     assert_eq!(doc.file_name, "Untitled");
-    assert_eq!(doc.language_ext, "rs");
+    assert_eq!(doc.language_ext, "txt");
+
+    // Extensionless files default to plain text ("txt"), not Rust ("rs").
+    for name in ["Dockerfile", "Makefile", ".gitignore", "LICENSE"] {
+        doc.path = PathBuf::from(name);
+        doc.refresh_file_metadata();
+        assert_eq!(doc.language_ext, "txt", "{name} should highlight as txt");
+    }
 }
 
 #[test]

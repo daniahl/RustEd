@@ -188,7 +188,7 @@ pub struct Document {
     pub file_name: String,
     pub language_ext: String,
     pub language_name: &'static str,
-    pub language_salt: u64,
+    pub(crate) language_salt: u64,
     pub line_ending: &'static str,
     /// Per-row logical line number (0 = wrapped continuation row), for the gutter.
     /// Rebuilt only when the editor's galley changes.
@@ -200,8 +200,9 @@ pub struct Document {
     pub cursor_line: usize,
     pub cursor_col: usize,
     pub selected_chars: usize,
-    pub status_file_cache: Option<(usize, usize, String)>,
-    pub status_pos_cache: Option<((usize, usize, usize), String)>,
+    last_cursor_status_key: Option<(u64, egui::text::CCursorRange)>,
+    pub(crate) status_file_cache: Option<(usize, usize, String)>,
+    pub(crate) status_pos_cache: Option<((usize, usize, usize), String)>,
     pub find_open: bool,
     pub find_query: String,
     pub focus_find_input: bool,
@@ -219,18 +220,20 @@ impl Default for Document {
 
 impl Document {
     pub fn new() -> Self {
+        let text = PieceTable::new();
+        let saved_snapshot = Some(text.snapshot());
         Self {
             path: PathBuf::new(),
-            text: PieceTable::new(),
-            saved_snapshot: None,
+            text,
+            saved_snapshot,
             saved_revision: 0,
             is_current_dirty: false,
             unsaved_files: HashMap::new(),
             text_revision: 0,
             file_name: "Untitled".to_string(),
-            language_ext: "rs".to_string(),
+            language_ext: "txt".to_string(),
             language_name: "Plain Text",
-            language_salt: hash_language_salt("rs"),
+            language_salt: hash_language_salt("txt"),
             line_ending: "LF",
             gutter_cache: None,
             folding: FoldState::new(),
@@ -238,6 +241,7 @@ impl Document {
             cursor_line: 1,
             cursor_col: 1,
             selected_chars: 0,
+            last_cursor_status_key: None,
             status_file_cache: None,
             status_pos_cache: None,
             find_open: false,
@@ -254,13 +258,32 @@ impl Document {
         self.text = text.into();
         self.text_revision = self.text_revision.wrapping_add(1);
         self.gutter_cache = None;
+        self.last_cursor_status_key = None;
         self.folding.clear();
         self.line_count = self.text.line_count();
         self.refresh_line_ending();
     }
 
     pub fn can_save(&self) -> bool {
-        !self.path.as_os_str().is_empty() && self.is_current_dirty
+        self.is_current_dirty
+    }
+
+    /// Returns `true` when the active buffer is an unsaved `Untitled` buffer with no disk path yet.
+    pub fn is_untitled_dirty(&self) -> bool {
+        self.path.as_os_str().is_empty() && self.is_current_dirty
+    }
+
+    /// Returns `true` if `path` (or any file inside `path` when `is_dir` is `true`) has unsaved edits.
+    pub fn has_dirty_in_path(&self, path: &Path, is_dir: bool) -> bool {
+        if !self.path.as_os_str().is_empty()
+            && self.is_current_dirty
+            && (paths_equal(&self.path, path) || (is_dir && path_starts_with(&self.path, path)))
+        {
+            return true;
+        }
+        self.unsaved_files.keys().any(|k| {
+            paths_equal(k, path) || (is_dir && path_starts_with(k, path))
+        })
     }
 
     /// Returns `true` if the editor currently has a non-empty text selection.
@@ -301,7 +324,11 @@ impl Document {
 
     pub fn save_all(&mut self) -> bool {
         let mut all_ok = true;
-        if self.can_save() {
+        if self.is_untitled_dirty() {
+            self.last_save_error =
+                Some("Cannot save Untitled without choosing a destination path.".to_string());
+            all_ok = false;
+        } else if self.can_save() {
             self.save_current_file();
             if self.is_current_dirty {
                 all_ok = false;
@@ -332,6 +359,32 @@ impl Document {
     pub fn is_file_dirty(&self, path: &Path) -> bool {
         (self.is_current_dirty && !self.path.as_os_str().is_empty() && paths_equal(&self.path, path))
             || (!self.unsaved_files.is_empty() && has_unsaved_entry(&self.unsaved_files, path))
+    }
+
+    /// Saves the active buffer to `target_path` (Save As), updating `self.path` and metadata on success.
+    pub fn save_current_file_as(&mut self, target_path: PathBuf) -> bool {
+        match write_piece_table_atomic(&target_path, &self.text) {
+            Ok(()) => {
+                self.path = target_path.clone();
+                self.saved_snapshot = Some(self.text.snapshot());
+                self.saved_revision = self.text_revision;
+                self.is_current_dirty = false;
+                self.last_save_error = None;
+                self.disk_stamp = read_disk_stamp(&target_path);
+                self.external_conflict = None;
+                take_unsaved_entry(&mut self.unsaved_files, &target_path);
+                self.refresh_file_metadata();
+                true
+            }
+            Err(err) => {
+                let name = target_path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("file");
+                self.last_save_error = Some(format!("Failed to save {name}: {err}"));
+                false
+            }
+        }
     }
 
     pub fn save_current_file(&mut self) {
@@ -386,10 +439,7 @@ impl Document {
         if !self.path.as_os_str().is_empty() && self.is_current_dirty {
             let mut prev_state = ctx.data_mut(|d| d.get_temp::<editor::FastEditorState>(editor_id));
             if let Some(ref mut st) = prev_state {
-                st.layout_cache = None;
-                st.virtual_layout_cache = None;
-                st.accesskit_row_cache = None;
-                st.last_undo_snapshot = None;
+                st.clear_caches();
             }
             self.text.drop_cached_text();
             self.unsaved_files.insert(
@@ -412,6 +462,7 @@ impl Document {
         self.path = chosen.clone();
         self.text_revision = self.text_revision.wrapping_add(1);
         self.gutter_cache = None;
+        self.last_cursor_status_key = None;
         self.folding.clear();
         self.external_conflict = None;
         self.last_save_error = None;
@@ -555,12 +606,15 @@ impl Document {
         content: String,
         stamp: Option<DiskStamp>,
     ) {
+        let prev_full_text: Arc<str> = self.text.with_str(|s| Arc::from(s));
+
         self.text = PieceTable::from_string(content);
         self.saved_snapshot = Some(self.text.snapshot());
         self.text_revision = self.text_revision.wrapping_add(1);
         self.saved_revision = self.text_revision;
         self.is_current_dirty = false;
         self.gutter_cache = None;
+        self.last_cursor_status_key = None;
         self.line_count = self.text.line_count();
         self.disk_stamp = stamp;
         self.external_conflict = None;
@@ -578,13 +632,19 @@ impl Document {
             .unwrap_or_else(|| egui::text::CCursorRange::one(egui::text::CCursor::new(0)));
         let primary_idx = prev_range.primary.index.0.min(total_chars);
         let secondary_idx = prev_range.secondary.index.0.min(total_chars);
-        st.cursor.set_char_range(Some(egui::text::CCursorRange::two(
+        let clamped_range = egui::text::CCursorRange::two(
             egui::text::CCursor::new(secondary_idx),
             egui::text::CCursor::new(primary_idx),
-        )));
-        st.layout_cache = None;
-        st.virtual_layout_cache = None;
-        st.accesskit_row_cache = None;
+        );
+        st.cursor.set_char_range(Some(clamped_range));
+        st.clear_caches();
+        // Reset stale `PieceTableSnapshot` entries tied to the previous `PieceTable`'s `table_id`,
+        // and seed a `FullText` checkpoint so `Ctrl+Z` can cleanly undo the reload.
+        st.reset_undo_history();
+        {
+            let mut undoer = st.undoer.lock().unwrap_or_else(|e| e.into_inner());
+            undoer.add_undo(&(prev_range, editor::UndoSnapshot::FullText(prev_full_text)));
+        }
         st.last_undo_snapshot = Some(self.text.undo_snapshot());
 
         let (line, col) = self.text.char_to_line_col(primary_idx);
@@ -610,11 +670,12 @@ impl Document {
             if paths_equal(cur, path) || (is_dir && path_starts_with(cur, path)) {
                 self.path.clear();
                 self.text.clear();
-                self.saved_snapshot = None;
+                self.saved_snapshot = Some(self.text.snapshot());
                 self.is_current_dirty = false;
                 self.text_revision = self.text_revision.wrapping_add(1);
                 self.saved_revision = self.text_revision;
                 self.gutter_cache = None;
+                self.last_cursor_status_key = None;
                 self.folding.clear();
                 self.line_count = 1;
                 self.cursor_line = 1;
@@ -679,7 +740,7 @@ impl Document {
     pub fn refresh_file_metadata(&mut self) {
         if self.path.as_os_str().is_empty() {
             self.file_name = "Untitled".to_string();
-            self.language_ext = "rs".to_string();
+            self.language_ext = "txt".to_string();
         } else {
             let p = &self.path;
             self.file_name = p
@@ -689,11 +750,13 @@ impl Document {
             self.language_ext = p
                 .extension()
                 .and_then(|ext| ext.to_str())
-                .unwrap_or("rs")
+                .unwrap_or("txt")
                 .to_string();
         }
         self.language_name = detect_language_name(&self.path.to_string_lossy());
         self.language_salt = hash_language_salt(&self.language_ext);
+        self.folding
+            .set_hash_comments(crate::folding::extension_uses_hash_comments(&self.language_ext));
         self.status_file_cache = None;
         self.refresh_line_ending();
     }
@@ -1120,10 +1183,16 @@ impl Document {
     }
 
     /// Updates cursor line/column/selection status fields from the editor output.
+    /// Skips scanning the buffer on idle frames where `(text_revision, cursor_range)` is unchanged.
     fn update_cursor_status(&mut self, ctx: &egui::Context, output: &editor::EditorOutput) {
         let Some(cursor_range) = output.cursor_range else {
             return;
         };
+        let key = (self.text_revision, cursor_range);
+        if !output.text_changed && self.last_cursor_status_key == Some(key) {
+            return;
+        }
+        self.last_cursor_status_key = Some(key);
         let prev = (self.cursor_line, self.cursor_col, self.selected_chars);
         let (line, col) = self.text.char_to_line_col(cursor_range.primary.index.0);
         self.cursor_line = line + 1;
@@ -1217,6 +1286,7 @@ impl Document {
             let text_color = ui.visuals().widgets.inactive.text_color();
 
             let available_size = ui.available_size();
+            let is_large = self.text.len() > MAX_HIGHLIGHT_BYTES;
             egui::ScrollArea::vertical()
                 .id_salt("editor_scroll_area")
                 .auto_shrink([false, false])
@@ -1245,7 +1315,6 @@ impl Document {
                         self.folding
                             .ensure_updated_buffer(&self.text, Some(text_revision));
 
-                        let is_large = self.text.len() > MAX_HIGHLIGHT_BYTES;
                         let newline = if self.line_ending == "CRLF" { "\r\n" } else { "\n" };
                         let output = {
                             let language = self.language_ext.as_str();
@@ -1271,21 +1340,34 @@ impl Document {
                                 };
                                 ui.fonts_mut(|f| f.layout_job(layout_job))
                             };
-                            FastEditor::new(
-                                editor::code_editor_id(),
-                                &mut self.text,
-                                editor_min_size,
-                                &mut layouter,
-                            )
-                            .cache_salt(language_salt)
-                            .text_revision(text_revision)
-                            .newline(newline)
-                            .virtualized(is_large)
-                            .fold_state(&mut self.folding)
-                            .show(ui)
+                            let mut show_fast_editor = |ui: &mut egui::Ui| {
+                                FastEditor::new(
+                                    editor::code_editor_id(),
+                                    &mut self.text,
+                                    editor_min_size,
+                                    &mut layouter,
+                                )
+                                .cache_salt(language_salt)
+                                .text_revision(text_revision)
+                                .newline(newline)
+                                .virtualized(is_large)
+                                .fold_state(&mut self.folding)
+                                .show(ui)
+                            };
+                            if is_large {
+                                egui::ScrollArea::horizontal()
+                                    .id_salt("editor_hscroll_area")
+                                    .max_width(editor_min_size.x)
+                                    .auto_shrink([false, false])
+                                    .animated(false)
+                                    .show(ui, |ui| show_fast_editor(ui))
+                                    .inner
+                            } else {
+                                show_fast_editor(ui)
+                            }
                         };
                         if self.focus_editor {
-                            output.response.request_focus();
+                            editor::request_editor_focus(ui.ctx(), output.response.id);
                             self.focus_editor = false;
                         }
                         editor_text_changed = output.text_changed;
@@ -1337,6 +1419,7 @@ impl Document {
 
         if editor_text_changed {
             self.text_revision = self.text_revision.wrapping_add(1);
+            self.last_cursor_status_key = None;
             if self
                 .saved_snapshot
                 .as_ref()
@@ -1344,8 +1427,7 @@ impl Document {
             {
                 self.saved_revision = self.text_revision;
             }
-            self.is_current_dirty =
-                !self.path.as_os_str().is_empty() && self.text_revision != self.saved_revision;
+            self.is_current_dirty = self.text_revision != self.saved_revision;
             ctx.request_repaint();
         }
     }

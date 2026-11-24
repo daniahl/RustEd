@@ -1003,3 +1003,51 @@ fn test_virtualized_ctrl_arrows_skip_folded_lines_and_plain_arrows_collapse_sele
     assert_eq!((cur.secondary.index.0, cur.primary.index.0), (0, 0));
 }
 
+#[test]
+fn test_fold_scanner_ignores_hash_comments_multiline_strings_and_raw_strings() {
+    use rusted::folding::{compute_fold_ranges, compute_fold_ranges_with_options, FoldRange};
+
+    // Python / hash-comment file with stray `{` in a `#` comment
+    let py = "\
+# comment with stray {
+def foo():
+    d = {
+        'a': 1,
+    }
+    return d
+";
+    let ranges = compute_fold_ranges_with_options(py, true);
+    assert!(
+        ranges.contains(&FoldRange {
+            start_line: 2,
+            end_line: 3,
+        }),
+        "brace fold for dict should not be broken by `# {{`, got {ranges:?}"
+    );
+    assert!(
+        !ranges.iter().any(|r| r.start_line == 0),
+        "comment line 0 must not start a brace fold, got {ranges:?}"
+    );
+
+    // Rust file with multi-line double-quoted string and raw string containing unmatched braces
+    let rs = "\
+fn demo() {
+    let s = \"multiline {
+        still inside string {{{
+    \";
+    let raw = r#\"
+        raw string with }}}} and {
+    \"#;
+    let x = 1;
+}
+";
+    let rs_ranges = compute_fold_ranges(rs);
+    assert!(
+        rs_ranges.contains(&FoldRange {
+            start_line: 0,
+            end_line: 7,
+        }),
+        "fn demo() fold should span lines 0..=7 despite braces inside strings, got {rs_ranges:?}"
+    );
+}
+

@@ -38,10 +38,21 @@ fn line_indent(line: &str) -> Option<usize> {
     None
 }
 
+/// Returns `true` for file extensions where `#` starts a line comment.
+pub fn extension_uses_hash_comments(ext: &str) -> bool {
+    matches!(
+        ext.to_ascii_lowercase().as_str(),
+        "py" | "toml" | "yaml" | "yml" | "sh" | "bash" | "zsh" | "rb" | "r"
+    )
+}
+
 /// Streaming fold-range builder that scans lines sequentially without requiring a flattened buffer.
 struct FoldScanner {
     line_idx: usize,
     block_comment_depth: usize,
+    in_double_quote: bool,
+    raw_string_hashes: Option<usize>,
+    hash_comments: bool,
     brace_stack: Vec<usize>,
     brace_folds: HashMap<usize, usize>,
     indent_stack: Vec<(usize, usize)>,
@@ -50,10 +61,13 @@ struct FoldScanner {
 }
 
 impl FoldScanner {
-    fn new() -> Self {
+    fn new(hash_comments: bool) -> Self {
         Self {
             line_idx: 0,
             block_comment_depth: 0,
+            in_double_quote: false,
+            raw_string_hashes: None,
+            hash_comments,
             brace_stack: Vec::new(),
             brace_folds: HashMap::new(),
             indent_stack: Vec::new(),
@@ -87,7 +101,6 @@ impl FoldScanner {
         let bytes = line.as_bytes();
         let trimmed_starts_with_close = line.trim_start().starts_with('}');
         let mut i = 0usize;
-        let mut in_double_quote = false;
 
         while i < bytes.len() {
             if self.block_comment_depth > 0 {
@@ -103,11 +116,24 @@ impl FoldScanner {
                 continue;
             }
 
-            if in_double_quote {
+            if let Some(hashes) = self.raw_string_hashes {
+                if bytes[i] == b'"'
+                    && i + hashes < bytes.len()
+                    && bytes[i + 1..=i + hashes].iter().all(|&b| b == b'#')
+                {
+                    self.raw_string_hashes = None;
+                    i += 1 + hashes;
+                } else {
+                    i += 1;
+                }
+                continue;
+            }
+
+            if self.in_double_quote {
                 if bytes[i] == b'\\' {
                     i += 2;
                 } else if bytes[i] == b'"' {
-                    in_double_quote = false;
+                    self.in_double_quote = false;
                     i += 1;
                 } else {
                     i += 1;
@@ -116,6 +142,10 @@ impl FoldScanner {
             }
 
             match bytes[i] {
+                b'#' if self.hash_comments => {
+                    // Hash line comment (Python, TOML, YAML, Shell, Ruby, R)
+                    break;
+                }
                 b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'/' => {
                     // Line comment: ignore rest of line
                     break;
@@ -124,8 +154,34 @@ impl FoldScanner {
                     self.block_comment_depth += 1;
                     i += 2;
                 }
+                b'r' if !self.hash_comments => {
+                    // Detect Rust raw string literals: `r"..."`, `r#"..."#`, `br#"..."#`, etc.
+                    let valid_prefix = if i == 0 {
+                        true
+                    } else {
+                        let prev = bytes[i - 1];
+                        if prev == b'b' || prev == b'c' {
+                            i == 1
+                                || !(bytes[i - 2].is_ascii_alphanumeric() || bytes[i - 2] == b'_')
+                        } else {
+                            !(prev.is_ascii_alphanumeric() || prev == b'_')
+                        }
+                    };
+                    if valid_prefix {
+                        let mut j = i + 1;
+                        while j < bytes.len() && bytes[j] == b'#' {
+                            j += 1;
+                        }
+                        if j < bytes.len() && bytes[j] == b'"' {
+                            self.raw_string_hashes = Some(j - (i + 1));
+                            i = j + 1;
+                            continue;
+                        }
+                    }
+                    i += 1;
+                }
                 b'"' => {
-                    in_double_quote = true;
+                    self.in_double_quote = true;
                     i += 1;
                 }
                 b'\'' => {
@@ -225,10 +281,15 @@ impl FoldScanner {
 ///
 /// Returned ranges are sorted by `start_line` with unique `start_line` values.
 pub fn compute_fold_ranges(text: &str) -> Vec<FoldRange> {
+    compute_fold_ranges_with_options(text, false)
+}
+
+/// Like [`compute_fold_ranges`], optionally ignoring `#` line comments (for Python, TOML, YAML, Shell, etc.).
+pub fn compute_fold_ranges_with_options(text: &str, hash_comments: bool) -> Vec<FoldRange> {
     if text.is_empty() {
         return Vec::new();
     }
-    let mut scanner = FoldScanner::new();
+    let mut scanner = FoldScanner::new(hash_comments);
     for line in text.split('\n') {
         scanner.scan_line(line);
     }
@@ -237,7 +298,15 @@ pub fn compute_fold_ranges(text: &str) -> Vec<FoldRange> {
 
 /// Computes foldable line ranges by streaming chunks from an `EditorBuffer` without flattening it.
 pub fn compute_fold_ranges_buffer<T: EditorBuffer>(buffer: &T) -> Vec<FoldRange> {
-    let mut scanner = FoldScanner::new();
+    compute_fold_ranges_buffer_with_options(buffer, false)
+}
+
+/// Like [`compute_fold_ranges_buffer`], optionally ignoring `#` line comments.
+pub fn compute_fold_ranges_buffer_with_options<T: EditorBuffer>(
+    buffer: &T,
+    hash_comments: bool,
+) -> Vec<FoldRange> {
+    let mut scanner = FoldScanner::new(hash_comments);
     let mut carry = String::new();
     let mut saw_any = false;
 
@@ -275,6 +344,7 @@ pub fn compute_fold_ranges_buffer<T: EditorBuffer>(buffer: &T) -> Vec<FoldRange>
 #[derive(Clone, Debug, Default)]
 pub struct FoldState {
     cached_revision: Option<u64>,
+    hash_comments: bool,
     ranges: Vec<FoldRange>,
     folded: BTreeSet<usize>,
     fold_version: u64,
@@ -284,6 +354,14 @@ pub struct FoldState {
 impl FoldState {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Configures whether `#` starts a line comment when scanning `{ }` braces.
+    pub fn set_hash_comments(&mut self, enabled: bool) {
+        if self.hash_comments != enabled {
+            self.hash_comments = enabled;
+            self.cached_revision = None;
+        }
     }
 
     /// Monotonic version counter bumped whenever active folds or fold ranges affecting visibility change.
@@ -328,7 +406,7 @@ impl FoldState {
         if self.cached_revision == Some(text_revision) {
             return;
         }
-        let ranges = compute_fold_ranges(text);
+        let ranges = compute_fold_ranges_with_options(text, self.hash_comments);
         self.apply_ranges(ranges, Some(text_revision));
     }
 
@@ -339,7 +417,7 @@ impl FoldState {
                 return;
             }
         }
-        let ranges = compute_fold_ranges_buffer(buffer);
+        let ranges = compute_fold_ranges_buffer_with_options(buffer, self.hash_comments);
         self.apply_ranges(ranges, text_revision);
     }
 
@@ -627,8 +705,8 @@ impl FoldState {
         self.fold_version = self.fold_version.wrapping_add(1);
     }
 
-    /// Returns the sorted list of visible 0-based document lines for a document with `total_lines` lines.
-    pub fn visible_lines(&mut self, total_lines: usize) -> &[usize] {
+    /// Ensures the cached visible-lines vector is up to date for `total_lines`.
+    pub fn ensure_visible_lines(&mut self, total_lines: usize) {
         let total = total_lines.max(1);
         let stale = match &self.cached_visible {
             Some((ver, cached_total, _)) => *ver != self.fold_version || *cached_total != total,
@@ -649,7 +727,21 @@ impl FoldState {
             }
             self.cached_visible = Some((self.fold_version, total, vis));
         }
-        &self.cached_visible.as_ref().unwrap().2
+    }
+
+    /// Returns the cached sorted visible 0-based document lines without mutating `self`.
+    /// Call [`Self::ensure_visible_lines`] first when `fold_version` or line count may have changed.
+    pub fn cached_visible_lines(&self) -> &[usize] {
+        self.cached_visible
+            .as_ref()
+            .map(|(_, _, v)| v.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// Returns the sorted list of visible 0-based document lines for a document with `total_lines` lines.
+    pub fn visible_lines(&mut self, total_lines: usize) -> &[usize] {
+        self.ensure_visible_lines(total_lines);
+        self.cached_visible_lines()
     }
 }
 

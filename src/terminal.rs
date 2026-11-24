@@ -18,6 +18,8 @@ use std::{
 
 pub const TERM_ROWS: u16 = 30;
 pub const TERM_COLS: u16 = 120;
+/// Number of scrollback lines retained above the active terminal viewport.
+pub const TERM_SCROLLBACK_LEN: usize = 2_000;
 /// Size of the read buffer for PTY output in bytes.
 pub const PTY_READ_BUF_SIZE: usize = 4096;
 
@@ -101,9 +103,9 @@ pub struct TerminalPane {
     shell_label: String,
     pub pty_writer: Option<mpsc::Sender<Vec<u8>>>,
     dsr_writer: Arc<Mutex<Option<mpsc::Sender<Vec<u8>>>>>,
-    pub _pty_master: Option<Box<dyn portable_pty::MasterPty + Send>>,
-    pub _pty_child: Option<Box<dyn portable_pty::Child + Send + Sync>>,
-    pub shutdown: Arc<AtomicBool>,
+    pub(crate) _pty_master: Option<Box<dyn portable_pty::MasterPty + Send>>,
+    pub(crate) _pty_child: Option<Box<dyn portable_pty::Child + Send + Sync>>,
+    pub(crate) shutdown: Arc<AtomicBool>,
     pub focus_terminal: bool,
     pub selecting_in_terminal: bool,
 }
@@ -124,7 +126,14 @@ impl TerminalPane {
             .take();
         if let Some(mut child) = self._pty_child.take() {
             let _ = child.kill();
-            let _ = child.try_wait();
+            if matches!(child.try_wait(), Ok(None)) {
+                // Reap off the UI thread so slow termination never stalls frames or leaves zombies.
+                let _ = thread::Builder::new()
+                    .name("rusted-pty-reaper".to_string())
+                    .spawn(move || {
+                        let _ = child.wait();
+                    });
+            }
         }
         self._pty_master = None;
     }
@@ -134,7 +143,7 @@ impl TerminalPane {
             parser: vt100::Parser::new(
                 std::num::NonZeroU16::new(TERM_ROWS).unwrap(),
                 std::num::NonZeroU16::new(TERM_COLS).unwrap(),
-                0,
+                TERM_SCROLLBACK_LEN,
             ),
             pty_updated: true,
         }));
@@ -175,12 +184,14 @@ impl TerminalPane {
 
             if let Ok(mut writer) = pair.master.take_writer() {
                 let (tx, rx) = mpsc::channel::<Vec<u8>>();
-                thread::spawn(move || {
-                    while let Ok(bytes) = rx.recv() {
-                        let _ = writer.write_all(&bytes);
-                        let _ = writer.flush();
-                    }
-                });
+                let _ = thread::Builder::new()
+                    .name("rusted-pty-writer".to_string())
+                    .spawn(move || {
+                        while let Ok(bytes) = rx.recv() {
+                            let _ = writer.write_all(&bytes);
+                            let _ = writer.flush();
+                        }
+                    });
                 *dsr_writer_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx.clone());
                 pty_writer = Some(tx);
             }
@@ -189,7 +200,9 @@ impl TerminalPane {
                 let term_clone = Arc::clone(&term);
                 let shutdown_flag = Arc::clone(&shutdown);
                 let dsr_writer = Arc::clone(&dsr_writer_slot);
-                thread::spawn(move || {
+                let _ = thread::Builder::new()
+                    .name("rusted-pty-reader".to_string())
+                    .spawn(move || {
                     let mut buf = [0u8; PTY_READ_BUF_SIZE];
                     let mut dsr_tail = [0u8; 3];
                     let mut dsr_tail_len = 0usize;
@@ -256,7 +269,7 @@ impl TerminalPane {
                 parser: vt100::Parser::new(
                     std::num::NonZeroU16::new(TERM_ROWS).unwrap(),
                     std::num::NonZeroU16::new(TERM_COLS).unwrap(),
-                    0,
+                    TERM_SCROLLBACK_LEN,
                 ),
                 pty_updated: false,
             })),
@@ -360,12 +373,14 @@ impl TerminalPane {
             // if it arrives in the exact same pipe read as the bracketed-paste terminator.
             if let Some(tx) = self.pty_writer.clone() {
                 let shutdown = Arc::clone(&self.shutdown);
-                thread::spawn(move || {
-                    thread::sleep(std::time::Duration::from_millis(50));
-                    if !shutdown.load(Ordering::Relaxed) {
-                        let _ = tx.send(b"\r".to_vec());
-                    }
-                });
+                let _ = thread::Builder::new()
+                    .name("rusted-pty-submit".to_string())
+                    .spawn(move || {
+                        thread::sleep(std::time::Duration::from_millis(50));
+                        if !shutdown.load(Ordering::Relaxed) {
+                            let _ = tx.send(b"\r".to_vec());
+                        }
+                    });
             }
         } else {
             self.write_to_pty(b"\r");
@@ -379,9 +394,14 @@ impl TerminalPane {
 
         let mut to_send: Vec<u8> = Vec::new();
         let mut clear_selection = false;
-        let bracketed_paste = self.is_bracketed_paste();
+        let (bracketed_paste, application_cursor) = {
+            let lock = self.term.lock().unwrap_or_else(|e| e.into_inner());
+            let screen = lock.parser.screen();
+            (screen.bracketed_paste(), screen.application_cursor())
+        };
 
         ctx.input_mut(|i| {
+            let has_paste_event = i.events.iter().any(|e| matches!(e, egui::Event::Paste(_)));
             i.events.retain(|event| {
                 match event {
                     egui::Event::Text(text) => {
@@ -412,38 +432,15 @@ impl TerminalPane {
                         if *key == egui::Key::C && modifiers.ctrl && self.selecting_in_terminal {
                             return false;
                         }
+                        if *key == egui::Key::V && modifiers.ctrl && has_paste_event {
+                            // Avoid sending a trailing `0x16` (`^V`) alongside `Event::Paste`.
+                            return false;
+                        }
 
-                        let seq: Option<&[u8]> = match key {
-                            egui::Key::Enter => Some(b"\r"),
-                            egui::Key::Backspace => Some(b"\x7f"),
-                            egui::Key::Tab if !modifiers.ctrl && !modifiers.command => Some(b"\t"),
-                            egui::Key::Escape => Some(b"\x1b"),
-                            egui::Key::Delete => Some(b"\x1b[3~"),
-                            egui::Key::ArrowUp => Some(b"\x1b[A"),
-                            egui::Key::ArrowDown => Some(b"\x1b[B"),
-                            egui::Key::ArrowRight => Some(b"\x1b[C"),
-                            egui::Key::ArrowLeft => Some(b"\x1b[D"),
-                            egui::Key::Home => Some(b"\x1b[H"),
-                            egui::Key::End => Some(b"\x1b[F"),
-                            egui::Key::PageUp => Some(b"\x1b[5~"),
-                            egui::Key::PageDown => Some(b"\x1b[6~"),
-                            egui::Key::F1 => Some(b"\x1bOP"),
-                            egui::Key::F2 => Some(b"\x1bOQ"),
-                            egui::Key::F3 => Some(b"\x1bOR"),
-                            egui::Key::F4 => Some(b"\x1bOS"),
-                            egui::Key::F5 => Some(b"\x1b[15~"),
-                            egui::Key::F6 => Some(b"\x1b[17~"),
-                            egui::Key::F7 => Some(b"\x1b[18~"),
-                            egui::Key::F8 => Some(b"\x1b[19~"),
-                            egui::Key::F9 => Some(b"\x1b[20~"),
-                            egui::Key::F10 => Some(b"\x1b[21~"),
-                            egui::Key::F11 => Some(b"\x1b[23~"),
-                            egui::Key::F12 => Some(b"\x1b[24~"),
-                            _ => None,
-                        };
-
-                        if let Some(bytes) = seq {
-                            to_send.extend_from_slice(bytes);
+                        if let Some(bytes) =
+                            encode_terminal_key(*key, *modifiers, application_cursor)
+                        {
+                            to_send.extend_from_slice(&bytes);
                             clear_selection = true;
                             false
                         } else if modifiers.ctrl && !modifiers.alt {
@@ -490,8 +487,10 @@ impl TerminalPane {
             let updated = lock.pty_updated || self.term_screen_text.is_empty();
             if updated {
                 lock.pty_updated = false;
-                self.term_cursor_idx =
-                    render_vt100_screen_into(lock.parser.screen(), &mut self.term_screen_text);
+                self.term_cursor_idx = render_vt100_screen_with_scrollback(
+                    lock.parser.screen_mut(),
+                    &mut self.term_screen_text,
+                );
                 self.term_revision = self.term_revision.wrapping_add(1);
                 true
             } else {
@@ -552,7 +551,7 @@ impl TerminalPane {
                             .show(ui);
 
                     if *focus_terminal {
-                        output.response.request_focus();
+                        crate::editor::request_editor_focus(ui.ctx(), output.response.id);
                         *focus_terminal = false;
                     }
                 });
@@ -640,6 +639,145 @@ pub fn render_vt100_screen_into(screen: &vt100::Screen, full_text: &mut String) 
     }
 
     cursor_char_idx
+}
+
+/// Renders any accumulated scrollback lines followed by the active `vt100::Screen` into
+/// `full_text`, returning the cursor's character index inside the combined text.
+pub fn render_vt100_screen_with_scrollback(
+    screen: &mut vt100::Screen,
+    full_text: &mut String,
+) -> usize {
+    let (rows, cols) = screen.size();
+    let rows_usize = rows.get() as usize;
+    let cols_u16 = cols.get();
+
+    screen.set_scrollback(usize::MAX);
+    let scrollback_len = screen.scrollback();
+    if scrollback_len == 0 {
+        return render_vt100_screen_into(screen, full_text);
+    }
+
+    full_text.clear();
+    full_text.reserve((scrollback_len + rows_usize) * (cols_u16 as usize + 1));
+    let mut prefix_chars = 0usize;
+
+    let mut remaining = scrollback_len;
+    while remaining > 0 {
+        screen.set_scrollback(remaining);
+        let take = remaining.min(rows_usize);
+        for line in screen.rows(0, cols_u16).take(take) {
+            let line_chars = line
+                .as_bytes()
+                .iter()
+                .filter(|&&b| (b & 0xC0) != 0x80)
+                .count();
+            full_text.push_str(&line);
+            full_text.push('\n');
+            prefix_chars += line_chars + 1;
+        }
+        remaining -= take;
+    }
+
+    screen.set_scrollback(0);
+    let mut active_buf = String::with_capacity(rows_usize * (cols_u16 as usize + 1));
+    let active_cursor = render_vt100_screen_into(screen, &mut active_buf);
+    full_text.push_str(&active_buf);
+    prefix_chars + active_cursor
+}
+
+/// Encodes non-character terminal keys into VT100/xterm escape sequences, honoring
+/// `Shift`/`Alt`/`Ctrl` modifier parameters, `Shift+Tab` (`\x1b[Z`), and `DECCKM`
+/// application cursor mode.
+pub fn encode_terminal_key(
+    key: egui::Key,
+    modifiers: egui::Modifiers,
+    application_cursor: bool,
+) -> Option<Vec<u8>> {
+    let mod_param = 1u8
+        + u8::from(modifiers.shift)
+        + u8::from(modifiers.alt) * 2
+        + u8::from(modifiers.ctrl) * 4;
+
+    match key {
+        egui::Key::Enter => Some(b"\r".to_vec()),
+        egui::Key::Backspace => Some(b"\x7f".to_vec()),
+        egui::Key::Tab if !modifiers.ctrl && !modifiers.command => {
+            if modifiers.shift {
+                Some(b"\x1b[Z".to_vec())
+            } else {
+                Some(b"\t".to_vec())
+            }
+        }
+        egui::Key::Escape => Some(b"\x1b".to_vec()),
+        egui::Key::ArrowUp
+        | egui::Key::ArrowDown
+        | egui::Key::ArrowRight
+        | egui::Key::ArrowLeft
+        | egui::Key::Home
+        | egui::Key::End => {
+            let code = match key {
+                egui::Key::ArrowUp => b'A',
+                egui::Key::ArrowDown => b'B',
+                egui::Key::ArrowRight => b'C',
+                egui::Key::ArrowLeft => b'D',
+                egui::Key::Home => b'H',
+                egui::Key::End => b'F',
+                _ => unreachable!(),
+            };
+            if mod_param == 1 {
+                let prefix = if application_cursor { b'O' } else { b'[' };
+                Some(vec![0x1b, prefix, code])
+            } else {
+                Some(format!("\x1b[1;{mod_param}{}", code as char).into_bytes())
+            }
+        }
+        egui::Key::Delete
+        | egui::Key::PageUp
+        | egui::Key::PageDown
+        | egui::Key::F5
+        | egui::Key::F6
+        | egui::Key::F7
+        | egui::Key::F8
+        | egui::Key::F9
+        | egui::Key::F10
+        | egui::Key::F11
+        | egui::Key::F12 => {
+            let num = match key {
+                egui::Key::Delete => 3,
+                egui::Key::PageUp => 5,
+                egui::Key::PageDown => 6,
+                egui::Key::F5 => 15,
+                egui::Key::F6 => 17,
+                egui::Key::F7 => 18,
+                egui::Key::F8 => 19,
+                egui::Key::F9 => 20,
+                egui::Key::F10 => 21,
+                egui::Key::F11 => 23,
+                egui::Key::F12 => 24,
+                _ => unreachable!(),
+            };
+            if mod_param == 1 {
+                Some(format!("\x1b[{num}~").into_bytes())
+            } else {
+                Some(format!("\x1b[{num};{mod_param}~").into_bytes())
+            }
+        }
+        egui::Key::F1 | egui::Key::F2 | egui::Key::F3 | egui::Key::F4 => {
+            let code = match key {
+                egui::Key::F1 => 'P',
+                egui::Key::F2 => 'Q',
+                egui::Key::F3 => 'R',
+                egui::Key::F4 => 'S',
+                _ => unreachable!(),
+            };
+            if mod_param == 1 {
+                Some(format!("\x1bO{code}").into_bytes())
+            } else {
+                Some(format!("\x1b[1;{mod_param}{code}").into_bytes())
+            }
+        }
+        _ => None,
+    }
 }
 
 /// Encodes text for pasting into a PTY, normalizing CRLF/CR line endings to LF so

@@ -187,7 +187,7 @@ fn test_handle_terminal_input_key_mappings() {
     send_event(&mut pane, &ctx, egui::Event::Text("cargo test".to_string()), true);
     assert_eq!(&take_sent(), b"cargo test");
 
-    // 8. Shift+ArrowLeft does NOT enter buffer selection mode; it forwards to the PTY
+    // 8. Shift+ArrowLeft does NOT enter buffer selection mode; it forwards xterm Shift+Left to the PTY
     assert!(!pane.selecting_in_terminal);
     send_event(
         &mut pane,
@@ -207,8 +207,8 @@ fn test_handle_terminal_input_key_mappings() {
     );
     assert_eq!(
         &take_sent(),
-        b"\x1b[D",
-        "Shift+Arrow should forward to PTY instead of selecting in the buffer"
+        b"\x1b[1;2D",
+        "Shift+Arrow should forward modified xterm sequence to PTY"
     );
 }
 
@@ -659,4 +659,66 @@ fn test_encode_paste_bytes_and_paste_and_submit() {
         take_sent(),
         b"\x1b[200~Explain main.rs:1-2: a\nb\x1b[201~\r"
     );
+}
+
+#[test]
+fn test_terminal_scrollback_and_modified_key_encoding() {
+    use rusted::terminal::{encode_terminal_key, render_vt100_screen_with_scrollback};
+
+    // Scrollback history is preserved above the active viewport and cursor offset accounts for it
+    let mut parser = vt100::Parser::new(
+        std::num::NonZeroU16::new(3).unwrap(),
+        std::num::NonZeroU16::new(20).unwrap(),
+        100,
+    );
+    parser.process(b"row0\r\nrow1\r\nrow2\r\nrow3\r\nrow4");
+    let mut buf = String::new();
+    let cursor = render_vt100_screen_with_scrollback(parser.screen_mut(), &mut buf);
+    assert!(buf.starts_with("row0\nrow1\nrow2\nrow3\nrow4"));
+    assert_eq!(cursor, "row0\nrow1\nrow2\nrow3\nrow4".chars().count());
+
+    // Modified key sequences & DECCKM application cursor mode
+    assert_eq!(
+        encode_terminal_key(egui::Key::Tab, egui::Modifiers::SHIFT, false),
+        Some(b"\x1b[Z".to_vec())
+    );
+    assert_eq!(
+        encode_terminal_key(egui::Key::ArrowLeft, egui::Modifiers::CTRL, false),
+        Some(b"\x1b[1;5D".to_vec())
+    );
+    assert_eq!(
+        encode_terminal_key(egui::Key::ArrowRight, egui::Modifiers::CTRL, false),
+        Some(b"\x1b[1;5C".to_vec())
+    );
+    assert_eq!(
+        encode_terminal_key(egui::Key::ArrowUp, egui::Modifiers::NONE, true),
+        Some(b"\x1bOA".to_vec())
+    );
+
+    // Ctrl+V paired with Event::Paste must NOT emit a trailing 0x16 (^V)
+    let ctx = egui::Context::default();
+    let mut pane = TerminalPane::new_headless();
+    let (tx, rx) = mpsc::channel();
+    pane.pty_writer = Some(tx);
+    let raw = egui::RawInput {
+        events: vec![
+            egui::Event::Paste("pasted".to_string()),
+            egui::Event::Key {
+                key: egui::Key::V,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::CTRL,
+            },
+        ],
+        ..Default::default()
+    };
+    ctx.run_ui(raw, |ui| pane.handle_terminal_input(ui.ctx(), true))
+        .textures_delta
+        .clear();
+    let mut sent = Vec::new();
+    while let Ok(chunk) = rx.try_recv() {
+        sent.extend_from_slice(&chunk);
+    }
+    assert_eq!(sent, b"pasted");
 }

@@ -899,3 +899,147 @@ fn test_enter_auto_indent_shift_tab_and_ctrl_shift_z_redo() {
     );
     assert_eq!(text.build_string(), "    hello\n");
 }
+
+#[test]
+fn test_multiline_tab_indent_and_paste_newline_normalization() {
+    use eframe::egui::{Pos2, Rect};
+    use rusted::{editor::FastEditorState, PieceTable};
+
+    let ctx = egui::Context::default();
+    let id = Id::unique("test_tab_paste_norm");
+    let mut text = PieceTable::from_str("first\nsecond\nthird");
+    let mut rev = 1u64;
+
+    let run_frame = |text: &mut PieceTable, rev: &mut u64, newline: &'static str, events: Vec<Event>| {
+        let mut cursor_out = None;
+        let mut out = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(600.0, 300.0))),
+                events,
+                ..Default::default()
+            },
+            |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    let mut layouter = |ui: &Ui, s: &str, w: f32| {
+                        let job = LayoutJob::simple(
+                            s.to_owned(),
+                            egui::TextStyle::Monospace.resolve(ui.style()),
+                            Color32::WHITE,
+                            w,
+                        );
+                        ui.fonts_mut(|f| f.layout_job(job))
+                    };
+                    let output = FastEditor::new(id, text, Vec2::new(500.0, 200.0), &mut layouter)
+                        .text_revision(*rev)
+                        .newline(newline)
+                        .show(ui);
+                    rusted::editor::request_editor_focus(ui.ctx(), output.response.id);
+                    if output.text_changed {
+                        *rev = rev.wrapping_add(1);
+                    }
+                    cursor_out = output.cursor_range;
+                });
+            },
+        );
+        out.textures_delta.clear();
+        cursor_out.unwrap()
+    };
+
+    // Frame 1 & 2: focus with focus-lock filter and select across lines 0 and 1 ("first\nsecond")
+    rusted::editor::request_editor_focus(&ctx, id);
+    let _ = run_frame(&mut text, &mut rev, "\n", vec![]);
+    let _ = run_frame(&mut text, &mut rev, "\n", vec![]);
+    ctx.data_mut(|d| {
+        let mut st = d.get_temp::<FastEditorState>(id).unwrap_or_default();
+        st.cursor.set_char_range(Some(egui::text::CCursorRange::two(
+            egui::text::CCursor::new(0),
+            egui::text::CCursor::new(12),
+        )));
+        d.insert_temp(id, st);
+    });
+
+    // Tab on multi-line selection indents both lines instead of deleting selection
+    let _ = run_frame(
+        &mut text,
+        &mut rev,
+        "\n",
+        vec![Event::Key {
+            key: Key::Tab,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::NONE,
+        }],
+    );
+    assert_eq!(text.build_string(), "    first\n    second\nthird");
+
+    // Shift+Tab round-trips back to original text
+    let _ = run_frame(
+        &mut text,
+        &mut rev,
+        "\n",
+        vec![Event::Key {
+            key: Key::Tab,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::SHIFT,
+        }],
+    );
+    assert_eq!(text.build_string(), "first\nsecond\nthird");
+
+    // Paste CRLF text into an LF editor normalizes to LF
+    ctx.data_mut(|d| {
+        let mut st = d.get_temp::<FastEditorState>(id).unwrap_or_default();
+        st.cursor.set_char_range(Some(egui::text::CCursorRange::one(
+            egui::text::CCursor::new(0),
+        )));
+        d.insert_temp(id, st);
+    });
+    let _ = run_frame(
+        &mut text,
+        &mut rev,
+        "\n",
+        vec![Event::Paste("A\r\nB\rC\n".to_string())],
+    );
+    assert_eq!(text.build_string(), "A\nB\nC\nfirst\nsecond\nthird");
+
+    // Paste LF text into a CRLF editor normalizes to CRLF
+    let mut crlf_text = PieceTable::from_str("end");
+    let mut crlf_rev = 1u64;
+    let crlf_id = Id::unique("test_paste_crlf_norm");
+    let run_crlf = |text: &mut PieceTable, rev: &mut u64, events: Vec<Event>| {
+        let mut out = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(600.0, 300.0))),
+                events,
+                ..Default::default()
+            },
+            |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    let mut layouter = |ui: &Ui, s: &str, w: f32| {
+                        let job = LayoutJob::simple(
+                            s.to_owned(),
+                            egui::TextStyle::Monospace.resolve(ui.style()),
+                            Color32::WHITE,
+                            w,
+                        );
+                        ui.fonts_mut(|f| f.layout_job(job))
+                    };
+                    let output = FastEditor::new(crlf_id, text, Vec2::new(500.0, 200.0), &mut layouter)
+                        .text_revision(*rev)
+                        .newline("\r\n")
+                        .show(ui);
+                    rusted::editor::request_editor_focus(ui.ctx(), output.response.id);
+                    if output.text_changed {
+                        *rev = rev.wrapping_add(1);
+                    }
+                });
+            },
+        );
+        out.textures_delta.clear();
+    };
+    run_crlf(&mut crlf_text, &mut crlf_rev, vec![]);
+    run_crlf(&mut crlf_text, &mut crlf_rev, vec![Event::Paste("x\ny\r\nz\n".to_string())]);
+    assert_eq!(crlf_text.build_string(), "x\r\ny\r\nz\r\nend");
+}

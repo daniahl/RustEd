@@ -3,10 +3,15 @@
 //! Custom multiline text editing component optimized for large files, with syntax layout caching,
 //! undo/redo history, scroll management, and screen-magnifier/screen-reader accessibility (AccessKit).
 
-use crate::{
-    folding::{FoldState, FoldView, FoldedRowMarker},
-    piece_table::{PieceTable, PieceTableSnapshot},
-};
+mod accesskit;
+mod buffer;
+mod virtualized;
+
+pub use accesskit::AccessKitRowCache;
+pub use buffer::{EditorBuffer, UndoSnapshot, WORD_SCAN_WINDOW};
+
+use accesskit::update_accesskit;
+use crate::folding::{FoldState, FoldView, FoldedRowMarker};
 use eframe::egui::{
     self,
     epaint::text::Galley,
@@ -15,6 +20,7 @@ use eframe::egui::{
     Color32, Event, Id, Key, Pos2, Rect, Response, Sense, Ui, Vec2,
 };
 use std::{
+    borrow::Cow,
     ops::Range,
     sync::{Arc, Mutex},
 };
@@ -28,8 +34,6 @@ pub const EDITOR_MARGIN: Vec2 = Vec2::new(6.0, 2.0);
 pub const MIN_WRAP_WIDTH: f32 = 100.0;
 /// Number of extra lines rendered above/below the viewport in virtualized mode.
 pub const VIRTUALIZED_OVERSCAN: usize = 4;
-/// Initial window size (in chars) for word-boundary scanning.
-pub const WORD_SCAN_WINDOW: usize = 256;
 /// Number of rows to jump for PageUp/PageDown.
 pub const PAGE_JUMP_ROWS: usize = 25;
 /// Tab insertion string (4 spaces).
@@ -59,322 +63,6 @@ pub fn request_editor_focus(ctx: &egui::Context, id: Id) {
     });
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum UndoSnapshot {
-    PieceTable(PieceTableSnapshot),
-    FullText(Arc<str>),
-}
-
-/// Abstraction over editable text buffers (String, PieceTable).
-///
-/// Unlike `egui::TextBuffer`, this trait uses a closure-based `with_str` API
-/// so that buffers with interior mutability (e.g. PieceTable's lazy cache)
-/// can provide safe `&str` access without `unsafe` code.
-pub trait EditorBuffer {
-    /// Access the full text via a closure. Implementations may use a
-    /// zero-copy borrow (single-piece) or a lazily-built cache.
-    fn with_str<R>(&self, f: impl FnOnce(&str) -> R) -> R;
-
-    /// Streams contiguous `&str` chunks of the buffer in order without requiring flattening.
-    fn for_each_chunk(&self, mut f: impl FnMut(&str)) {
-        self.with_str(|s| f(s));
-    }
-
-    /// Insert `text` at character index, returning chars inserted.
-    fn insert_text(&mut self, text: &str, char_index: usize) -> usize;
-
-    /// Delete the character range `start..end`.
-    fn delete_char_range(&mut self, range: Range<usize>);
-
-    /// Replace the entire buffer with `text`.
-    fn replace_with(&mut self, text: &str);
-
-    // --- Convenience methods (formerly from egui::TextBuffer) ---
-
-    /// Delete the selected range, returning the collapsed cursor.
-    fn delete_selected(&mut self, cursor_range: &CCursorRange) -> CCursor {
-        let [min, max] = cursor_range.sorted_cursors();
-        self.delete_char_range(min.index.0..max.index.0);
-        min
-    }
-
-    /// Insert `text` at `ccursor`, advancing the cursor. Returns chars inserted.
-    fn insert_text_at(&mut self, ccursor: &mut CCursor, text: &str, _max_len: usize) -> usize {
-        let inserted = self.insert_text(text, ccursor.index.0);
-        ccursor.index.0 += inserted;
-        inserted
-    }
-
-    /// Delete the character before `ccursor` (Backspace).
-    fn delete_previous_char(&mut self, ccursor: CCursor) -> CCursor {
-        let idx = ccursor.index.0;
-        if idx > 0 {
-            self.delete_char_range((idx - 1)..idx);
-            CCursor::new(idx - 1)
-        } else {
-            ccursor
-        }
-    }
-
-    /// Delete the character at `ccursor` (Delete key).
-    fn delete_next_char(&mut self, ccursor: CCursor) -> CCursor {
-        let idx = ccursor.index.0;
-        if idx < self.char_count() {
-            self.delete_char_range(idx..(idx + 1));
-        }
-        ccursor
-    }
-
-    // --- Higher-level text queries ---
-
-    fn undo_snapshot(&self) -> UndoSnapshot {
-        UndoSnapshot::FullText(self.with_str(|s| Arc::from(s)))
-    }
-
-    fn restore_undo_snapshot(&mut self, snapshot: &UndoSnapshot) {
-        if let UndoSnapshot::FullText(text) = snapshot {
-            self.replace_with(text);
-        }
-    }
-
-    fn char_count(&self) -> usize {
-        self.with_str(|s| s.chars().count())
-    }
-
-    fn line_count(&self) -> usize {
-        self.with_str(|s| s.bytes().filter(|&b| b == b'\n').count() + 1)
-    }
-
-    fn line_to_char(&self, line_idx: usize) -> usize {
-        if line_idx == 0 {
-            return 0;
-        }
-        self.with_str(|s| {
-            let mut line = 0usize;
-            let mut chars = 0usize;
-            for c in s.chars() {
-                chars += 1;
-                if c == '\n' {
-                    line += 1;
-                    if line == line_idx {
-                        return chars;
-                    }
-                }
-            }
-            chars
-        })
-    }
-
-    fn char_to_line_col(&self, char_idx: usize) -> (usize, usize) {
-        self.with_str(|s| {
-            let mut line = 0usize;
-            let mut col = 0usize;
-            for (i, c) in s.chars().enumerate() {
-                if i == char_idx {
-                    return (line, col);
-                }
-                if c == '\n' {
-                    line += 1;
-                    col = 0;
-                } else {
-                    col += 1;
-                }
-            }
-            (line, col)
-        })
-    }
-
-    fn line_char_range(&self, line_idx: usize) -> Range<usize> {
-        let start = self.line_to_char(line_idx);
-        let total_lines = self.line_count();
-        let mut end = if line_idx + 1 >= total_lines {
-            self.char_count()
-        } else {
-            self.line_to_char(line_idx + 1).saturating_sub(1)
-        };
-        if end > start && self.slice_chars(end - 1..end) == "\r" {
-            end -= 1;
-        }
-        start..end.max(start)
-    }
-
-    fn extract_char_range(&self, char_range: Range<usize>, out: &mut String) {
-        out.clear();
-        self.with_str(|s| {
-            for c in s.chars().skip(char_range.start).take(char_range.end.saturating_sub(char_range.start)) {
-                out.push(c);
-            }
-        });
-    }
-
-    fn slice_chars(&self, char_range: Range<usize>) -> String {
-        let mut s = String::new();
-        self.extract_char_range(char_range, &mut s);
-        s
-    }
-
-    fn prev_word_ccursor(&self, ccursor: CCursor) -> CCursor {
-        let end = ccursor.index.0.min(self.char_count());
-        if end == 0 {
-            return CCursor::new(0);
-        }
-        let mut window = WORD_SCAN_WINDOW;
-        let mut buf = String::new();
-        loop {
-            let start = end.saturating_sub(window);
-            self.extract_char_range(start..end, &mut buf);
-            let local_len = end - start;
-            let new_local = egui::TextBuffer::delete_previous_word(&mut buf, CCursor::new(local_len));
-            if new_local.index.0 > 0 || start == 0 {
-                return CCursor::new(start + new_local.index.0);
-            }
-            window = window.saturating_mul(2);
-        }
-    }
-
-    fn next_word_ccursor(&self, ccursor: CCursor) -> CCursor {
-        let total = self.char_count();
-        let start = ccursor.index.0.min(total);
-        if start >= total {
-            return CCursor::new(total);
-        }
-        let mut window = WORD_SCAN_WINDOW;
-        let mut buf = String::new();
-        loop {
-            let end = (start + window).min(total);
-            let local_len = end - start;
-            self.extract_char_range(start..end, &mut buf);
-            let _ = egui::TextBuffer::delete_next_word(&mut buf, CCursor::new(0));
-            let remaining = buf.chars().count();
-            let deleted = local_len.saturating_sub(remaining);
-            if remaining > 0 || end == total {
-                return CCursor::new(start + deleted);
-            }
-            window = window.saturating_mul(2);
-        }
-    }
-
-    fn delete_prev_word(&mut self, ccursor: CCursor) -> CCursor {
-        let target = self.prev_word_ccursor(ccursor);
-        let end = ccursor.index.0.min(self.char_count());
-        if target.index.0 < end {
-            self.delete_char_range(target.index.0..end);
-        }
-        target
-    }
-
-    fn delete_nxt_word(&mut self, ccursor: CCursor) -> CCursor {
-        let start = ccursor.index.0.min(self.char_count());
-        let target = self.next_word_ccursor(ccursor);
-        if target.index.0 > start {
-            self.delete_char_range(start..target.index.0);
-        }
-        CCursor::new(start)
-    }
-}
-
-impl EditorBuffer for String {
-    fn with_str<R>(&self, f: impl FnOnce(&str) -> R) -> R {
-        f(self.as_str())
-    }
-
-    fn insert_text(&mut self, text: &str, char_index: usize) -> usize {
-        egui::TextBuffer::insert_text(self, text, egui::text::CharIndex(char_index))
-    }
-
-    fn delete_char_range(&mut self, range: Range<usize>) {
-        egui::TextBuffer::delete_char_range(
-            self,
-            egui::text::CharIndex(range.start)..egui::text::CharIndex(range.end),
-        );
-    }
-
-    fn replace_with(&mut self, text: &str) {
-        egui::TextBuffer::replace_with(self, text);
-    }
-}
-
-impl EditorBuffer for PieceTable {
-    fn with_str<R>(&self, f: impl FnOnce(&str) -> R) -> R {
-        PieceTable::with_str(self, f)
-    }
-
-    fn for_each_chunk(&self, f: impl FnMut(&str)) {
-        PieceTable::for_each_chunk(self, f);
-    }
-
-    fn insert_text(&mut self, text: &str, char_index: usize) -> usize {
-        PieceTable::insert_text(self, text, char_index)
-    }
-
-    fn delete_char_range(&mut self, range: Range<usize>) {
-        PieceTable::delete_char_range(self, range);
-    }
-
-    fn replace_with(&mut self, text: &str) {
-        PieceTable::replace_with(self, text);
-    }
-
-    fn undo_snapshot(&self) -> UndoSnapshot {
-        UndoSnapshot::PieceTable(self.snapshot())
-    }
-
-    fn restore_undo_snapshot(&mut self, snapshot: &UndoSnapshot) {
-        match snapshot {
-            UndoSnapshot::PieceTable(snap) => {
-                let _ = self.restore_snapshot(snap);
-            }
-            UndoSnapshot::FullText(text) => self.replace_with(text),
-        }
-    }
-
-    fn char_count(&self) -> usize {
-        PieceTable::char_count(self)
-    }
-
-    fn line_count(&self) -> usize {
-        PieceTable::line_count(self)
-    }
-
-    fn line_to_char(&self, line_idx: usize) -> usize {
-        PieceTable::line_to_char(self, line_idx)
-    }
-
-    fn char_to_line_col(&self, char_idx: usize) -> (usize, usize) {
-        PieceTable::char_to_line_col(self, char_idx)
-    }
-
-    fn line_char_range(&self, line_idx: usize) -> Range<usize> {
-        PieceTable::line_char_range(self, line_idx)
-    }
-
-    fn extract_char_range(&self, char_range: Range<usize>, out: &mut String) {
-        PieceTable::extract_char_range(self, char_range, out);
-    }
-
-    fn slice_chars(&self, char_range: Range<usize>) -> String {
-        PieceTable::slice_chars(self, char_range)
-    }
-
-    fn delete_prev_word(&mut self, ccursor: CCursor) -> CCursor {
-        let target_start = self.prev_word_ccursor(ccursor);
-        let end = ccursor.index.0.min(self.char_count());
-        if target_start.index.0 < end {
-            self.delete_char_range(target_start.index.0..end);
-        }
-        target_start
-    }
-
-    fn delete_nxt_word(&mut self, ccursor: CCursor) -> CCursor {
-        let start = ccursor.index.0.min(self.char_count());
-        let target_end = self.next_word_ccursor(ccursor);
-        if target_end.index.0 > start {
-            self.delete_char_range(start..target_end.index.0);
-        }
-        CCursor::new(start)
-    }
-}
-
 type Undoer = egui::util::undoer::Undoer<(CCursorRange, UndoSnapshot)>;
 
 #[derive(Clone, Default)]
@@ -383,39 +71,47 @@ pub struct FastEditorState {
     /// Mouse-only selection range used when `pointer_moves_caret` is `false` (terminal mode).
     pub mouse_selection: Option<CCursorRange>,
     pub undoer: Arc<Mutex<Undoer>>,
-    pub last_undo_snapshot: Option<UndoSnapshot>,
+    pub(crate) last_undo_snapshot: Option<UndoSnapshot>,
     pub last_interaction_time: f64,
     /// Set after an edit / caret move until the caret has actually been scrolled into view.
     pub scroll_to_cursor: bool,
     /// Last layout result, reused on frames where text, width and theme are unchanged.
-    pub layout_cache: Option<Arc<LayoutCache>>,
+    pub(crate) layout_cache: Option<Arc<LayoutCache>>,
     /// Last windowed layout result for virtualized large-file mode.
-    pub virtual_layout_cache: Option<Arc<VirtualLayoutCache>>,
+    pub(crate) virtual_layout_cache: Option<Arc<VirtualLayoutCache>>,
     /// Last active-row AccessKit `TextRun` state, reused on frames where galley, active row,
     /// and clamped row bounds are unchanged so idle frames do not re-allocate or re-emit the row node.
-    pub accesskit_row_cache: Option<AccessKitRowCache>,
+    pub(crate) accesskit_row_cache: Option<AccessKitRowCache>,
     /// Tracks whether the editor had focus on the previous frame so we can force a
     /// `UIA_Text_TextSelectionChangedEventId` transition on the frame after focus is gained.
-    pub had_focus_prev_frame: bool,
+    pub(crate) had_focus_prev_frame: bool,
     /// Set when the editor just gained focus; causes one repaint where the selection is updated
     /// while `old.is_text_pattern_supported()` is already true.
-    pub pending_accesskit_selection_sync: bool,
+    pub(crate) pending_accesskit_selection_sync: bool,
     /// Cumulative egui pass number when this editor was last rendered.
     /// If the editor was not rendered on the immediately preceding pass (e.g. user switched tabs),
     /// the AccessKit tree dropped this widget's children, so any cached AccessKit row node must be invalidated.
-    pub last_rendered_pass: Option<u64>,
+    pub(crate) last_rendered_pass: Option<u64>,
 }
 
-/// Cached identity of the active AccessKit `TextRun` row node.
-#[derive(Clone)]
-pub struct AccessKitRowCache {
-    pub galley: Arc<Galley>,
-    pub row: usize,
-    pub bounds: egui::accesskit::Rect,
+impl FastEditorState {
+    /// Clears cached layouts and AccessKit row caches without altering cursor or undo history.
+    pub(crate) fn clear_caches(&mut self) {
+        self.layout_cache = None;
+        self.virtual_layout_cache = None;
+        self.accesskit_row_cache = None;
+        self.last_undo_snapshot = None;
+    }
+
+    /// Resets undo history to an empty `Undoer` (e.g. after replacing the underlying `PieceTable`).
+    pub(crate) fn reset_undo_history(&mut self) {
+        self.undoer = Arc::new(Mutex::new(Undoer::default()));
+        self.last_undo_snapshot = None;
+    }
 }
 
 /// Cached galley for a given text + layout parameters.
-pub struct LayoutCache {
+pub(crate) struct LayoutCache {
     key: (u32, u32, bool, u64),
     text_revision: Option<u64>,
     fold_version: u64,
@@ -424,7 +120,7 @@ pub struct LayoutCache {
 }
 
 /// Cached windowed galley for virtualized large-file mode.
-pub struct VirtualLayoutCache {
+pub(crate) struct VirtualLayoutCache {
     key: (u32, bool, u64),
     text_revision: u64,
     fold_version: u64,
@@ -432,6 +128,7 @@ pub struct VirtualLayoutCache {
     last_line: usize,
     window_start_char: usize,
     window_end_char: usize,
+    max_content_width: f32,
     galley: Arc<Galley>,
     fold_view: Option<Arc<FoldView>>,
 }
@@ -458,10 +155,7 @@ enum Layouter<'a, T> {
 impl<'a, T: EditorBuffer> Layouter<'a, T> {
     fn layout(&mut self, ui: &Ui, buffer: &T, wrap_width: f32) -> Arc<Galley> {
         match self {
-            Layouter::Str(f) => {
-                // Str layouter expects &str; use with_str to get it safely
-                buffer.with_str(|s| f(ui, s, wrap_width))
-            }
+            Layouter::Str(f) => buffer.with_str(|s| f(ui, s, wrap_width)),
             Layouter::Buffer(f) => f(ui, buffer, wrap_width),
         }
     }
@@ -479,7 +173,45 @@ impl<'a, T: EditorBuffer> Layouter<'a, T> {
     }
 }
 
-fn load_editor_state(ui: &Ui, id: Id) -> (FastEditorState, u64) {
+/// Normalizes pasted clipboard line endings (`\r\n`, `\r`, `\n`) to match the document's `newline`.
+pub(crate) fn normalize_paste_newlines<'a>(text: &'a str, newline: &str) -> Cow<'a, str> {
+    if newline == "\r\n" {
+        if !text.contains('\n') && !text.contains('\r') {
+            return Cow::Borrowed(text);
+        }
+        let mut out = String::with_capacity(text.len() + 16);
+        let bytes = text.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'\r' {
+                out.push_str("\r\n");
+                if i + 1 < bytes.len() && bytes[i + 1] == b'\n' {
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            } else if bytes[i] == b'\n' {
+                out.push_str("\r\n");
+                i += 1;
+            } else {
+                let start = i;
+                i += 1;
+                while i < bytes.len() && bytes[i] != b'\r' && bytes[i] != b'\n' {
+                    i += 1;
+                }
+                out.push_str(&text[start..i]);
+            }
+        }
+        Cow::Owned(out)
+    } else {
+        if !text.contains('\r') {
+            return Cow::Borrowed(text);
+        }
+        Cow::Owned(text.replace("\r\n", "\n").replace('\r', "\n"))
+    }
+}
+
+pub(super) fn load_editor_state(ui: &Ui, id: Id) -> (FastEditorState, u64) {
     let mut state = ui
         .ctx()
         .data_mut(|d| d.get_temp::<FastEditorState>(id))
@@ -504,7 +236,7 @@ fn load_editor_state(ui: &Ui, id: Id) -> (FastEditorState, u64) {
     (state, current_pass)
 }
 
-fn restore_focus_on_escape(ui: &Ui, response: &Response, id: Id) -> bool {
+pub(super) fn restore_focus_on_escape(ui: &Ui, response: &Response, id: Id) -> bool {
     let escape_without_popup =
         !ui.ctx().any_popup_open() && ui.input(|i| i.key_pressed(Key::Escape));
     if (response.has_focus() || escape_without_popup)
@@ -515,7 +247,7 @@ fn restore_focus_on_escape(ui: &Ui, response: &Response, id: Id) -> bool {
     response.has_focus()
 }
 
-fn feed_undoer_if_in_flux<T: EditorBuffer>(
+pub(super) fn feed_undoer_if_in_flux<T: EditorBuffer>(
     state: &mut FastEditorState,
     text: &T,
     now: f64,
@@ -535,7 +267,22 @@ fn feed_undoer_if_in_flux<T: EditorBuffer>(
     }
 }
 
-fn collect_relevant_events(ui: &Ui) -> Vec<Event> {
+pub(super) fn feed_undoer_after_edit<T: EditorBuffer>(
+    ui: &Ui,
+    state: &mut FastEditorState,
+    text: &T,
+    cursor_range: CCursorRange,
+) {
+    let snap = text.undo_snapshot();
+    state
+        .undoer
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .feed_state(ui.input(|i| i.time), &(cursor_range, snap.clone()));
+    state.last_undo_snapshot = Some(snap);
+}
+
+pub(super) fn collect_relevant_events(ui: &Ui) -> Vec<Event> {
     ui.input(|i| {
         let has_relevant = i.events.iter().any(|e| {
             matches!(
@@ -556,7 +303,7 @@ fn collect_relevant_events(ui: &Ui) -> Vec<Event> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn paint_selection_rows(
+pub(super) fn paint_selection_rows(
     painter: &egui::Painter,
     galley: &Galley,
     galley_pos: Pos2,
@@ -662,7 +409,7 @@ fn fold_badge_rect(
 }
 
 /// Returns the 0-based doc line of a visible inline `...` fold badge containing `pos`, if any.
-fn hit_test_fold_placeholder(
+pub(super) fn hit_test_fold_placeholder(
     galley: &Galley,
     galley_pos: Pos2,
     clip_rect: Rect,
@@ -696,7 +443,7 @@ fn hit_test_fold_placeholder(
 
 /// Paints inline `...` fold badges for visible folded lines.
 #[allow(clippy::too_many_arguments)]
-fn paint_fold_placeholders(
+pub(super) fn paint_fold_placeholders(
     ui: &Ui,
     painter: &egui::Painter,
     galley: &Galley,
@@ -759,7 +506,7 @@ fn paint_fold_placeholders(
 
 /// Determines the inclusive 0-based `(start_line, start_col, end_line)` potentially modified by
 /// `event` before it runs.
-fn edit_affected_lines<T: EditorBuffer>(
+pub(super) fn edit_affected_lines<T: EditorBuffer>(
     text: &T,
     event: &Event,
     cursor_range: CCursorRange,
@@ -820,7 +567,7 @@ fn edit_affected_lines<T: EditorBuffer>(
     (start_line, start_col, end_line)
 }
 
-fn finish_cursor_and_scroll(
+pub(super) fn finish_cursor_and_scroll(
     ui: &Ui,
     state: &mut FastEditorState,
     cursor_box: Rect,
@@ -865,7 +612,7 @@ fn finish_cursor_and_scroll(
     cursor_in_view
 }
 
-fn store_editor_state(
+pub(super) fn store_editor_state(
     ui: &Ui,
     id: Id,
     mut state: FastEditorState,
@@ -900,7 +647,7 @@ pub struct FastEditor<'a, T: EditorBuffer = String> {
 }
 
 #[derive(Clone, Copy)]
-enum EditOutcome {
+pub(super) enum EditOutcome {
     Unchanged,
     Edited(CCursorRange),
     Restored(CCursorRange),
@@ -1003,7 +750,7 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn apply_edit_outcome(
+    pub(super) fn apply_edit_outcome(
         &mut self,
         outcome: EditOutcome,
         now: f64,
@@ -1062,7 +809,7 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
         }
     }
 
-    fn handle_common_edit_event(
+    pub(super) fn handle_common_edit_event(
         &mut self,
         ui: &Ui,
         event: &Event,
@@ -1113,9 +860,10 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
                 if !text_changed {
                     self.seed_pre_edit_snapshot(state, cursor_range);
                 }
+                let normalized = normalize_paste_newlines(text_to_insert, self.newline);
                 let mut ccursor = self.text.delete_selected(&cursor_range);
                 self.text
-                    .insert_text_at(&mut ccursor, text_to_insert, usize::MAX);
+                    .insert_text_at(&mut ccursor, &normalized, usize::MAX);
                 EditOutcome::Edited(CCursorRange::one(ccursor))
             }
             Event::Text(text_to_insert) => {
@@ -1163,12 +911,48 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
                 ..
             } if !modifiers.ctrl && !modifiers.command => {
                 if !modifiers.shift {
-                    if !text_changed {
-                        self.seed_pre_edit_snapshot(state, cursor_range);
+                    let [min_c, max_c] = cursor_range.sorted_cursors();
+                    let total = self.text.char_count();
+                    let min_idx = min_c.index.0.min(total);
+                    let max_idx = max_c.index.0.min(total);
+                    let (start_line, _) = self.text.char_to_line_col(min_idx);
+                    let (raw_end_line, end_col) = self.text.char_to_line_col(max_idx);
+
+                    if !cursor_range.is_empty() && raw_end_line > start_line {
+                        let end_line = if end_col == 0 {
+                            raw_end_line - 1
+                        } else {
+                            raw_end_line
+                        };
+                        if !text_changed {
+                            self.seed_pre_edit_snapshot(state, cursor_range);
+                        }
+                        let mut new_primary = cursor_range.primary.index.0.min(total);
+                        let mut new_secondary = cursor_range.secondary.index.0.min(total);
+                        let indent_chars = TAB_INDENT.len();
+                        for line_idx in (start_line..=end_line).rev() {
+                            let line_start = self.text.line_char_range(line_idx).start;
+                            self.text.insert_text(TAB_INDENT, line_start);
+                            if new_primary > line_start {
+                                new_primary += indent_chars;
+                            }
+                            if new_secondary > line_start {
+                                new_secondary += indent_chars;
+                            }
+                        }
+                        EditOutcome::Edited(CCursorRange::two(
+                            CCursor::new(new_secondary),
+                            CCursor::new(new_primary),
+                        ))
+                    } else {
+                        if !text_changed {
+                            self.seed_pre_edit_snapshot(state, cursor_range);
+                        }
+                        let mut ccursor = self.text.delete_selected(&cursor_range);
+                        self.text
+                            .insert_text_at(&mut ccursor, TAB_INDENT, usize::MAX);
+                        EditOutcome::Edited(CCursorRange::one(ccursor))
                     }
-                    let mut ccursor = self.text.delete_selected(&cursor_range);
-                    self.text.insert_text_at(&mut ccursor, TAB_INDENT, usize::MAX);
-                    EditOutcome::Edited(CCursorRange::one(ccursor))
                 } else {
                     let [min_c, max_c] = cursor_range.sorted_cursors();
                     let total = self.text.char_count();
@@ -1238,8 +1022,7 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
                     } else {
                         let idx = cursor.index.0.min(self.text.char_count());
                         if idx >= 2 && self.text.slice_chars(idx - 2..idx) == "\r\n" {
-                            self.text
-                                .delete_char_range((idx - 2)..idx);
+                            self.text.delete_char_range((idx - 2)..idx);
                             CCursor::new(idx - 2)
                         } else {
                             self.text.delete_previous_char(cursor)
@@ -1266,8 +1049,7 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
                         let idx = cursor.index.0;
                         let total = self.text.char_count();
                         if idx + 2 <= total && self.text.slice_chars(idx..idx + 2) == "\r\n" {
-                            self.text
-                                .delete_char_range(idx..(idx + 2));
+                            self.text.delete_char_range(idx..(idx + 2));
                             CCursor::new(idx)
                         } else {
                             self.text.delete_next_char(cursor)
@@ -1295,9 +1077,12 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
                     .undo(&(cursor_range, current_snap))
                     .cloned();
                 if let Some((undo_range, undo_snap)) = undo_target {
-                    self.text.restore_undo_snapshot(&undo_snap);
-                    state.last_undo_snapshot = Some(undo_snap);
-                    EditOutcome::Restored(undo_range)
+                    if self.text.restore_undo_snapshot(&undo_snap) {
+                        state.last_undo_snapshot = Some(undo_snap);
+                        EditOutcome::Restored(undo_range)
+                    } else {
+                        EditOutcome::Unchanged
+                    }
                 } else {
                     EditOutcome::Unchanged
                 }
@@ -1321,9 +1106,12 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
                     .redo(&(cursor_range, current_snap))
                     .cloned();
                 if let Some((redo_range, redo_snap)) = redo_target {
-                    self.text.restore_undo_snapshot(&redo_snap);
-                    state.last_undo_snapshot = Some(redo_snap);
-                    EditOutcome::Restored(redo_range)
+                    if self.text.restore_undo_snapshot(&redo_snap) {
+                        state.last_undo_snapshot = Some(redo_snap);
+                        EditOutcome::Restored(redo_range)
+                    } else {
+                        EditOutcome::Unchanged
+                    }
                 } else {
                     EditOutcome::Unchanged
                 }
@@ -1457,6 +1245,28 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
         galley_pos: Pos2,
         state: &mut FastEditorState,
     ) {
+        self.handle_selection_pointer_windowed(ui, response, galley, galley_pos, state, 0, None);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn handle_selection_pointer_windowed(
+        &mut self,
+        ui: &Ui,
+        response: &Response,
+        galley: &Galley,
+        galley_pos: Pos2,
+        state: &mut FastEditorState,
+        window_start_char: usize,
+        fold_view: Option<&FoldView>,
+    ) {
+        let map_to_doc = |local: CCursor, total: usize| -> CCursor {
+            if let Some(fv) = fold_view {
+                CCursor::new(fv.disp_to_doc(local.index.0).min(total))
+            } else {
+                CCursor::new((window_start_char + local.index.0).min(total))
+            }
+        };
+
         if response.clicked() || response.secondary_clicked() {
             response.request_focus();
             state.last_interaction_time = ui.input(|i| i.time);
@@ -1478,15 +1288,16 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
         } else if let Some(pointer_pos) = ui.ctx().pointer_interact_pos() {
             let primary_pressed = ui.input(|i| i.pointer.primary_pressed());
             let primary_down = ui.input(|i| i.pointer.primary_down());
+            let total = self.text.char_count();
             if response.hovered() && primary_pressed {
                 response.request_focus();
-                let c = galley.cursor_from_pos(pointer_pos - galley_pos);
+                let c = map_to_doc(galley.cursor_from_pos(pointer_pos - galley_pos), total);
                 state.mouse_selection = Some(CCursorRange::one(c));
             } else if response.dragged_by(egui::PointerButton::Primary)
                 || (ui.ctx().is_being_dragged(self.id) && primary_down)
             {
                 if let Some(sel) = &mut state.mouse_selection {
-                    let c = galley.cursor_from_pos(pointer_pos - galley_pos);
+                    let c = map_to_doc(galley.cursor_from_pos(pointer_pos - galley_pos), total);
                     sel.primary = c;
                 }
             }
@@ -1729,11 +1540,12 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
 
                 let outcome = match event {
                     Event::Key {
-                        key: Key::PageUp,
+                        key: key @ (Key::PageUp | Key::PageDown),
                         pressed: true,
                         modifiers,
                         ..
                     } => {
+                        let down = *key == Key::PageDown;
                         if let Some(fv) = fold_view.as_deref() {
                             let old_disp_sec = fv.doc_to_disp(cursor_range.secondary.index.0);
                             let mut disp_range = CCursorRange::two(
@@ -1744,7 +1556,7 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
                                 &galley,
                                 &mut disp_range,
                                 PAGE_JUMP_ROWS,
-                                false,
+                                down,
                                 modifiers.shift,
                             );
                             let new_primary =
@@ -1760,46 +1572,7 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
                                 &galley,
                                 &mut cursor_range,
                                 PAGE_JUMP_ROWS,
-                                false,
-                                modifiers.shift,
-                            );
-                        }
-                        state.last_interaction_time = now;
-                        continue;
-                    }
-                    Event::Key {
-                        key: Key::PageDown,
-                        pressed: true,
-                        modifiers,
-                        ..
-                    } => {
-                        if let Some(fv) = fold_view.as_deref() {
-                            let old_disp_sec = fv.doc_to_disp(cursor_range.secondary.index.0);
-                            let mut disp_range = CCursorRange::two(
-                                CCursor::new(old_disp_sec),
-                                CCursor::new(fv.doc_to_disp(cursor_range.primary.index.0)),
-                            );
-                            Self::page_move_cursor(
-                                &galley,
-                                &mut disp_range,
-                                PAGE_JUMP_ROWS,
-                                true,
-                                modifiers.shift,
-                            );
-                            let new_primary =
-                                CCursor::new(fv.disp_to_doc(disp_range.primary.index.0));
-                            let new_secondary = if modifiers.shift {
-                                cursor_range.secondary
-                            } else {
-                                new_primary
-                            };
-                            cursor_range = CCursorRange::two(new_secondary, new_primary);
-                        } else {
-                            Self::page_move_cursor(
-                                &galley,
-                                &mut cursor_range,
-                                PAGE_JUMP_ROWS,
-                                true,
+                                down,
                                 modifiers.shift,
                             );
                         }
@@ -1840,16 +1613,7 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
         state.cursor.set_char_range(Some(cursor_range));
 
         if should_feed_undoer {
-            let snap = self.text.undo_snapshot();
-            state
-                .undoer
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .feed_state(
-                ui.input(|i| i.time),
-                &(cursor_range, snap.clone()),
-            );
-            state.last_undo_snapshot = Some(snap);
+            feed_undoer_after_edit(ui, &mut state, self.text, cursor_range);
         }
 
         let text_clip_rect = ui.clip_rect().intersect(rect);
@@ -1981,960 +1745,6 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
             first_line: 0,
             virtualized: false,
             active_galley_row: Some(focus.row),
-        }
-    }
-
-    fn layout_virtual_window(
-        &mut self,
-        ui: &Ui,
-        font_id: &egui::FontId,
-        text_color: Color32,
-        first_line: usize,
-        last_line: usize,
-        window_buf: &mut String,
-    ) -> (Arc<Galley>, usize, usize, Option<Arc<FoldView>>) {
-        let doc_total_lines = self.text.line_count().max(1);
-        let total_chars = self.text.char_count();
-        let has_folds = self
-            .fold_state
-            .as_deref()
-            .is_some_and(FoldState::has_active_folds);
-
-        if has_folds {
-            let fs = self.fold_state.as_deref_mut().unwrap();
-            let vis_lines = fs.visible_lines(doc_total_lines).to_vec();
-            let (mut fv, disp_text) = FoldView::build_window(
-                self.text,
-                &vis_lines,
-                first_line,
-                last_line,
-                fs,
-            );
-            let ws = fv.doc_span().start;
-            let we = fv.doc_span().end;
-            let job = LayoutJob::simple(disp_text, font_id.clone(), text_color, f32::INFINITY);
-            let g = ui.fonts_mut(|f| f.layout_job(job));
-            fv.populate_row_markers(&g);
-            (g, ws, we, Some(Arc::new(fv)))
-        } else {
-            let ws = self.text.line_to_char(first_line);
-            let we = if last_line >= doc_total_lines {
-                total_chars
-            } else {
-                self.text.line_char_range(last_line - 1).end
-            };
-            self.text.extract_char_range(ws..we, window_buf);
-            let job = LayoutJob::simple(
-                std::mem::take(window_buf),
-                font_id.clone(),
-                text_color,
-                f32::INFINITY,
-            );
-            let g = ui.fonts_mut(|f| f.layout_job(job));
-            (g, ws, we, None)
-        }
-    }
-
-    fn show_virtualized(mut self, ui: &mut Ui) -> EditorOutput {
-        const MARGIN: Vec2 = EDITOR_MARGIN;
-        const OVERSCAN: usize = VIRTUALIZED_OVERSCAN;
-
-        let font_id = egui::TextStyle::Monospace.resolve(ui.style());
-        let text_color = ui.visuals().widgets.inactive.text_color();
-        let line_height = ui.fonts_mut(|f| f.row_height(&font_id)).max(1.0);
-        let char_width = ui.fonts_mut(|f| f.glyph_width(&font_id, ' ')).max(1.0);
-        let badge_width = char_width * 3.0 + 10.0;
-
-        let (mut state, current_pass) = load_editor_state(ui, self.id);
-
-        if let Some(fs) = self.fold_state.as_deref_mut() {
-            fs.ensure_updated_buffer(self.text, self.text_revision);
-        }
-        let fold_version = self
-            .fold_state
-            .as_deref()
-            .map_or(0, FoldState::fold_version);
-
-        let doc_total_lines = self.text.line_count().max(1);
-        let total_lines = match self.fold_state.as_deref_mut() {
-            Some(fs) if fs.has_active_folds() => fs.visible_lines(doc_total_lines).len().max(1),
-            _ => doc_total_lines,
-        };
-        let total_chars = self.text.char_count();
-        let total_height =
-            (total_lines as f32 * line_height + MARGIN.y * 2.0).max(self.min_size.y);
-        let alloc_width = ui.available_width().max(self.min_size.x);
-        let desired_size = Vec2::new(alloc_width, total_height);
-
-        let (rect, _) = ui.allocate_exact_size(desired_size, Sense::hover());
-        let response = ui.interact(rect, self.id, Sense::click_and_drag());
-        let base_pos = rect.min + MARGIN;
-
-        if response.hovered() {
-            ui.ctx().set_cursor_icon(egui::CursorIcon::Text);
-        }
-
-        let clip_rect = ui.clip_rect();
-        let vis_top = (clip_rect.min.y - base_pos.y).max(0.0);
-        let vis_bottom = (clip_rect.max.y - base_pos.y).max(0.0);
-        let mut first_line = ((vis_top / line_height).floor() as usize)
-            .saturating_sub(OVERSCAN)
-            .min(total_lines - 1);
-        let mut last_line = (((vis_bottom / line_height).ceil() as usize) + 1 + OVERSCAN)
-            .min(total_lines)
-            .max(first_line + 1);
-        let window_galley_pos = base_pos + Vec2::new(0.0, first_line as f32 * line_height);
-
-        let cache_key = (
-            ui.ctx().pixels_per_point().to_bits(),
-            ui.visuals().dark_mode,
-            self.cache_salt,
-        );
-        let rev = self.text_revision.unwrap_or(0);
-        let text_unchanged = match &state.virtual_layout_cache {
-            Some(c) => self.text_revision.is_some() && c.text_revision == rev,
-            None => false,
-        };
-        if !text_unchanged {
-            state.last_undo_snapshot = None;
-        }
-        let mut window_buf = String::new();
-
-        let (mut galley, mut window_start_char, mut window_end_char, mut fold_view, mut layout_dirty) =
-            match &state.virtual_layout_cache {
-                Some(c)
-                    if c.key == cache_key
-                        && text_unchanged
-                        && c.fold_version == fold_version
-                        && c.first_line == first_line
-                        && c.last_line == last_line =>
-                {
-                    (
-                        Arc::clone(&c.galley),
-                        c.window_start_char,
-                        c.window_end_char,
-                        c.fold_view.as_ref().map(Arc::clone),
-                        false,
-                    )
-                }
-                _ => {
-                    let (g, ws, we, fv) = self.layout_virtual_window(
-                        ui,
-                        &font_id,
-                        text_color,
-                        first_line,
-                        last_line,
-                        &mut window_buf,
-                    );
-                    (g, ws, we, fv, true)
-                }
-            };
-
-        let prev_ccursor_range = state
-            .cursor
-            .char_range()
-            .unwrap_or_else(|| CCursorRange::one(CCursor::new(0)));
-        let mut ccursor_range = CCursorRange::two(
-            CCursor::new(prev_ccursor_range.secondary.index.0.min(total_chars)),
-            CCursor::new(prev_ccursor_range.primary.index.0.min(total_chars)),
-        );
-
-        // Check if user clicked an inline `...` fold placeholder badge to unfold it.
-        let mut clicked_fold_badge = false;
-        if response.clicked() {
-            if let (Some(fv), Some(pointer_pos)) =
-                (fold_view.as_deref(), ui.ctx().pointer_interact_pos())
-            {
-                let text_clip = ui.clip_rect().intersect(rect);
-                if let Some(doc_line) = hit_test_fold_placeholder(
-                    &galley,
-                    window_galley_pos,
-                    text_clip,
-                    fv,
-                    pointer_pos,
-                    badge_width,
-                ) {
-                    if let Some(fs) = self.fold_state.as_deref_mut() {
-                        if fs.unfold_line(doc_line) {
-                            clicked_fold_badge = true;
-                            response.request_focus();
-                            let new_total_vis = if fs.has_active_folds() {
-                                fs.visible_lines(doc_total_lines).len().max(1)
-                            } else {
-                                doc_total_lines
-                            };
-                            first_line = first_line.min(new_total_vis - 1);
-                            last_line = last_line.min(new_total_vis).max(first_line + 1);
-                            let (g, ws, we, fv_new) = self.layout_virtual_window(
-                                ui,
-                                &font_id,
-                                text_color,
-                                first_line,
-                                last_line,
-                                &mut window_buf,
-                            );
-                            galley = g;
-                            window_start_char = ws;
-                            window_end_char = we;
-                            fold_view = fv_new;
-                            layout_dirty = true;
-                            ui.ctx().request_repaint();
-                        }
-                    }
-                }
-            }
-        }
-
-        // Pointer interaction inside the visible window
-        if !clicked_fold_badge {
-            if self.pointer_moves_caret {
-                if let Some(pointer_pos) = ui.ctx().pointer_interact_pos() {
-                    if response.hovered() || response.dragged() || response.clicked() {
-                        let is_being_dragged = ui.ctx().is_being_dragged(self.id);
-                        let cursor_at_pointer =
-                            galley.cursor_from_pos(pointer_pos - window_galley_pos);
-
-                        let mut local_cursor_state = state.cursor;
-                        let clamped_local = if let Some(fv) = fold_view.as_deref() {
-                            CCursorRange::two(
-                                CCursor::new(fv.doc_to_disp(ccursor_range.secondary.index.0)),
-                                CCursor::new(fv.doc_to_disp(ccursor_range.primary.index.0)),
-                            )
-                        } else {
-                            CCursorRange::two(
-                                CCursor::new(
-                                    ccursor_range
-                                        .secondary
-                                        .index
-                                        .0
-                                        .saturating_sub(window_start_char)
-                                        .min(window_end_char - window_start_char),
-                                ),
-                                CCursor::new(
-                                    ccursor_range
-                                        .primary
-                                        .index
-                                        .0
-                                        .saturating_sub(window_start_char)
-                                        .min(window_end_char - window_start_char),
-                                ),
-                            )
-                        };
-                        let prev_clamped_sec = clamped_local.secondary.index.0;
-                        local_cursor_state.set_char_range(Some(clamped_local));
-
-                        let did_interact = local_cursor_state.pointer_interaction(
-                            ui,
-                            &response,
-                            cursor_at_pointer,
-                            &galley,
-                            is_being_dragged,
-                        );
-                        if did_interact || response.clicked() {
-                            response.request_focus();
-                            state.last_interaction_time = ui.input(|i| i.time);
-                            if let Some(r) = local_cursor_state.char_range() {
-                                let secondary = if is_being_dragged
-                                    && !response.clicked()
-                                    && r.secondary.index.0 == prev_clamped_sec
-                                {
-                                    ccursor_range.secondary
-                                } else if let Some(fv) = fold_view.as_deref() {
-                                    CCursor::new(fv.disp_to_doc(r.secondary.index.0).min(total_chars))
-                                } else {
-                                    CCursor::new(
-                                        (window_start_char + r.secondary.index.0).min(total_chars),
-                                    )
-                                };
-                                let primary = if let Some(fv) = fold_view.as_deref() {
-                                    CCursor::new(fv.disp_to_doc(r.primary.index.0).min(total_chars))
-                                } else {
-                                    CCursor::new(
-                                        (window_start_char + r.primary.index.0).min(total_chars),
-                                    )
-                                };
-                                ccursor_range = CCursorRange::two(secondary, primary);
-                            }
-                            state.cursor = local_cursor_state;
-                        }
-                    }
-                }
-            } else if response.clicked() || response.secondary_clicked() {
-                response.request_focus();
-                state.last_interaction_time = ui.input(|i| i.time);
-            }
-        }
-
-        let mut text_changed = false;
-        let mut should_feed_undoer = false;
-        let has_focus = restore_focus_on_escape(ui, &response, self.id);
-
-        if has_focus {
-            let now = ui.input(|i| i.time);
-            feed_undoer_if_in_flux(&mut state, self.text, now, ccursor_range);
-
-            let events = collect_relevant_events(ui);
-
-            for event in &events {
-                if self.read_only && !self.pointer_moves_caret {
-                    let _ = self.handle_common_edit_event(
-                        ui,
-                        event,
-                        &mut state,
-                        ccursor_range,
-                        text_changed,
-                    );
-                    continue;
-                }
-                let cur_total = self.text.char_count();
-
-                match event {
-                    Event::Key {
-                        key: Key::A,
-                        pressed: true,
-                        modifiers,
-                        ..
-                    } if modifiers.command => {
-                        ccursor_range =
-                            CCursorRange::two(CCursor::new(0), CCursor::new(cur_total));
-                        state.last_interaction_time = now;
-                    }
-                    Event::Key {
-                        key: Key::ArrowLeft,
-                        pressed: true,
-                        modifiers,
-                        ..
-                    } => {
-                        let next = if !modifiers.shift
-                            && !(modifiers.ctrl || modifiers.command)
-                            && !ccursor_range.is_empty()
-                        {
-                            ccursor_range.sorted_cursors()[0].index.0.min(cur_total)
-                        } else if modifiers.ctrl || modifiers.command {
-                            let mut target =
-                                self.text.prev_word_ccursor(ccursor_range.primary).index.0;
-                            if let Some(fs) = self.fold_state.as_deref() {
-                                if fs.has_active_folds() {
-                                    let (target_line, _) = self.text.char_to_line_col(target);
-                                    if fs.is_line_hidden(target_line) {
-                                        let ancestor = fs.outermost_visible_ancestor(target_line);
-                                        target = self.text.line_char_range(ancestor).end;
-                                    }
-                                }
-                            }
-                            target
-                        } else {
-                            let cur = ccursor_range.primary.index.0.min(cur_total);
-                            let mut jumped = None;
-                            if let Some(fs) = self.fold_state.as_deref_mut() {
-                                if fs.has_active_folds() {
-                                    let (line, col) = self.text.char_to_line_col(cur);
-                                    if col == 0 {
-                                        let total_l = self.text.line_count().max(1);
-                                        let vis = fs.visible_lines(total_l);
-                                        let vis_idx = vis.partition_point(|&l| l < line);
-                                        if vis_idx > 0 {
-                                            let prev_vis_line = vis[vis_idx - 1];
-                                            jumped = Some(self.text.line_char_range(prev_vis_line).end);
-                                        }
-                                    }
-                                }
-                            }
-                            if let Some(j) = jumped {
-                                j
-                            } else if cur >= 2 && self.text.slice_chars(cur - 2..cur) == "\r\n" {
-                                cur - 2
-                            } else {
-                                cur.saturating_sub(1)
-                            }
-                        };
-                        ccursor_range.primary = CCursor::new(next);
-                        if !modifiers.shift {
-                            ccursor_range.secondary = ccursor_range.primary;
-                        }
-                        state.last_interaction_time = now;
-                    }
-                    Event::Key {
-                        key: Key::ArrowRight,
-                        pressed: true,
-                        modifiers,
-                        ..
-                    } => {
-                        let next = if !modifiers.shift
-                            && !(modifiers.ctrl || modifiers.command)
-                            && !ccursor_range.is_empty()
-                        {
-                            ccursor_range.sorted_cursors()[1].index.0.min(cur_total)
-                        } else if modifiers.ctrl || modifiers.command {
-                            let mut target =
-                                self.text.next_word_ccursor(ccursor_range.primary).index.0;
-                            if let Some(fs) = self.fold_state.as_deref_mut() {
-                                if fs.has_active_folds() {
-                                    let (target_line, _) = self.text.char_to_line_col(target);
-                                    if fs.is_line_hidden(target_line) {
-                                        let total_l = self.text.line_count().max(1);
-                                        let vis = fs.visible_lines(total_l);
-                                        let vis_idx = vis.partition_point(|&l| l < target_line);
-                                        if let Some(&next_vis) = vis.get(vis_idx) {
-                                            target = self.text.line_char_range(next_vis).start;
-                                        } else {
-                                            let ancestor =
-                                                fs.outermost_visible_ancestor(target_line);
-                                            target = self.text.line_char_range(ancestor).end;
-                                        }
-                                    }
-                                }
-                            }
-                            target
-                        } else {
-                            let cur = ccursor_range.primary.index.0.min(cur_total);
-                            let mut jumped = None;
-                            if let Some(fs) = self.fold_state.as_deref_mut() {
-                                if fs.has_active_folds() {
-                                    let (line, _) = self.text.char_to_line_col(cur);
-                                    let line_end = self.text.line_char_range(line).end;
-                                    if cur >= line_end {
-                                        let total_l = self.text.line_count().max(1);
-                                        let vis = fs.visible_lines(total_l);
-                                        let vis_idx = vis.partition_point(|&l| l < line);
-                                        if vis_idx + 1 < vis.len() {
-                                            let next_vis_line = vis[vis_idx + 1];
-                                            jumped = Some(self.text.line_char_range(next_vis_line).start);
-                                        } else {
-                                            jumped = Some(line_end);
-                                        }
-                                    }
-                                }
-                            }
-                            if let Some(j) = jumped {
-                                j
-                            } else if cur + 2 <= cur_total
-                                && self.text.slice_chars(cur..cur + 2) == "\r\n"
-                            {
-                                cur + 2
-                            } else {
-                                (cur + 1).min(cur_total)
-                            }
-                        };
-                        ccursor_range.primary = CCursor::new(next);
-                        if !modifiers.shift {
-                            ccursor_range.secondary = ccursor_range.primary;
-                        }
-                        state.last_interaction_time = now;
-                    }
-                    Event::Key {
-                        key: key @ (Key::ArrowUp | Key::ArrowDown | Key::PageUp | Key::PageDown),
-                        pressed: true,
-                        modifiers,
-                        ..
-                    } => {
-                        let (line, col) = self.text.char_to_line_col(ccursor_range.primary.index.0);
-                        let lines_total = self.text.line_count().max(1);
-                        let target_line = if let Some(fs) = self.fold_state.as_deref_mut() {
-                            if fs.has_active_folds() {
-                                let vis = fs.visible_lines(lines_total);
-                                let cur_vis = vis
-                                    .partition_point(|&l| l < line)
-                                    .min(vis.len().saturating_sub(1));
-                                let target_vis = match key {
-                                    Key::ArrowUp => cur_vis.saturating_sub(1),
-                                    Key::ArrowDown => (cur_vis + 1).min(vis.len() - 1),
-                                    Key::PageUp => cur_vis.saturating_sub(PAGE_JUMP_ROWS),
-                                    Key::PageDown => {
-                                        (cur_vis + PAGE_JUMP_ROWS).min(vis.len() - 1)
-                                    }
-                                    _ => cur_vis,
-                                };
-                                vis[target_vis]
-                            } else {
-                                match key {
-                                    Key::ArrowUp => line.saturating_sub(1),
-                                    Key::ArrowDown => (line + 1).min(lines_total - 1),
-                                    Key::PageUp => line.saturating_sub(PAGE_JUMP_ROWS),
-                                    Key::PageDown => {
-                                        (line + PAGE_JUMP_ROWS).min(lines_total - 1)
-                                    }
-                                    _ => line,
-                                }
-                            }
-                        } else {
-                            match key {
-                                Key::ArrowUp => line.saturating_sub(1),
-                                Key::ArrowDown => (line + 1).min(lines_total - 1),
-                                Key::PageUp => line.saturating_sub(PAGE_JUMP_ROWS),
-                                Key::PageDown => (line + PAGE_JUMP_ROWS).min(lines_total - 1),
-                                _ => line,
-                            }
-                        };
-                        let range = self.text.line_char_range(target_line);
-                        let next = (range.start + col).min(range.end);
-                        ccursor_range.primary = CCursor::new(next);
-                        if !modifiers.shift {
-                            ccursor_range.secondary = ccursor_range.primary;
-                        }
-                        state.last_interaction_time = now;
-                    }
-                    Event::Key {
-                        key: Key::Home,
-                        pressed: true,
-                        modifiers,
-                        ..
-                    } => {
-                        let next = if modifiers.ctrl || modifiers.command {
-                            0
-                        } else {
-                            let (line, _) = self.text.char_to_line_col(ccursor_range.primary.index.0);
-                            self.text.line_char_range(line).start
-                        };
-                        ccursor_range.primary = CCursor::new(next);
-                        if !modifiers.shift {
-                            ccursor_range.secondary = ccursor_range.primary;
-                        }
-                        state.last_interaction_time = now;
-                    }
-                    Event::Key {
-                        key: Key::End,
-                        pressed: true,
-                        modifiers,
-                        ..
-                    } => {
-                        let next = if modifiers.ctrl || modifiers.command {
-                            if let Some(fs) = self.fold_state.as_deref_mut() {
-                                if fs.has_active_folds() {
-                                    let total_l = self.text.line_count().max(1);
-                                    let last_vis =
-                                        *fs.visible_lines(total_l).last().unwrap_or(&0);
-                                    self.text.line_char_range(last_vis).end
-                                } else {
-                                    cur_total
-                                }
-                            } else {
-                                cur_total
-                            }
-                        } else {
-                            let (line, _) = self.text.char_to_line_col(ccursor_range.primary.index.0);
-                            self.text.line_char_range(line).end
-                        };
-                        ccursor_range.primary = CCursor::new(next);
-                        if !modifiers.shift {
-                            ccursor_range.secondary = ccursor_range.primary;
-                        }
-                        state.last_interaction_time = now;
-                    }
-                    _ => {
-                        let old_line_count = if self.fold_state.is_some() {
-                            self.text.line_count()
-                        } else {
-                            0
-                        };
-                        let affected_lines = if self.fold_state.is_some() {
-                            edit_affected_lines(
-                                self.text,
-                                event,
-                                ccursor_range,
-                                self.fold_state.as_deref(),
-                            )
-                        } else {
-                            (0, usize::MAX, 0)
-                        };
-                        let outcome = self.handle_common_edit_event(
-                            ui,
-                            event,
-                            &mut state,
-                            ccursor_range,
-                            text_changed,
-                        );
-                        self.apply_edit_outcome(
-                            outcome,
-                            now,
-                            old_line_count,
-                            affected_lines,
-                            &mut state,
-                            &mut ccursor_range,
-                            &mut text_changed,
-                            &mut should_feed_undoer,
-                        );
-                    }
-                }
-            }
-        }
-
-        let total_lines_after = self.text.line_count().max(1);
-        let total_chars_after = self.text.char_count();
-        ccursor_range.primary.index.0 = ccursor_range.primary.index.0.min(total_chars_after);
-        ccursor_range.secondary.index.0 = ccursor_range.secondary.index.0.min(total_chars_after);
-
-        if text_changed {
-            let new_total_vis = match self.fold_state.as_deref_mut() {
-                Some(fs) if fs.has_active_folds() => {
-                    fs.visible_lines(total_lines_after).len().max(1)
-                }
-                _ => total_lines_after,
-            };
-            first_line = first_line.min(new_total_vis - 1);
-            last_line = last_line.min(new_total_vis).max(first_line + 1);
-            let (g, ws, we, fv_new) = self.layout_virtual_window(
-                ui,
-                &font_id,
-                text_color,
-                first_line,
-                last_line,
-                &mut window_buf,
-            );
-            galley = g;
-            window_start_char = ws;
-            window_end_char = we;
-            fold_view = fv_new;
-            layout_dirty = true;
-        }
-
-        state.cursor.set_char_range(Some(ccursor_range));
-
-        if should_feed_undoer {
-            let snap = self.text.undo_snapshot();
-            state
-                .undoer
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .feed_state(
-                ui.input(|i| i.time),
-                &(ccursor_range, snap.clone()),
-            );
-            state.last_undo_snapshot = Some(snap);
-        }
-
-        let (cur_line, cur_col) = self.text.char_to_line_col(ccursor_range.primary.index.0);
-        let cur_vis_line = match self.fold_state.as_deref_mut() {
-            Some(fs) if fs.has_active_folds() => {
-                let vis = fs.visible_lines(total_lines_after);
-                vis.partition_point(|&l| l < cur_line)
-                    .min(vis.len().saturating_sub(1))
-            }
-            _ => cur_line,
-        };
-        let cursor_in_window = ccursor_range.primary.index.0 >= window_start_char
-            && ccursor_range.primary.index.0 <= window_end_char;
-
-        let local_primary = if cursor_in_window {
-            let disp_idx = match fold_view.as_deref() {
-                Some(fv) => fv.doc_to_disp(ccursor_range.primary.index.0),
-                None => ccursor_range.primary.index.0 - window_start_char,
-            };
-            Some(galley.layout_from_cursor(CCursor::new(disp_idx)))
-        } else {
-            None
-        };
-
-        let mut cursor_box = if let Some(lp) = local_primary {
-            galley
-                .pos_from_layout_cursor(&lp)
-                .translate(window_galley_pos.to_vec2())
-        } else {
-            let x = base_pos.x + cur_col as f32 * char_width;
-            let y = base_pos.y + cur_vis_line as f32 * line_height;
-            Rect::from_min_size(Pos2::new(x, y), Vec2::new(1.0, line_height))
-        };
-        if cursor_box.height() < line_height {
-            cursor_box.max.y = cursor_box.min.y + line_height;
-        }
-
-        let cursor_moved = ccursor_range != prev_ccursor_range;
-        if has_focus && (text_changed || cursor_moved) {
-            state.scroll_to_cursor = true;
-        }
-        if state.scroll_to_cursor {
-            ui.scroll_to_rect(cursor_box, None);
-        }
-
-        let text_clip_rect = ui.clip_rect().intersect(rect);
-        let painter = ui.painter_at(rect);
-
-        // Paint selection rects for visible rows inside the window
-        if ccursor_range.primary != ccursor_range.secondary {
-            paint_selection_rows(
-                &painter,
-                &galley,
-                window_galley_pos,
-                text_clip_rect,
-                ui.visuals().selection.bg_fill,
-                ccursor_range,
-                window_start_char..window_end_char,
-                fold_view.as_deref(),
-            );
-        }
-
-        painter.galley(window_galley_pos, Arc::clone(&galley), Color32::WHITE);
-
-        if let Some(fv) = fold_view.as_deref() {
-            paint_fold_placeholders(
-                ui,
-                &painter,
-                &galley,
-                window_galley_pos,
-                text_clip_rect,
-                fv,
-                &font_id,
-                badge_width,
-            );
-        }
-
-        let cursor_in_view =
-            finish_cursor_and_scroll(ui, &mut state, cursor_box, text_clip_rect, has_focus);
-
-        let local_row = cur_vis_line.saturating_sub(first_line);
-        let local_col = local_primary.map(|lp| lp.column.0).unwrap_or(cur_col);
-        update_accesskit(
-            ui,
-            self.id,
-            &mut state,
-            &galley,
-            window_galley_pos,
-            rect,
-            text_clip_rect,
-            has_focus,
-            cursor_in_view && cursor_in_window,
-            local_row,
-            cur_line,
-            local_col,
-        );
-
-        let final_fold_version = self
-            .fold_state
-            .as_deref()
-            .map_or(0, FoldState::fold_version);
-        if text_changed {
-            if let (Some(fs), Some(r)) = (self.fold_state.as_deref_mut(), self.text_revision) {
-                fs.set_cached_revision(r.wrapping_add(1));
-            }
-        }
-        if layout_dirty {
-            let cached_rev = if text_changed {
-                rev.wrapping_add(1)
-            } else {
-                rev
-            };
-            state.virtual_layout_cache = Some(Arc::new(VirtualLayoutCache {
-                key: cache_key,
-                text_revision: cached_rev,
-                fold_version: final_fold_version,
-                first_line,
-                last_line,
-                window_start_char,
-                window_end_char,
-                galley: Arc::clone(&galley),
-                fold_view,
-            }));
-        }
-        store_editor_state(ui, self.id, state, current_pass, has_focus);
-
-        EditorOutput {
-            response,
-            galley,
-            galley_pos: window_galley_pos,
-            text_clip_rect,
-            cursor_range: Some(ccursor_range),
-            text_changed,
-            first_line,
-            virtualized: true,
-            active_galley_row: if cursor_in_window {
-                Some(local_row)
-            } else {
-                None
-            },
-        }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn update_accesskit(
-    ui: &mut Ui,
-    id: Id,
-    state: &mut FastEditorState,
-    galley: &Arc<Galley>,
-    galley_pos: Pos2,
-    rect: Rect,
-    text_clip_rect: Rect,
-    has_focus: bool,
-    cursor_in_view: bool,
-    galley_row_idx: usize,
-    global_row_idx: usize,
-    col_idx: usize,
-) {
-    ui.ctx().accesskit_node_builder(id, |builder| {
-        builder.set_role(egui::accesskit::Role::MultilineTextInput);
-        builder.set_bounds(egui::accesskit::Rect {
-            x0: rect.min.x.into(),
-            y0: rect.min.y.into(),
-            x1: rect.max.x.into(),
-            y1: rect.max.y.into(),
-        });
-    });
-
-    if has_focus && !cursor_in_view {
-        state.accesskit_row_cache = None;
-        ui.ctx().accesskit_node_builder(id, |builder| {
-            builder.clear_text_selection();
-        });
-    } else if let Some(row) = galley.rows.get(galley_row_idx) {
-        let row_id = id.with(global_row_idx);
-        let row_accesskit_id: egui::accesskit::NodeId = row_id.value().into();
-
-        if has_focus {
-            if !state.had_focus_prev_frame && !ui.ctx().will_discard() {
-                state.pending_accesskit_selection_sync = true;
-                ui.ctx().request_repaint();
-                ui.ctx().accesskit_node_builder(id, |builder| {
-                    let pos = egui::accesskit::TextPosition {
-                        node: row_accesskit_id,
-                        character_index: 0,
-                    };
-                    builder.set_text_selection(egui::accesskit::TextSelection {
-                        anchor: pos,
-                        focus: pos,
-                    });
-                });
-            } else {
-                if !ui.ctx().will_discard() {
-                    state.pending_accesskit_selection_sync = false;
-                }
-                ui.ctx().accesskit_node_builder(id, |builder| {
-                    let target_idx = (col_idx + 1).min(row.glyphs.len() + 1);
-                    let focus_pos = egui::accesskit::TextPosition {
-                        node: row_accesskit_id,
-                        character_index: target_idx,
-                    };
-                    builder.set_text_selection(egui::accesskit::TextSelection {
-                        anchor: focus_pos,
-                        focus: focus_pos,
-                    });
-                });
-            }
-        } else if ui.memory(|m| m.has_focus(id)) {
-            // The widget keeps egui focus but the OS window is inactive. Keep exposing
-            // the caret so that when Windows re-announces focus on window activation
-            // (before our next frame runs) UIA clients (magnifier, screen readers) find
-            // a valid text selection and keep tracking the caret.
-            ui.ctx().accesskit_node_builder(id, |builder| {
-                let target_idx = (col_idx + 1).min(row.glyphs.len() + 1);
-                let focus_pos = egui::accesskit::TextPosition {
-                    node: row_accesskit_id,
-                    character_index: target_idx,
-                };
-                builder.set_text_selection(egui::accesskit::TextSelection {
-                    anchor: focus_pos,
-                    focus: focus_pos,
-                });
-            });
-        } else {
-            ui.ctx().accesskit_node_builder(id, |builder| {
-                builder.clear_text_selection();
-            });
-        }
-
-        let line_height = ui.text_style_height(&egui::TextStyle::Monospace);
-        let mut row_min = galley_pos + row.rect().min.to_vec2();
-        let mut row_max = galley_pos + row.rect().max.to_vec2();
-        if row_max.y - row_min.y < line_height {
-            row_max.y = row_min.y + line_height;
-        }
-
-        if text_clip_rect.min.y.is_finite()
-            && text_clip_rect.max.y.is_finite()
-            && text_clip_rect.min.y <= text_clip_rect.max.y
-        {
-            row_min.y = row_min.y.clamp(text_clip_rect.min.y, text_clip_rect.max.y);
-            row_max.y = row_max.y.clamp(row_min.y, text_clip_rect.max.y);
-        } else if text_clip_rect.min.y.is_finite() {
-            row_min.y = text_clip_rect.min.y;
-            row_max.y = text_clip_rect.min.y;
-        }
-        if text_clip_rect.min.x.is_finite()
-            && text_clip_rect.max.x.is_finite()
-            && text_clip_rect.min.x <= text_clip_rect.max.x
-        {
-            row_min.x = row_min.x.clamp(text_clip_rect.min.x, text_clip_rect.max.x);
-            row_max.x = row_max.x.clamp(row_min.x, text_clip_rect.max.x);
-        } else if text_clip_rect.min.x.is_finite() {
-            row_min.x = text_clip_rect.min.x;
-            row_max.x = text_clip_rect.min.x;
-        }
-        if row_max.x - row_min.x < 2.0 {
-            row_max.x = row_min.x + 2.0;
-        }
-        let row_bounds = egui::accesskit::Rect {
-            x0: row_min.x.into(),
-            y0: row_min.y.into(),
-            x1: row_max.x.into(),
-            y1: row_max.y.into(),
-        };
-
-        let row_unchanged = match &state.accesskit_row_cache {
-            Some(c) => {
-                Arc::ptr_eq(&c.galley, galley)
-                    && c.row == global_row_idx
-                    && c.bounds == row_bounds
-            }
-            None => false,
-        };
-
-        if row_unchanged {
-            ui.ctx().accesskit_node_builder(id, |builder| {
-                if !builder.children().contains(&row_accesskit_id) {
-                    builder.push_child(row_accesskit_id);
-                }
-            });
-        } else if !ui.ctx().will_discard() {
-            let mut built_row = false;
-            let sub_ui = ui.new_child(
-                egui::UiBuilder::new()
-                    .id_salt(("accesskit_row", row_id))
-                    .accessibility_parent(id),
-            );
-            sub_ui.interact(egui::Rect::NOTHING, row_id, egui::Sense::empty());
-            sub_ui.ctx().accesskit_node_builder(row_id, |builder| {
-                built_row = true;
-                builder.set_role(egui::accesskit::Role::TextRun);
-                builder.set_text_direction(egui::accesskit::TextDirection::LeftToRight);
-                builder.set_bounds(row_bounds);
-
-                let glyph_count = row.glyphs.len();
-                let mut value = String::with_capacity(glyph_count + 2);
-                let mut character_lengths = Vec::<u8>::with_capacity(glyph_count + 2);
-                let mut character_positions = Vec::<f32>::with_capacity(glyph_count + 2);
-                let mut character_widths = Vec::<f32>::with_capacity(glyph_count + 2);
-
-                value.push(' ');
-                character_lengths.push(1);
-                character_positions.push(0.0);
-                character_widths.push(1.0);
-
-                for glyph in &row.glyphs {
-                    let old_len = value.len();
-                    value.push(glyph.chr);
-                    character_lengths.push((value.len() - old_len) as u8);
-                    character_positions.push(glyph.pos.x - row.rect().min.x);
-                    character_widths.push(glyph.advance_width.max(1.0));
-                }
-
-                let end_x = row.rect().width();
-                value.push(if row.ends_with_newline { '\n' } else { ' ' });
-                character_lengths.push(1);
-                character_positions.push(end_x);
-                character_widths.push(1.0);
-
-                builder.set_value(value);
-                builder.set_character_lengths(character_lengths);
-                builder.set_character_positions(character_positions);
-                builder.set_character_widths(character_widths);
-                builder.set_word_starts(vec![0]);
-            });
-            if built_row {
-                state.accesskit_row_cache = Some(AccessKitRowCache {
-                    galley: Arc::clone(galley),
-                    row: global_row_idx,
-                    bounds: row_bounds,
-                });
-            }
         }
     }
 }

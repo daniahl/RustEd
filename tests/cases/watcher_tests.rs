@@ -311,5 +311,16 @@ fn test_path_strip_prefix_windows_aware() {
             Path::new(r"c:/proj/src/lib.rs"),
             Path::new(r"C:\Proj")
         ));
+        assert!(paths_equal(
+            Path::new(r"\\?\UNC\server\share\proj\src\main.rs"),
+            Path::new(r"\\server\share\Proj\SRC\main.rs")
+        ));
+        assert_eq!(
+            path_strip_prefix(
+                Path::new(r"\\?\UNC\server\share\proj\src\main.rs"),
+                Path::new(r"\\server\share\proj")
+            ),
+            Some(PathBuf::from("src").join("main.rs"))
+        );
     }
 }

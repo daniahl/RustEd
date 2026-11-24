@@ -217,6 +217,25 @@ impl TextEditor {
         }
     }
 
+    pub fn save_active_file(&mut self) -> bool {
+        if !self.doc.can_save() {
+            return true;
+        }
+        if self.doc.is_untitled_dirty() {
+            let Some(dest) = pick_save_file(&self.explorer.folder_path) else {
+                return false;
+            };
+            if self.doc.save_current_file_as(dest.clone()) {
+                self.explorer.selected_node = Some((dest.clone(), false));
+                self.explorer.refresh_watched_paths(&[dest], false);
+                return true;
+            }
+            return false;
+        }
+        self.doc.save_current_file();
+        !self.doc.is_current_dirty
+    }
+
     fn handle_close_confirmation(&mut self, ctx: &egui::Context) {
         if ctx.input(|i| i.viewport().close_requested())
             && !self.allow_close
@@ -259,12 +278,21 @@ impl TextEditor {
             });
 
         if save_and_close {
-            if self.doc.save_all() {
+            let untitled_ok = if self.doc.is_untitled_dirty() {
+                self.save_active_file()
+            } else {
+                true
+            };
+            if untitled_ok && self.doc.save_all() {
                 self.allow_close = true;
                 self.confirm_close_open = false;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             } else {
                 self.confirm_close_open = false;
+                // Ensure the save error banner on the Editor tab is visible if close failed from Terminal.
+                if self.doc.last_save_error.is_some() {
+                    self.tab = Tab::Editor;
+                }
             }
         } else if discard_and_close {
             self.allow_close = true;
@@ -327,6 +355,8 @@ impl TextEditor {
                         if !self.doc.find_open
                             && !self.confirm_close_open
                             && self.explorer.pending_tree_edit.is_none()
+                            && self.explorer.pending_delete.is_none()
+                            && self.explorer.pending_open_after_untitled.is_none()
                             && !folder_input_focused
                         {
                             let alt = egui::Modifiers::ALT;
@@ -351,7 +381,7 @@ impl TextEditor {
                     )
                 });
             if ctrl_s && self.doc.can_save() {
-                self.doc.save_current_file();
+                self.save_active_file();
             }
             if ctrl_f {
                 self.doc.open_find_dialog(ctx);
@@ -437,7 +467,7 @@ impl TextEditor {
                         .on_hover_text("Save (Ctrl+S)")
                         .clicked()
                     {
-                        self.doc.save_current_file();
+                        self.save_active_file();
                     }
 
                     if ui.button("Find").on_hover_text("Find (Ctrl+F)").clicked() {
@@ -567,13 +597,22 @@ pub fn folder_from_args<I: IntoIterator<Item = String>>(args: I) -> Option<PathB
     })
 }
 
-/// Shows the native folder-selection dialog, starting at start_dir when it exists.
+/// Shows the native folder-selection dialog, starting at `start_dir` when it exists.
 fn pick_folder(start_dir: &Path) -> Option<PathBuf> {
     let mut dialog = rfd::FileDialog::new().set_title("Open project folder");
     if start_dir.is_dir() {
         dialog = dialog.set_directory(start_dir);
     }
     dialog.pick_folder()
+}
+
+/// Shows the native Save As dialog, starting at `start_dir` when it exists.
+pub(crate) fn pick_save_file(start_dir: &Path) -> Option<PathBuf> {
+    let mut dialog = rfd::FileDialog::new().set_title("Save file as");
+    if start_dir.is_dir() {
+        dialog = dialog.set_directory(start_dir);
+    }
+    dialog.save_file()
 }
 
 impl eframe::App for TextEditor {

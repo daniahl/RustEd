@@ -30,14 +30,15 @@ impl WatchBatch {
     }
 }
 
-/// Strips a Windows `\\?\` verbatim drive prefix so canonical and regular paths compare cleanly.
+/// Strips a Windows `\\?\` or `\\?\UNC\` verbatim prefix so canonical and regular paths compare cleanly.
 fn normalize_verbatim(path: &Path) -> Cow<'_, Path> {
     #[cfg(target_os = "windows")]
     if let Some(s) = path.to_str() {
+        if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+            return Cow::Owned(PathBuf::from(format!(r"\\{rest}")));
+        }
         if let Some(rest) = s.strip_prefix(r"\\?\") {
-            if !rest.starts_with("UNC\\") {
-                return Cow::Owned(PathBuf::from(rest));
-            }
+            return Cow::Owned(PathBuf::from(rest));
         }
     }
     Cow::Borrowed(path)
@@ -337,29 +338,38 @@ impl FileWatcher {
 }
 
 #[cfg(target_os = "windows")]
-struct DirWatchGuard {
-    stop_event: SendHandle,
-    thread: Option<std::thread::JoinHandle<()>>,
+struct OwnedHandle(windows::Win32::Foundation::HANDLE);
+
+#[cfg(target_os = "windows")]
+unsafe impl Send for OwnedHandle {}
+
+#[cfg(target_os = "windows")]
+unsafe impl Sync for OwnedHandle {}
+
+#[cfg(target_os = "windows")]
+impl Drop for OwnedHandle {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = windows::Win32::Foundation::CloseHandle(self.0);
+        }
+    }
 }
 
 #[cfg(target_os = "windows")]
-#[derive(Clone, Copy)]
-struct SendHandle(windows::Win32::Foundation::HANDLE);
-
-#[cfg(target_os = "windows")]
-unsafe impl Send for SendHandle {}
+struct DirWatchGuard {
+    stop_event: Arc<OwnedHandle>,
+    stopped: Arc<std::sync::atomic::AtomicBool>,
+}
 
 #[cfg(target_os = "windows")]
 impl Drop for DirWatchGuard {
     fn drop(&mut self) {
+        self.stopped.store(true, std::sync::atomic::Ordering::Release);
+        // Wake the watcher thread without blocking the UI thread (important on SMB/network shares).
+        // The thread closes `dir_handle` and `io_event` on exit, and `OwnedHandle` closes
+        // `stop_event` once both the guard and the watcher thread have dropped their `Arc`.
         unsafe {
             let _ = windows::Win32::System::Threading::SetEvent(self.stop_event.0);
-        }
-        if let Some(handle) = self.thread.take() {
-            let _ = handle.join();
-        }
-        unsafe {
-            let _ = windows::Win32::Foundation::CloseHandle(self.stop_event.0);
         }
     }
 }
@@ -376,20 +386,37 @@ impl DirWatchGuard {
             windows::Win32::System::Threading::CreateEventW(None, true, false, None)
         }
         .ok()?;
-        let stop_event = SendHandle(stop_raw);
-        let thread = std::thread::Builder::new()
+        let stop_event = Arc::new(OwnedHandle(stop_raw));
+        let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<bool>(1);
+
+        let stop_event_clone = Arc::clone(&stop_event);
+        let stopped_clone = Arc::clone(&stopped);
+        std::thread::Builder::new()
             .name("rusted-fs-watcher".to_string())
             .spawn(move || {
-                run_windows_watch_loop(ctx, dir, recursive, stop_event, shared);
+                run_windows_watch_loop(
+                    ctx,
+                    dir,
+                    recursive,
+                    stop_event_clone,
+                    stopped_clone,
+                    shared,
+                    ready_tx,
+                );
             })
-            .ok();
-        if thread.is_none() {
-            unsafe {
-                let _ = windows::Win32::Foundation::CloseHandle(stop_raw);
-            }
-            return None;
+            .ok()?;
+
+        // Wait until the watcher thread has opened `dir_handle` and armed `ReadDirectoryChangesW`
+        // so filesystem writes immediately following `spawn` cannot race ahead of registration.
+        if ready_rx.recv().unwrap_or(false) {
+            Some(Self {
+                stop_event,
+                stopped,
+            })
+        } else {
+            None
         }
-        Some(Self { stop_event, thread })
     }
 }
 
@@ -398,10 +425,13 @@ fn run_windows_watch_loop(
     ctx: egui::Context,
     dir: PathBuf,
     recursive: bool,
-    stop_event: SendHandle,
+    stop_event: Arc<OwnedHandle>,
+    stopped: Arc<std::sync::atomic::AtomicBool>,
     shared: Arc<Mutex<SharedQueue>>,
+    ready_tx: std::sync::mpsc::SyncSender<bool>,
 ) {
     use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    use std::sync::atomic::Ordering;
     use windows::core::PCWSTR;
     use windows::Win32::Foundation::{
         CloseHandle, GetLastError, ERROR_NOTIFY_ENUM_DIR, WAIT_OBJECT_0, WAIT_TIMEOUT,
@@ -431,6 +461,7 @@ fn run_windows_watch_loop(
             None,
         )
     }) else {
+        let _ = ready_tx.send(false);
         return;
     };
 
@@ -438,6 +469,7 @@ fn run_windows_watch_loop(
         unsafe {
             let _ = CloseHandle(dir_handle);
         }
+        let _ = ready_tx.send(false);
         return;
     };
 
@@ -475,6 +507,7 @@ fn run_windows_watch_loop(
     };
 
     let mut io_pending = issue_read(&mut buffer, &mut overlapped);
+    let _ = ready_tx.send(io_pending);
     let mut pending_paths: Vec<PathBuf> = Vec::new();
     let mut pending_seen: HashSet<PathKey> = HashSet::new();
     let mut pending_rescan = false;
@@ -486,7 +519,7 @@ fn run_windows_watch_loop(
                          rescan: &mut bool,
                          first_at: &mut Option<std::time::Instant>,
                          last_at: &mut Option<std::time::Instant>| {
-        if !paths.is_empty() || *rescan {
+        if (!paths.is_empty() || *rescan) && !stopped.load(Ordering::Acquire) {
             let drained = std::mem::take(paths);
             seen.clear();
             let rescan_flag = std::mem::take(rescan);
@@ -494,6 +527,10 @@ fn run_windows_watch_loop(
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .push_paths(drained, rescan_flag, &ctx);
+        } else {
+            paths.clear();
+            seen.clear();
+            *rescan = false;
         }
         *first_at = None;
         *last_at = None;

@@ -507,3 +507,71 @@ fn test_pending_root_edit_renders_without_panicking() {
     }
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn test_entry_name_validation_reports_errors_and_blocks_reserved_names() {
+    let dir = fresh_dir("validate_reserved");
+    let mut explorer = FileExplorer::new(dir.clone());
+
+    for bad in ["bad/name", "bad\\name", "trailing.", "bad:name", "CON", "nul.txt", "COM1"] {
+        assert!(
+            explorer.create_folder_in(&dir, bad).is_none(),
+            "{bad} should be rejected"
+        );
+        assert!(
+            explorer.last_fs_error.is_some(),
+            "rejecting {bad} should set last_fs_error"
+        );
+    }
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_request_delete_prompts_when_dirty_and_keyboard_nav_moves_selection() {
+    let dir = fresh_dir("dirty_del_nav");
+    let sub = dir.join("alpha");
+    fs::create_dir(&sub).unwrap();
+    let f1 = dir.join("b.txt");
+    let f2 = dir.join("c.txt");
+    fs::write(&f1, "one").unwrap();
+    fs::write(&f2, "two").unwrap();
+
+    let ctx = egui::Context::default();
+    let mut explorer = FileExplorer::new(dir.clone());
+    let mut doc = Document::new();
+    doc.open_file(&ctx, f1.clone());
+    doc.set_text("unsaved");
+    doc.is_current_dirty = true;
+
+    // RequestDeleteNode on dirty file sets pending_delete instead of immediately trashing
+    explorer.handle_tree_action(
+        &ctx,
+        &mut doc,
+        TreeAction::RequestDeleteNode {
+            path: f1.clone(),
+            is_dir: false,
+        },
+    );
+    assert_eq!(explorer.pending_delete, Some((f1.clone(), false)));
+    assert!(f1.exists());
+    explorer.pending_delete = None;
+
+    // ArrowDown navigates through visible nodes (alpha -> b.txt -> c.txt)
+    let mut labels = Vec::new();
+    let key_down = || egui::Event::Key {
+        key: egui::Key::ArrowDown,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: egui::Modifiers::NONE,
+    };
+    run_sidebar_frame(&ctx, &mut explorer, &mut doc, vec![key_down()], &mut labels);
+    assert_eq!(explorer.selected_node, Some((sub.clone(), true)));
+    run_sidebar_frame(&ctx, &mut explorer, &mut doc, vec![key_down()], &mut labels);
+    assert_eq!(explorer.selected_node, Some((f1.clone(), false)));
+    run_sidebar_frame(&ctx, &mut explorer, &mut doc, vec![key_down()], &mut labels);
+    assert_eq!(explorer.selected_node, Some((f2.clone(), false)));
+
+    let _ = fs::remove_dir_all(&dir);
+}

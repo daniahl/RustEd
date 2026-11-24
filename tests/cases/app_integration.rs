@@ -1197,3 +1197,96 @@ fn test_ai_explain_from_scrolled_long_file_does_not_panic() {
 
     let _ = fs::remove_dir_all(&temp_dir);
 }
+
+#[test]
+fn test_untitled_dirty_tracking_save_as_and_undo_across_disk_reload() {
+    let temp_dir =
+        std::env::temp_dir().join(format!("rusted_untitled_reload_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    let ctx = egui::Context::default();
+    let mut app = TextEditor::new_headless(&temp_dir);
+    let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::Vec2::new(900.0, 600.0));
+
+    // Focus Untitled editor and type text -> becomes dirty & saveable
+    let _ = run_ui(
+        &ctx,
+        egui::RawInput {
+            screen_rect: Some(screen),
+            ..Default::default()
+        },
+        |ui| {
+            app.update_ui(ui);
+            ui.ctx()
+                .memory_mut(|m| m.request_focus(rusted::editor::code_editor_id()));
+        },
+    );
+    let _ = run_ui(
+        &ctx,
+        egui::RawInput {
+            screen_rect: Some(screen),
+            events: vec![egui::Event::Text("draft note".to_string())],
+            ..Default::default()
+        },
+        |ui| app.update_ui(ui),
+    );
+    assert!(app.doc.is_untitled_dirty());
+    assert!(app.doc.can_save());
+    assert!(app.doc.has_unsaved_changes());
+
+    // Save As writes to disk and clears dirty state
+    let dest = temp_dir.join("saved_draft.txt");
+    assert!(app.doc.save_current_file_as(dest.clone()));
+    assert!(!app.doc.is_current_dirty);
+    assert_eq!(app.doc.file_name, "saved_draft.txt");
+    assert_eq!(fs::read_to_string(&dest).unwrap(), "draft note");
+
+    // External disk modification triggers reload; Ctrl+Z cleanly restores pre-reload text
+    fs::write(&dest, "external overwrite from disk").unwrap();
+    assert_eq!(
+        app.doc.sync_with_disk(&ctx, false),
+        rusted::document::DiskSyncResult::Reloaded
+    );
+    assert_eq!(app.doc.text, "external overwrite from disk");
+
+    let _ = run_ui(
+        &ctx,
+        egui::RawInput {
+            screen_rect: Some(screen),
+            events: vec![egui::Event::Key {
+                key: egui::Key::Z,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::COMMAND,
+            }],
+            ..Default::default()
+        },
+        |ui| app.update_ui(ui),
+    );
+    assert_eq!(
+        app.doc.text, "draft note",
+        "Ctrl+Z after disk reload should restore pre-reload buffer cleanly"
+    );
+
+    // Ctrl+Y redoes back to the reloaded disk content
+    let _ = run_ui(
+        &ctx,
+        egui::RawInput {
+            screen_rect: Some(screen),
+            events: vec![egui::Event::Key {
+                key: egui::Key::Y,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::COMMAND,
+            }],
+            ..Default::default()
+        },
+        |ui| app.update_ui(ui),
+    );
+    assert_eq!(app.doc.text, "external overwrite from disk");
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}

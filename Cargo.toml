@@ -1,8 +1,11 @@
 [package]
 name = "rusted"
-version = "0.6.0"
+version = "0.8.0"
 edition = "2021"
 
+# All unit and integration tests are consolidated into `tests/tests.rs` so Cargo links
+# heavy UI dependencies (`eframe`, `syntect`) only once. Do not add `#[cfg(test)]`
+# modules inside `src/`, as `test = false` skips lib/bin unit test harnesses.
 [lib]
 name = "rusted"
 path = "src/lib.rs"
