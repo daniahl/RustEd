@@ -1,14 +1,14 @@
-//! Platform-specific window tweaks.
+//! Platform-specific window hooks (Windows Alt-menu suppression, Win32 caret, and AccessKit focus sync).
 
 #[cfg(windows)]
 mod win {
     use std::sync::Mutex;
     use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
-    use windows::Win32::Graphics::Gdi::{CreateBitmap, DeleteObject, HGDIOBJ};
+    use windows::Win32::Graphics::Gdi::{CreateBitmap, DeleteObject, HBITMAP, HGDIOBJ};
     use windows::Win32::UI::Accessibility::NotifyWinEvent;
     use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
     use windows::Win32::UI::WindowsAndMessaging::{
-        CreateCaret, DestroyCaret, SetCaretPos, ShowCaret, CHILDID_SELF,
+        CreateCaret, DestroyCaret, GetForegroundWindow, SetCaretPos, ShowCaret, CHILDID_SELF,
         EVENT_OBJECT_LOCATIONCHANGE, OBJID_CARET, SC_KEYMENU, WM_ACTIVATE, WM_ENTERMENULOOP,
         WM_EXITMENULOOP, WM_KILLFOCUS, WM_NCDESTROY, WM_SETFOCUS, WM_SYSCOMMAND,
     };
@@ -51,24 +51,35 @@ mod win {
             return None;
         }
         let hwnd = HWND(state.hwnd as *mut _);
-        if !state.caret_created || state.created_w != state.w || state.created_h != state.h {
-            let stride_words = ((state.w + 15) / 16) as usize;
-            let words = vec![0u16; stride_words * (state.h as usize)];
-            let hbmp =
-                unsafe { CreateBitmap(state.w, state.h, 1, 1, Some(words.as_ptr() as *const _)) };
-            if hbmp.is_invalid() {
-                return None;
-            }
+        let size_changed = state.created_w != state.w || state.created_h != state.h;
+        if !state.caret_created || size_changed {
+            let (hbmp, created_new) = if !size_changed && state.bitmap != 0 {
+                (HBITMAP(state.bitmap as *mut _), false)
+            } else {
+                let stride_words = ((state.w + 15) / 16) as usize;
+                let words = vec![0u16; stride_words * (state.h as usize)];
+                let bmp = unsafe {
+                    CreateBitmap(state.w, state.h, 1, 1, Some(words.as_ptr() as *const _))
+                };
+                if bmp.is_invalid() {
+                    return None;
+                }
+                (bmp, true)
+            };
             if unsafe { CreateCaret(hwnd, Some(hbmp), state.w, state.h) }.is_err() {
-                let _ = unsafe { DeleteObject(HGDIOBJ(hbmp.0)) };
+                if created_new {
+                    let _ = unsafe { DeleteObject(HGDIOBJ(hbmp.0)) };
+                }
                 return None;
             }
-            if state.bitmap != 0 {
-                let _ = unsafe { DeleteObject(HGDIOBJ(state.bitmap as *mut _)) };
+            if created_new {
+                if state.bitmap != 0 {
+                    let _ = unsafe { DeleteObject(HGDIOBJ(state.bitmap as *mut _)) };
+                }
+                state.bitmap = hbmp.0 as isize;
+                state.created_w = state.w;
+                state.created_h = state.h;
             }
-            state.bitmap = hbmp.0 as isize;
-            state.created_w = state.w;
-            state.created_h = state.h;
             state.caret_created = true;
             let _ = unsafe { SetCaretPos(state.x, state.y) };
             let _ = unsafe { ShowCaret(Some(hwnd)) };
@@ -164,9 +175,10 @@ mod win {
     pub fn install(handle: raw_window_handle::RawWindowHandle) {
         if let raw_window_handle::RawWindowHandle::Win32(h) = handle {
             let hwnd = HWND(h.hwnd.get() as *mut _);
+            let focused = unsafe { GetForegroundWindow() == hwnd };
             if let Ok(mut state) = CARET.lock() {
                 state.hwnd = hwnd.0 as isize;
-                state.window_focused = true;
+                state.window_focused = focused;
             }
             unsafe {
                 let _ = SetWindowSubclass(hwnd, Some(subclass_proc), SUBCLASS_ID, 0);
@@ -199,12 +211,12 @@ mod win {
 }
 
 #[cfg(windows)]
-pub fn suppress_alt_menu_mode(handle: raw_window_handle::RawWindowHandle) {
+pub fn install_window_hooks(handle: raw_window_handle::RawWindowHandle) {
     win::install(handle);
 }
 
 #[cfg(not(windows))]
-pub fn suppress_alt_menu_mode(_handle: raw_window_handle::RawWindowHandle) {}
+pub fn install_window_hooks(_handle: raw_window_handle::RawWindowHandle) {}
 
 #[cfg(windows)]
 pub fn update_caret(x: i32, y: i32, w: i32, h: i32, force_notify: bool) {

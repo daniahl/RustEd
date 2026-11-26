@@ -1043,3 +1043,202 @@ fn test_multiline_tab_indent_and_paste_newline_normalization() {
     run_crlf(&mut crlf_text, &mut crlf_rev, vec![Event::Paste("x\ny\r\nz\n".to_string())]);
     assert_eq!(crlf_text.build_string(), "x\r\ny\r\nz\r\nend");
 }
+
+#[test]
+fn test_noop_backspace_and_delete_at_boundaries_do_not_mutate_or_relayout() {
+    use egui::{
+        text::CCursor,
+        text_selection::CCursorRange,
+        Pos2, Rect,
+    };
+    use rusted::{editor::FastEditorState, piece_table::PieceTable};
+
+    let ctx = egui::Context::default();
+    let editor_id = Id::unique("test_noop_boundary_keys");
+    let mut text = PieceTable::from_str("hello");
+    let mut rev = 1u64;
+
+    let run = |text: &mut PieceTable, rev: &mut u64, events: Vec<Event>| -> bool {
+        let mut changed = false;
+        let mut out = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(600.0, 300.0))),
+                events,
+                ..Default::default()
+            },
+            |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    let mut layouter = |ui: &Ui, s: &str, w: f32| {
+                        let job = LayoutJob::simple(
+                            s.to_owned(),
+                            egui::TextStyle::Monospace.resolve(ui.style()),
+                            Color32::WHITE,
+                            w,
+                        );
+                        ui.fonts_mut(|f| f.layout_job(job))
+                    };
+                    let output = FastEditor::new(editor_id, text, Vec2::new(500.0, 200.0), &mut layouter)
+                        .text_revision(*rev)
+                        .show(ui);
+                    rusted::editor::request_editor_focus(ui.ctx(), output.response.id);
+                    changed = output.text_changed;
+                    if changed {
+                        *rev = rev.wrapping_add(1);
+                    }
+                });
+            },
+        );
+        out.textures_delta.clear();
+        changed
+    };
+
+    // Initial focus with cursor at 0
+    assert!(!run(&mut text, &mut rev, vec![]));
+    // Backspace at index 0 is a no-op
+    assert!(!run(
+        &mut text,
+        &mut rev,
+        vec![Event::Key {
+            key: Key::Backspace,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::NONE,
+        }]
+    ));
+    assert_eq!(rev, 1);
+
+    // Move cursor to EOF (index 5) and press Delete -> also a no-op
+    ctx.data_mut(|d| {
+        let mut st = d.get_temp::<FastEditorState>(editor_id).unwrap_or_default();
+        st.cursor
+            .set_char_range(Some(CCursorRange::one(CCursor::new(5))));
+        d.insert_temp(editor_id, st);
+    });
+    assert!(!run(
+        &mut text,
+        &mut rev,
+        vec![Event::Key {
+            key: Key::Delete,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::NONE,
+        }]
+    ));
+    assert_eq!(rev, 1);
+    assert_eq!(text.build_string(), "hello");
+}
+
+#[test]
+fn test_virtualized_sticky_column_and_horizontal_scroll_accesskit_positions() {
+    use egui::{
+        text::CCursor,
+        text_selection::CCursorRange,
+        Pos2, Rect,
+    };
+    use rusted::{editor::FastEditorState, piece_table::PieceTable};
+
+    let ctx = egui::Context::default();
+    ctx.enable_accesskit();
+    let editor_id = Id::unique("test_virt_sticky_and_hscroll_ak");
+    let long_line = "a".repeat(200);
+    let mut text = PieceTable::from_str(&format!("{long_line}\n\n{long_line}"));
+    let mut rev = 1u64;
+
+    let run = |text: &mut PieceTable,
+               rev: &mut u64,
+               events: Vec<Event>|
+     -> (Option<egui::accesskit::TreeUpdate>, Option<CCursorRange>) {
+        let mut range = None;
+        let mut out = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(300.0, 200.0))),
+                events,
+                ..Default::default()
+            },
+            |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    egui::ScrollArea::horizontal()
+                        .id_salt("test_virt_hscroll")
+                        .auto_shrink([false, false])
+                        .animated(false)
+                        .show(ui, |ui| {
+                            let mut layouter = |ui: &Ui, s: &str, w: f32| {
+                                let job = LayoutJob::simple(
+                                    s.to_owned(),
+                                    egui::TextStyle::Monospace.resolve(ui.style()),
+                                    Color32::WHITE,
+                                    w,
+                                );
+                                ui.fonts_mut(|f| f.layout_job(job))
+                            };
+                            let output =
+                                FastEditor::new(editor_id, text, Vec2::new(280.0, 180.0), &mut layouter)
+                                    .text_revision(*rev)
+                                    .virtualized(true)
+                                    .show(ui);
+                            rusted::editor::request_editor_focus(ui.ctx(), output.response.id);
+                            range = output.cursor_range;
+                        });
+                });
+            },
+        );
+        out.textures_delta.clear();
+        (out.platform_output.accesskit_update, range)
+    };
+
+    // Focus and place cursor at column 150 on line 0
+    let _ = run(&mut text, &mut rev, vec![]);
+    ctx.data_mut(|d| {
+        let mut st = d.get_temp::<FastEditorState>(editor_id).unwrap_or_default();
+        st.cursor
+            .set_char_range(Some(CCursorRange::one(CCursor::new(150))));
+        st.scroll_to_cursor = true;
+        d.insert_temp(editor_id, st);
+    });
+    // Render frames so horizontal scroll settles and capture the latest emitted TextRun node
+    let mut latest_text_run = None;
+    for _ in 0..3 {
+        let (ak_opt, _) = run(&mut text, &mut rev, vec![]);
+        if let Some(ak) = ak_opt {
+            if let Some((_, node)) = ak
+                .nodes
+                .into_iter()
+                .find(|(_, n)| n.role() == egui::accesskit::Role::TextRun)
+            {
+                latest_text_run = Some(node);
+            }
+        }
+    }
+    let row_node = latest_text_run.expect("Active TextRun should be present");
+    let bounds = row_node.bounds().expect("TextRun should have bounds");
+    let positions = row_node
+        .character_positions()
+        .expect("TextRun should have character_positions");
+    // Column 150 corresponds to index 151 (after leading anchor). Its screen X (bounds.x0 + pos)
+    // must lie within the 300px viewport rather than being shifted off-screen by the scroll offset.
+    let col150_screen_x = bounds.x0 + positions[151] as f64;
+    assert!(
+        (0.0..=320.0).contains(&col150_screen_x),
+        "Horizontally scrolled AccessKit glyph X should stay in viewport, got {col150_screen_x} (bounds={bounds:?}, pos={})",
+        positions[151]
+    );
+
+    // ArrowDown onto blank line 1, then ArrowDown onto line 2 -> sticky column 150 preserved
+    let down = Event::Key {
+        key: Key::ArrowDown,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: Modifiers::NONE,
+    };
+    let (_, r1) = run(&mut text, &mut rev, vec![down.clone()]);
+    assert_eq!(text.char_to_line_col(r1.unwrap().primary.index.0), (1, 0));
+    let (_, r2) = run(&mut text, &mut rev, vec![down]);
+    assert_eq!(
+        text.char_to_line_col(r2.unwrap().primary.index.0),
+        (2, 150),
+        "Virtualized mode should preserve sticky preferred column across blank lines"
+    );
+}

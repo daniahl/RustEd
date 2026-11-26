@@ -573,5 +573,72 @@ fn test_request_delete_prompts_when_dirty_and_keyboard_nav_moves_selection() {
     run_sidebar_frame(&ctx, &mut explorer, &mut doc, vec![key_down()], &mut labels);
     assert_eq!(explorer.selected_node, Some((f2.clone(), false)));
 
+    // keyboard_blocked suppresses sidebar keyboard navigation (e.g. behind close modal)
+    explorer.keyboard_blocked = true;
+    run_sidebar_frame(
+        &ctx,
+        &mut explorer,
+        &mut doc,
+        vec![egui::Event::Key {
+            key: egui::Key::ArrowUp,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }],
+        &mut labels,
+    );
+    assert_eq!(explorer.selected_node, Some((f2.clone(), false)));
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_create_file_protects_dirty_untitled_and_rename_preserves_nested_expanded() {
+    let dir = fresh_dir("untitled_and_nested_rename");
+    let outer = dir.join("outer");
+    let inner = outer.join("inner");
+    fs::create_dir_all(&inner).unwrap();
+    fs::write(inner.join("leaf.txt"), "leaf").unwrap();
+
+    let ctx = egui::Context::default();
+    let mut explorer = FileExplorer::new(dir.clone());
+    let mut doc = Document::new();
+
+    // Dirty Untitled buffer must NOT be silently discarded when creating a new file
+    doc.set_text("unsaved untitled text");
+    doc.is_current_dirty = true;
+    let created = explorer
+        .create_file_in(&ctx, &mut doc, &dir, "new_file.txt")
+        .expect("file should be created");
+    assert_eq!(doc.text, "unsaved untitled text");
+    assert_eq!(explorer.pending_open_after_untitled, Some(created));
+
+    // Reserved name with trailing space before dot is also rejected
+    assert!(explorer.create_folder_in(&dir, "CON .txt").is_none());
+
+    // Expand outer and inner, then rename outer -> outer_renamed: inner must remain expanded
+    let root = explorer.tree_root.as_mut().unwrap();
+    let outer_node = root.find_mut(&outer).unwrap();
+    outer_node.expanded = true;
+    outer_node.load_children();
+    let inner_node = outer_node.find_mut(&inner).unwrap();
+    inner_node.expanded = true;
+    inner_node.load_children();
+
+    let renamed = explorer
+        .rename_node(&mut doc, &outer, "outer_renamed", true)
+        .expect("rename should succeed");
+    let renamed_inner = explorer
+        .tree_root
+        .as_mut()
+        .unwrap()
+        .find_mut(&renamed.join("inner"))
+        .expect("inner node should exist under renamed folder");
+    assert!(
+        renamed_inner.expanded && renamed_inner.children_loaded,
+        "renaming an expanded folder should preserve nested expanded subdirectories"
+    );
+
     let _ = fs::remove_dir_all(&dir);
 }

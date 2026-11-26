@@ -699,3 +699,42 @@ fn test_hint_accelerated_coordinate_queries_match_reference() {
         assert_eq!((got_line, got_col), (line, 0), "line_to_char round-trip failed for line {line}");
     }
 }
+
+#[test]
+fn test_byte_to_char_mid_utf8_and_reverse_case_insensitive_search() {
+    let mut pt = PieceTable::from_str("Hello 🌍 World\nAlpha beta ALPHA");
+    // Split across pieces right inside text
+    pt.insert(5, "!");
+    pt.insert(15, "!");
+    // Mid-UTF-8 byte offset inside '🌍' (4-byte emoji) must floor cleanly without panicking
+    let emoji_byte = pt.char_to_byte(7);
+    assert_eq!(pt.byte_to_char(emoji_byte), 7);
+    assert_eq!(pt.byte_to_char(emoji_byte + 1), 7);
+    assert_eq!(pt.byte_to_char(emoji_byte + 2), 7);
+    assert_eq!(pt.byte_to_char(emoji_byte + 3), 7);
+    assert_eq!(pt.byte_to_char(emoji_byte + 4), 8);
+
+    // Reverse search across multi-piece boundary
+    let mut multi = PieceTable::from_str("abcd");
+    multi.insert(4, "efg");
+    multi.insert(7, "hijk");
+    assert_eq!(multi.find_prev_byte("abcdefghij", 11), Some(0));
+    assert_eq!(multi.find_prev_byte("defgh", 11), Some(3));
+    assert_eq!(multi.find_prev_byte("defgh", 3), None);
+
+    // Case-insensitive forward & backward search (ASCII + Unicode)
+    let mut ci = PieceTable::from_str("Alpha beta ");
+    ci.insert(11, "ALPHA gamma ");
+    ci.insert(23, "alpha");
+    assert_eq!(ci.find_char_range("alpha", 0, false, false), Some(0..5));
+    assert_eq!(ci.find_char_range("alpha", 5, false, false), Some(11..16));
+    assert_eq!(ci.find_char_range("alpha", 16, false, false), Some(23..28));
+    assert_eq!(ci.find_char_range("alpha", 23, false, true), Some(11..16));
+    assert_eq!(ci.find_char_range("alpha", 11, false, true), Some(0..5));
+    assert_eq!(ci.find_char_range("alpha", 0, false, true), None);
+
+    let uni = PieceTable::from_str("Über café ÜBER");
+    assert_eq!(uni.find_char_range("über", 0, false, false), Some(0..4));
+    assert_eq!(uni.find_char_range("über", 4, false, false), Some(10..14));
+    assert_eq!(uni.find_char_range("über", 10, false, true), Some(0..4));
+}

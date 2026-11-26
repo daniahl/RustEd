@@ -184,6 +184,8 @@ pub struct PieceTableSnapshot {
     orig_checkpoints: Arc<[LineCheckpoint]>,
     pieces: Arc<Vec<Piece>>,
     added_epoch: u64,
+    added_piece_bytes: usize,
+    added_len_at_snapshot: usize,
     total_chars: usize,
     total_bytes: usize,
     total_line_feeds: usize,
@@ -205,6 +207,7 @@ pub struct PieceTable {
     added_epoch: u64,
     added_chars: usize,
     added_lfs: usize,
+    added_piece_bytes: usize,
     /// Copy-on-write piece list: snapshots share it in O(1); edits call Arc::make_mut.
     pieces: Arc<Vec<Piece>>,
     /// Locality hint `(idx, char_start, byte_start, nl_start)` for the last lookup/edit.
@@ -227,6 +230,7 @@ impl Clone for PieceTable {
             added_epoch: self.added_epoch,
             added_chars: self.added_chars,
             added_lfs: self.added_lfs,
+            added_piece_bytes: self.added_piece_bytes,
             pieces: Arc::clone(&self.pieces),
             hint: Cell::new(PieceHint::default()),
             total_chars: self.total_chars,
@@ -322,6 +326,7 @@ impl PieceTable {
             added_epoch: 0,
             added_chars: 0,
             added_lfs: 0,
+            added_piece_bytes: 0,
             pieces: Arc::new(pieces),
             hint: Cell::new(PieceHint::default()),
             total_chars: char_count,
@@ -331,7 +336,7 @@ impl PieceTable {
         }
     }
 
-    /// Captures a lightweight O(P) snapshot of piece descriptors without copying text buffers.
+    /// Captures a lightweight O(1) copy-on-write snapshot of piece descriptors without copying text buffers.
     pub fn snapshot(&self) -> PieceTableSnapshot {
         PieceTableSnapshot {
             table_id: self.table_id,
@@ -339,24 +344,23 @@ impl PieceTable {
             orig_checkpoints: Arc::clone(&self.orig_checkpoints),
             pieces: Arc::clone(&self.pieces),
             added_epoch: self.added_epoch,
+            added_piece_bytes: self.added_piece_bytes,
+            added_len_at_snapshot: self.added.len(),
             total_chars: self.total_chars,
             total_bytes: self.total_bytes,
             total_line_feeds: self.total_line_feeds,
         }
     }
 
+    #[inline]
     fn snapshot_compatible(&self, snapshot: &PieceTableSnapshot) -> bool {
-        if snapshot.table_id != self.table_id {
-            return false;
-        }
-        snapshot.pieces.iter().all(|p| {
-            p.buffer != BufferType::Added
+        snapshot.table_id == self.table_id
+            && (snapshot.added_piece_bytes == 0
                 || (snapshot.added_epoch == self.added_epoch
-                    && p.start + p.length <= self.added.len())
-        })
+                    && snapshot.added_len_at_snapshot <= self.added.len()))
     }
 
-    /// Restores piece descriptors from a previously captured `PieceTableSnapshot` in O(P) time.
+    /// Restores piece descriptors from a previously captured `PieceTableSnapshot` in O(1) time.
     /// Returns `false` if the snapshot belongs to another table or invalidated `added` epoch.
     pub fn restore_snapshot(&mut self, snapshot: &PieceTableSnapshot) -> bool {
         if !self.snapshot_compatible(snapshot) {
@@ -365,6 +369,7 @@ impl PieceTable {
         self.original = Arc::clone(&snapshot.original);
         self.orig_checkpoints = Arc::clone(&snapshot.orig_checkpoints);
         self.pieces = Arc::clone(&snapshot.pieces);
+        self.added_piece_bytes = snapshot.added_piece_bytes;
         self.hint.set(PieceHint::default());
         self.total_chars = snapshot.total_chars;
         self.total_bytes = snapshot.total_bytes;
@@ -472,6 +477,7 @@ impl PieceTable {
         self.added_epoch = self.added_epoch.wrapping_add(1);
         self.added_chars = 0;
         self.added_lfs = 0;
+        self.added_piece_bytes = 0;
         self.pieces = Arc::new(Vec::new());
         self.hint.set(PieceHint::default());
         self.total_chars = 0;
@@ -688,6 +694,7 @@ impl PieceTable {
         }
 
         self.hint.set(new_hint);
+        self.added_piece_bytes += text_bytes;
         self.total_chars += text_chars;
         self.total_bytes += text_bytes;
         self.total_line_feeds += text_lf;
@@ -752,15 +759,21 @@ impl PieceTable {
             replacement[1] = Some(right);
         }
 
-        let (mut old_bytes, mut old_lfs) = (0usize, 0usize);
+        let (mut old_bytes, mut old_lfs, mut old_added_bytes) = (0usize, 0usize, 0usize);
         for p in &self.pieces[first..last] {
             old_bytes += p.length;
             old_lfs += p.line_feed_cnt;
+            if p.buffer == BufferType::Added {
+                old_added_bytes += p.length;
+            }
         }
-        let (mut new_bytes, mut new_lfs) = (0usize, 0usize);
+        let (mut new_bytes, mut new_lfs, mut new_added_bytes) = (0usize, 0usize, 0usize);
         for p in replacement.iter().flatten() {
             new_bytes += p.length;
             new_lfs += p.line_feed_cnt;
+            if p.buffer == BufferType::Added {
+                new_added_bytes += p.length;
+            }
         }
 
         let repl_len = replacement.iter().flatten().count();
@@ -791,6 +804,7 @@ impl PieceTable {
         } else {
             first_hint
         });
+        self.added_piece_bytes = self.added_piece_bytes - old_added_bytes + new_added_bytes;
         self.total_chars -= end - start;
         self.total_bytes = self.total_bytes - old_bytes + new_bytes;
         self.total_line_feeds = self.total_line_feeds - old_lfs + new_lfs;
@@ -904,6 +918,9 @@ impl PieceTable {
     }
 
     /// Converts a byte offset to a character index in the document.
+    ///
+    /// Safe even when `byte_idx` falls inside a multi-byte UTF-8 character (floors to the
+    /// enclosing character's start boundary).
     pub fn byte_to_char(&self, byte_idx: usize) -> usize {
         if byte_idx == 0 {
             return 0;
@@ -911,9 +928,20 @@ impl PieceTable {
         if byte_idx >= self.total_bytes || self.pieces.is_empty() {
             return self.total_chars;
         }
+        #[inline]
+        fn floor_char_boundary(s: &str, mut idx: usize) -> usize {
+            let bytes = s.as_bytes();
+            idx = idx.min(bytes.len());
+            while idx > 0 && idx < bytes.len() && (bytes[idx] & 0xC0) == 0x80 {
+                idx -= 1;
+            }
+            idx
+        }
+
         let h = self.locate_byte(byte_idx);
         let p = &self.pieces[h.idx];
-        let offset_in_piece = byte_idx - h.byte_start;
+        let text = p.get_text(&self.original, &self.added);
+        let offset_in_piece = floor_char_boundary(text, byte_idx - h.byte_start);
         // Fast path: if char count equals byte length, all characters are single-byte ASCII
         if p.char_count == p.length {
             return h.char_start + offset_in_piece;
@@ -931,7 +959,6 @@ impl PieceTable {
                 }
             }
         }
-        let text = p.get_text(&self.original, &self.added);
         let chars_in_offset = text[..offset_in_piece].chars().count();
         h.char_start + chars_in_offset
     }
@@ -1246,6 +1273,15 @@ impl PieceTable {
     /// Safe even when `start_byte` is not aligned to a UTF-8 character boundary (advances past
     /// any leading UTF-8 continuation bytes, since a valid UTF-8 `needle` can never begin there).
     pub fn find_from_byte(&self, needle: &str, start_byte: usize) -> Option<usize> {
+        self.find_from_byte_impl(needle, start_byte, true)
+    }
+
+    fn find_from_byte_impl(
+        &self,
+        needle: &str,
+        start_byte: usize,
+        case_sensitive: bool,
+    ) -> Option<usize> {
         if needle.is_empty() || needle.len() > self.total_bytes || start_byte >= self.total_bytes {
             return None;
         }
@@ -1257,24 +1293,47 @@ impl PieceTable {
             }
             byte_idx
         }
-
-        if let [p] = self.pieces.as_slice() {
-            let text = p.get_text(&self.original, &self.added);
-            let aligned = align_char_boundary(text, start_byte);
-            return text[aligned..].find(needle).map(|rel| aligned + rel);
+        #[inline]
+        fn bytes_match(a: &[u8], b: &[u8], case_sensitive: bool) -> bool {
+            if case_sensitive {
+                a == b
+            } else {
+                a.eq_ignore_ascii_case(b)
+            }
         }
 
         let needle_bytes = needle.as_bytes();
         let needle_len = needle_bytes.len();
+
+        if let [p] = self.pieces.as_slice() {
+            let text = p.get_text(&self.original, &self.added);
+            let aligned = align_char_boundary(text, start_byte);
+            return if case_sensitive {
+                text[aligned..].find(needle).map(|rel| aligned + rel)
+            } else {
+                text.as_bytes()[aligned..]
+                    .windows(needle_len)
+                    .position(|w| w.eq_ignore_ascii_case(needle_bytes))
+                    .map(|rel| aligned + rel)
+            };
+        }
+
+        let start_hint = self.locate_byte(start_byte);
+        let mut piece_byte_start = start_hint.byte_start;
+
         if needle_len == 1 {
             let target = needle_bytes[0];
-            let mut piece_byte_start = 0usize;
-            for p in self.pieces.iter() {
+            for p in &self.pieces[start_hint.idx..] {
                 let piece_end = piece_byte_start + p.length;
                 if piece_end > start_byte {
                     let local_start = start_byte.saturating_sub(piece_byte_start);
                     let bytes = &p.get_text(&self.original, &self.added).as_bytes()[local_start..];
-                    if let Some(rel) = bytes.iter().position(|&b| b == target) {
+                    let pos = if case_sensitive {
+                        bytes.iter().position(|&b| b == target)
+                    } else {
+                        bytes.iter().position(|&b| b.eq_ignore_ascii_case(&target))
+                    };
+                    if let Some(rel) = pos {
                         return Some(piece_byte_start + local_start + rel);
                     }
                 }
@@ -1287,16 +1346,16 @@ impl PieceTable {
         // matches that straddle piece boundaries.
         let max_tail = needle_len - 1;
         let mut tail: Vec<u8> = Vec::with_capacity(max_tail * 2);
-        let mut piece_byte_start = 0usize;
 
-        for p in self.pieces.iter() {
+        for p in &self.pieces[start_hint.idx..] {
             let piece_end = piece_byte_start + p.length;
             if piece_end <= start_byte {
                 piece_byte_start = piece_end;
                 continue;
             }
             let full_text = p.get_text(&self.original, &self.added);
-            let local_start = align_char_boundary(full_text, start_byte.saturating_sub(piece_byte_start));
+            let local_start =
+                align_char_boundary(full_text, start_byte.saturating_sub(piece_byte_start));
             let slice_start_byte = piece_byte_start + local_start;
             let slice = &full_text[local_start..];
             let slice_bytes = slice.as_bytes();
@@ -1305,13 +1364,23 @@ impl PieceTable {
                 let tail_len = tail.len();
                 let take_prefix = slice_bytes.len().min(max_tail);
                 tail.extend_from_slice(&slice_bytes[..take_prefix]);
-                if let Some(rel) = tail.windows(needle_len).position(|w| w == needle_bytes) {
+                if let Some(rel) = tail
+                    .windows(needle_len)
+                    .position(|w| bytes_match(w, needle_bytes, case_sensitive))
+                {
                     return Some(slice_start_byte - tail_len + rel);
                 }
                 tail.truncate(tail_len);
             }
 
-            if let Some(rel) = slice.find(needle) {
+            let in_slice = if case_sensitive {
+                slice.find(needle)
+            } else {
+                slice_bytes
+                    .windows(needle_len)
+                    .position(|w| w.eq_ignore_ascii_case(needle_bytes))
+            };
+            if let Some(rel) = in_slice {
                 return Some(slice_start_byte + rel);
             }
 
@@ -1329,6 +1398,219 @@ impl PieceTable {
         }
 
         None
+    }
+
+    /// Searches backwards for the last occurrence of `needle` whose match starts strictly before
+    /// `limit_byte`, without flattening the piece table into `cached_text`.
+    pub fn find_prev_byte(&self, needle: &str, limit_byte: usize) -> Option<usize> {
+        self.find_prev_byte_impl(needle, limit_byte, true)
+    }
+
+    fn find_prev_byte_impl(
+        &self,
+        needle: &str,
+        limit_byte: usize,
+        case_sensitive: bool,
+    ) -> Option<usize> {
+        if needle.is_empty() || needle.len() > self.total_bytes || limit_byte == 0 {
+            return None;
+        }
+        #[inline]
+        fn bytes_match(a: &[u8], b: &[u8], case_sensitive: bool) -> bool {
+            if case_sensitive {
+                a == b
+            } else {
+                a.eq_ignore_ascii_case(b)
+            }
+        }
+
+        let needle_bytes = needle.as_bytes();
+        let needle_len = needle_bytes.len();
+        let clamped_limit = limit_byte.min(self.total_bytes);
+        let search_end = (clamped_limit - 1)
+            .saturating_add(needle_len)
+            .min(self.total_bytes);
+        if search_end < needle_len {
+            return None;
+        }
+
+        if let [p] = self.pieces.as_slice() {
+            let text = p.get_text(&self.original, &self.added);
+            let bytes = &text.as_bytes()[..search_end];
+            return if case_sensitive {
+                if text.is_char_boundary(search_end) {
+                    text[..search_end].rfind(needle)
+                } else {
+                    bytes.windows(needle_len).rposition(|w| w == needle_bytes)
+                }
+            } else {
+                bytes
+                    .windows(needle_len)
+                    .rposition(|w| w.eq_ignore_ascii_case(needle_bytes))
+            };
+        }
+
+        let end_hint = self.locate_byte(search_end);
+        let mut idx = end_hint.idx;
+        let mut piece_byte_start = end_hint.byte_start;
+        let max_head = needle_len - 1;
+        let mut head: Vec<u8> = Vec::with_capacity(max_head * 2);
+        let mut combined: Vec<u8> = Vec::with_capacity(max_head * 2);
+
+        loop {
+            let p = &self.pieces[idx];
+            let full_text = p.get_text(&self.original, &self.added);
+            let local_end = search_end.saturating_sub(piece_byte_start).min(p.length);
+            let slice_bytes = &full_text.as_bytes()[..local_end];
+            let slice_end_byte = piece_byte_start + local_end;
+
+            if !slice_bytes.is_empty() {
+                if needle_len == 1 {
+                    let target = needle_bytes[0];
+                    let pos = if case_sensitive {
+                        slice_bytes.iter().rposition(|&b| b == target)
+                    } else {
+                        slice_bytes
+                            .iter()
+                            .rposition(|&b| b.eq_ignore_ascii_case(&target))
+                    };
+                    if let Some(rel) = pos {
+                        return Some(piece_byte_start + rel);
+                    }
+                } else {
+                    if !head.is_empty() {
+                        let suffix_len = slice_bytes.len().min(max_head);
+                        combined.clear();
+                        combined
+                            .extend_from_slice(&slice_bytes[slice_bytes.len() - suffix_len..]);
+                        combined.extend_from_slice(&head);
+                        if let Some(rel) = combined
+                            .windows(needle_len)
+                            .rposition(|w| bytes_match(w, needle_bytes, case_sensitive))
+                        {
+                            return Some(slice_end_byte - suffix_len + rel);
+                        }
+                    }
+
+                    let in_slice = if case_sensitive && full_text.is_char_boundary(local_end) {
+                        full_text[..local_end].rfind(needle)
+                    } else {
+                        slice_bytes
+                            .windows(needle_len)
+                            .rposition(|w| bytes_match(w, needle_bytes, case_sensitive))
+                    };
+                    if let Some(rel) = in_slice {
+                        return Some(piece_byte_start + rel);
+                    }
+
+                    if slice_bytes.len() >= max_head {
+                        head.clear();
+                        head.extend_from_slice(&slice_bytes[..max_head]);
+                    } else {
+                        let keep_old = head.len().min(max_head - slice_bytes.len());
+                        head.truncate(keep_old);
+                        head.splice(0..0, slice_bytes.iter().copied());
+                    }
+                }
+            }
+
+            if idx == 0 {
+                break;
+            }
+            idx -= 1;
+            piece_byte_start -= self.pieces[idx].length;
+        }
+
+        None
+    }
+
+    /// Searches for `needle` starting from `start_char` (forward when `!backwards`, or finding the
+    /// last match starting strictly before `start_char` when `backwards`), supporting both
+    /// case-sensitive and case-insensitive matching. Returns the matched character range.
+    pub fn find_char_range(
+        &self,
+        needle: &str,
+        start_char: usize,
+        case_sensitive: bool,
+        backwards: bool,
+    ) -> Option<Range<usize>> {
+        if needle.is_empty() || self.is_empty() {
+            return None;
+        }
+        if case_sensitive || needle.is_ascii() {
+            let needle_chars = needle.chars().count();
+            let byte_pos = if backwards {
+                let limit_byte = self.char_to_byte(start_char.min(self.total_chars));
+                self.find_prev_byte_impl(needle, limit_byte, case_sensitive)?
+            } else {
+                let start_byte = self.char_to_byte(start_char.min(self.total_chars));
+                self.find_from_byte_impl(needle, start_byte, case_sensitive)?
+            };
+            let match_start = self.byte_to_char(byte_pos);
+            return Some(match_start..match_start + needle_chars);
+        }
+
+        // Non-ASCII case-insensitive search: compare Unicode lowercased char sequences so
+        // multi-codepoint case folds (e.g. 'İ') produce accurate original char ranges.
+        let needle_lower: Vec<char> = needle.chars().flat_map(char::to_lowercase).collect();
+        if needle_lower.is_empty() {
+            return None;
+        }
+        self.with_str(|s| {
+            let mut lower_chars: Vec<char> = Vec::with_capacity(s.len());
+            let mut orig_char_idx: Vec<usize> = Vec::with_capacity(s.len());
+            for (ci, ch) in s.chars().enumerate() {
+                for lc in ch.to_lowercase() {
+                    lower_chars.push(lc);
+                    orig_char_idx.push(ci);
+                }
+            }
+            let nlen = needle_lower.len();
+            if lower_chars.len() < nlen {
+                return None;
+            }
+            if backwards {
+                let limit = start_char.min(self.total_chars);
+                let mut pos = lower_chars.len() - nlen;
+                loop {
+                    let orig_start = orig_char_idx[pos];
+                    let at_orig_boundary = pos == 0 || orig_char_idx[pos - 1] != orig_start;
+                    let end_at_orig_boundary = pos + nlen == lower_chars.len()
+                        || orig_char_idx[pos + nlen] != orig_char_idx[pos + nlen - 1];
+                    if orig_start < limit
+                        && at_orig_boundary
+                        && end_at_orig_boundary
+                        && lower_chars[pos..pos + nlen] == needle_lower[..]
+                    {
+                        let orig_end = orig_char_idx[pos + nlen - 1] + 1;
+                        return Some(orig_start..orig_end);
+                    }
+                    if pos == 0 {
+                        break;
+                    }
+                    pos -= 1;
+                }
+                None
+            } else {
+                for pos in 0..=lower_chars.len() - nlen {
+                    let orig_start = orig_char_idx[pos];
+                    if orig_start < start_char {
+                        continue;
+                    }
+                    let at_orig_boundary = pos == 0 || orig_char_idx[pos - 1] != orig_start;
+                    let end_at_orig_boundary = pos + nlen == lower_chars.len()
+                        || orig_char_idx[pos + nlen] != orig_char_idx[pos + nlen - 1];
+                    if at_orig_boundary
+                        && end_at_orig_boundary
+                        && lower_chars[pos..pos + nlen] == needle_lower[..]
+                    {
+                        let orig_end = orig_char_idx[pos + nlen - 1] + 1;
+                        return Some(orig_start..orig_end);
+                    }
+                }
+                None
+            }
+        })
     }
 }
 
@@ -1482,6 +1764,7 @@ impl PieceTable {
         self.added_epoch = self.added_epoch.wrapping_add(1);
         self.added_chars = 0;
         self.added_lfs = 0;
+        self.added_piece_bytes = 0;
         self.hint.set(PieceHint::default());
         let pieces = Arc::make_mut(&mut self.pieces);
         pieces.clear();

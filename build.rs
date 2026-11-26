@@ -29,13 +29,24 @@ fn find_rc_exe() -> Option<PathBuf> {
         let Ok(entries) = std::fs::read_dir(root) else {
             continue;
         };
-        let mut versions: Vec<PathBuf> = entries
+        let mut versions: Vec<(Vec<u64>, PathBuf)> = entries
             .flatten()
-            .map(|e| e.path().join(arch_dir).join("rc.exe"))
-            .filter(|p| p.is_file())
+            .filter_map(|e| {
+                let rc = e.path().join(arch_dir).join("rc.exe");
+                if !rc.is_file() {
+                    return None;
+                }
+                let ver: Vec<u64> = e
+                    .file_name()
+                    .to_string_lossy()
+                    .split('.')
+                    .map(|part| part.parse::<u64>().unwrap_or(0))
+                    .collect();
+                Some((ver, rc))
+            })
             .collect();
-        versions.sort();
-        if let Some(latest) = versions.pop() {
+        versions.sort_by(|a, b| a.0.cmp(&b.0));
+        if let Some((_, latest)) = versions.pop() {
             return Some(latest);
         }
     }

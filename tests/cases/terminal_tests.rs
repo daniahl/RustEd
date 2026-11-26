@@ -722,3 +722,64 @@ fn test_terminal_scrollback_and_modified_key_encoding() {
     }
     assert_eq!(sent, b"pasted");
 }
+
+#[test]
+fn test_process_chunk_with_dsr_and_ai_cli_keys() {
+    use rusted::terminal::{encode_terminal_key, process_chunk_with_dsr};
+
+    // DSR probe followed by cursor restore in the SAME chunk must reply with the probed position
+    let mut parser = vt100::Parser::new(
+        std::num::NonZeroU16::new(24).unwrap(),
+        std::num::NonZeroU16::new(80).unwrap(),
+        0,
+    );
+    let mut tail = [0u8; 3];
+    let mut tail_len = 0usize;
+    let replies = process_chunk_with_dsr(
+        &mut parser,
+        &mut tail,
+        &mut tail_len,
+        b"\x1b[999;999H\x1b[6n\x1b[1;1H\x1b[6n",
+    );
+    assert_eq!(replies, vec![b"\x1b[24;80R".to_vec(), b"\x1b[1;1R".to_vec()]);
+
+    // Split across two chunks with a move right after
+    let replies1 = process_chunk_with_dsr(&mut parser, &mut tail, &mut tail_len, b"\x1b[5;10H\x1b[");
+    assert!(replies1.is_empty());
+    let replies2 = process_chunk_with_dsr(&mut parser, &mut tail, &mut tail_len, b"6n\x1b[1;1H");
+    assert_eq!(replies2, vec![b"\x1b[5;10R".to_vec()]);
+
+    // AI CLI modified Enter and Alt keys
+    assert_eq!(
+        encode_terminal_key(egui::Key::Enter, egui::Modifiers::SHIFT, false),
+        Some(b"\x1b[13;2u".to_vec())
+    );
+    assert_eq!(
+        encode_terminal_key(egui::Key::Enter, egui::Modifiers::ALT, false),
+        Some(b"\x1b\r".to_vec())
+    );
+    assert_eq!(
+        encode_terminal_key(egui::Key::Backspace, egui::Modifiers::ALT, false),
+        Some(b"\x1b\x7f".to_vec())
+    );
+
+    // Alt+B sends ESC b via handle_terminal_input
+    let ctx = egui::Context::default();
+    let mut pane = TerminalPane::new_headless();
+    let (tx, rx) = mpsc::channel();
+    pane.pty_writer = Some(tx);
+    let raw = egui::RawInput {
+        events: vec![egui::Event::Key {
+            key: egui::Key::B,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::ALT,
+        }],
+        ..Default::default()
+    };
+    ctx.run_ui(raw, |ui| pane.handle_terminal_input(ui.ctx(), true))
+        .textures_delta
+        .clear();
+    assert_eq!(rx.try_recv().unwrap(), b"\x1bb");
+}

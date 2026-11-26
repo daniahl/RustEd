@@ -88,6 +88,8 @@ pub struct FastEditorState {
     /// Set when the editor just gained focus; causes one repaint where the selection is updated
     /// while `old.is_text_pattern_supported()` is already true.
     pub(crate) pending_accesskit_selection_sync: bool,
+    /// Sticky preferred column for vertical navigation in virtualized mode.
+    pub(crate) preferred_col: Option<usize>,
     /// Cumulative egui pass number when this editor was last rendered.
     /// If the editor was not rendered on the immediately preceding pass (e.g. user switched tabs),
     /// the AccessKit tree dropped this widget's children, so any cached AccessKit row node must be invalidated.
@@ -101,6 +103,7 @@ impl FastEditorState {
         self.virtual_layout_cache = None;
         self.accesskit_row_cache = None;
         self.last_undo_snapshot = None;
+        self.preferred_col = None;
     }
 
     /// Resets undo history to an empty `Undoer` (e.g. after replacing the underlying `PieceTable`).
@@ -502,6 +505,109 @@ pub(super) fn paint_fold_placeholders(
             fg,
         );
     }
+}
+
+/// Resolves the active visual selection range (either mouse selection in terminal mode or caret selection).
+pub(super) fn resolve_selection_range(
+    pointer_moves_caret: bool,
+    mouse_selection: Option<CCursorRange>,
+    cursor_range: CCursorRange,
+    total_chars: usize,
+) -> Option<CCursorRange> {
+    if !pointer_moves_caret {
+        mouse_selection
+            .filter(|r| r.primary != r.secondary)
+            .map(|r| {
+                CCursorRange::two(
+                    CCursor::new(r.secondary.index.0.min(total_chars)),
+                    CCursor::new(r.primary.index.0.min(total_chars)),
+                )
+            })
+    } else if !cursor_range.is_empty() {
+        Some(cursor_range)
+    } else {
+        None
+    }
+}
+
+/// Paints selection highlights, text galley, and inline fold placeholders for the editor viewport.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn paint_editor_contents(
+    ui: &Ui,
+    painter: &egui::Painter,
+    galley: &Arc<Galley>,
+    galley_pos: Pos2,
+    text_clip_rect: Rect,
+    selection_range: Option<CCursorRange>,
+    window: Range<usize>,
+    fold_view: Option<&FoldView>,
+    font_id: &egui::FontId,
+    badge_width: f32,
+) {
+    if let Some(sel_range) = selection_range {
+        // Paint selection rects directly for visible rows instead of calling
+        // `paint_text_selection` on `galley`, which would deep-clone the entire
+        // Galley via `Arc::make_mut` every frame.
+        paint_selection_rows(
+            painter,
+            galley,
+            galley_pos,
+            text_clip_rect,
+            ui.visuals().selection.bg_fill,
+            sel_range,
+            window,
+            fold_view,
+        );
+    }
+
+    painter.galley(galley_pos, Arc::clone(galley), Color32::WHITE);
+
+    if let Some(fv) = fold_view {
+        paint_fold_placeholders(
+            ui,
+            painter,
+            galley,
+            galley_pos,
+            text_clip_rect,
+            fv,
+            font_id,
+            badge_width,
+        );
+    }
+}
+
+/// Checks if the user clicked an inline `...` fold badge and unfolds it if so.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn try_unfold_clicked_badge(
+    ui: &Ui,
+    response: &Response,
+    rect: Rect,
+    galley: &Galley,
+    galley_pos: Pos2,
+    fold_view: Option<&FoldView>,
+    fold_state: Option<&mut FoldState>,
+    badge_width: f32,
+) -> bool {
+    if !response.clicked() {
+        return false;
+    }
+    let (Some(fv), Some(pointer_pos)) = (fold_view, ui.ctx().pointer_interact_pos()) else {
+        return false;
+    };
+    let text_clip = ui.clip_rect().intersect(rect);
+    let Some(doc_line) =
+        hit_test_fold_placeholder(galley, galley_pos, text_clip, fv, pointer_pos, badge_width)
+    else {
+        return false;
+    };
+    if let Some(fs) = fold_state {
+        if fs.unfold_line(doc_line) {
+            response.request_focus();
+            ui.ctx().request_repaint();
+            return true;
+        }
+    }
+    false
 }
 
 /// Determines the inclusive 0-based `(start_line, start_col, end_line)` potentially modified by
@@ -1013,22 +1119,26 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
                 modifiers,
                 ..
             } => {
-                if !text_changed {
-                    self.seed_pre_edit_snapshot(state, cursor_range);
-                }
                 let ccursor = if let Some(cursor) = cursor_range.single() {
+                    let idx = cursor.index.0.min(self.text.char_count());
+                    if idx == 0 {
+                        return EditOutcome::Unchanged;
+                    }
+                    if !text_changed {
+                        self.seed_pre_edit_snapshot(state, cursor_range);
+                    }
                     if modifiers.ctrl {
                         self.text.delete_prev_word(cursor)
+                    } else if idx >= 2 && self.text.slice_chars(idx - 2..idx) == "\r\n" {
+                        self.text.delete_char_range((idx - 2)..idx);
+                        CCursor::new(idx - 2)
                     } else {
-                        let idx = cursor.index.0.min(self.text.char_count());
-                        if idx >= 2 && self.text.slice_chars(idx - 2..idx) == "\r\n" {
-                            self.text.delete_char_range((idx - 2)..idx);
-                            CCursor::new(idx - 2)
-                        } else {
-                            self.text.delete_previous_char(cursor)
-                        }
+                        self.text.delete_previous_char(cursor)
                     }
                 } else {
+                    if !text_changed {
+                        self.seed_pre_edit_snapshot(state, cursor_range);
+                    }
                     self.text.delete_selected(&cursor_range)
                 };
                 EditOutcome::Edited(CCursorRange::one(ccursor))
@@ -1039,23 +1149,27 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
                 modifiers,
                 ..
             } => {
-                if !text_changed {
-                    self.seed_pre_edit_snapshot(state, cursor_range);
-                }
                 let ccursor = if let Some(cursor) = cursor_range.single() {
+                    let idx = cursor.index.0;
+                    let total = self.text.char_count();
+                    if idx >= total {
+                        return EditOutcome::Unchanged;
+                    }
+                    if !text_changed {
+                        self.seed_pre_edit_snapshot(state, cursor_range);
+                    }
                     if modifiers.ctrl {
                         self.text.delete_nxt_word(cursor)
+                    } else if idx + 2 <= total && self.text.slice_chars(idx..idx + 2) == "\r\n" {
+                        self.text.delete_char_range(idx..(idx + 2));
+                        CCursor::new(idx)
                     } else {
-                        let idx = cursor.index.0;
-                        let total = self.text.char_count();
-                        if idx + 2 <= total && self.text.slice_chars(idx..idx + 2) == "\r\n" {
-                            self.text.delete_char_range(idx..(idx + 2));
-                            CCursor::new(idx)
-                        } else {
-                            self.text.delete_next_char(cursor)
-                        }
+                        self.text.delete_next_char(cursor)
                     }
                 } else {
+                    if !text_changed {
+                        self.seed_pre_edit_snapshot(state, cursor_range);
+                    }
                     self.text.delete_selected(&cursor_range)
                 };
                 EditOutcome::Edited(CCursorRange::one(ccursor))
@@ -1322,6 +1436,7 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
         let badge_width = char_width * 3.0 + 10.0;
 
         let (mut state, current_pass) = load_editor_state(ui, self.id);
+        state.virtual_layout_cache = None;
 
         if let Some(fs) = self.fold_state.as_deref_mut() {
             fs.ensure_updated_buffer(self.text, self.text_revision);
@@ -1386,33 +1501,21 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
             .unwrap_or_else(|| CCursorRange::one(CCursor::new(0)));
 
         // Check if the user clicked an inline `...` fold badge to unfold that region.
-        let mut clicked_fold_badge = false;
-        if response.clicked() {
-            if let (Some(fv), Some(pointer_pos)) =
-                (fold_view.as_deref(), ui.ctx().pointer_interact_pos())
-            {
-                let text_clip = ui.clip_rect().intersect(rect);
-                if let Some(doc_line) = hit_test_fold_placeholder(
-                    &galley,
-                    galley_pos,
-                    text_clip,
-                    fv,
-                    pointer_pos,
-                    badge_width,
-                ) {
-                    if let Some(fs) = self.fold_state.as_deref_mut() {
-                        if fs.unfold_line(doc_line) {
-                            clicked_fold_badge = true;
-                            response.request_focus();
-                            let (g, fv_new) = self.layout_with_folds(ui, wrap_width);
-                            galley = g;
-                            fold_view = fv_new;
-                            layout_dirty = true;
-                            ui.ctx().request_repaint();
-                        }
-                    }
-                }
-            }
+        let clicked_fold_badge = try_unfold_clicked_badge(
+            ui,
+            &response,
+            rect,
+            &galley,
+            galley_pos,
+            fold_view.as_deref(),
+            self.fold_state.as_deref_mut(),
+            badge_width,
+        );
+        if clicked_fold_badge {
+            let (g, fv_new) = self.layout_with_folds(ui, wrap_width);
+            galley = g;
+            fold_view = fv_new;
+            layout_dirty = true;
         }
 
         // Pointer interaction (mouse click & drag)
@@ -1643,53 +1746,25 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
             ui.scroll_to_rect(cursor_box, None);
         }
 
-        let selection_range = if !self.pointer_moves_caret {
-            state
-                .mouse_selection
-                .filter(|r| r.primary != r.secondary)
-                .map(|r| {
-                    let total = self.text.char_count();
-                    CCursorRange::two(
-                        CCursor::new(r.secondary.index.0.min(total)),
-                        CCursor::new(r.primary.index.0.min(total)),
-                    )
-                })
-        } else if !cursor_range.is_empty() {
-            Some(cursor_range)
-        } else {
-            None
-        };
+        let selection_range = resolve_selection_range(
+            self.pointer_moves_caret,
+            state.mouse_selection,
+            cursor_range,
+            self.text.char_count(),
+        );
 
-        if let Some(sel_range) = selection_range {
-            // Paint selection rects directly for visible rows instead of calling
-            // `paint_text_selection` on `galley`, which would deep-clone the entire
-            // Galley via `Arc::make_mut` every frame.
-            paint_selection_rows(
-                &painter,
-                &galley,
-                galley_pos,
-                text_clip_rect,
-                ui.visuals().selection.bg_fill,
-                sel_range,
-                0..usize::MAX,
-                fold_view.as_deref(),
-            );
-        }
-
-        painter.galley(galley_pos, Arc::clone(&galley), Color32::WHITE);
-
-        if let Some(fv) = fold_view.as_deref() {
-            paint_fold_placeholders(
-                ui,
-                &painter,
-                &galley,
-                galley_pos,
-                text_clip_rect,
-                fv,
-                &font_id,
-                badge_width,
-            );
-        }
+        paint_editor_contents(
+            ui,
+            &painter,
+            &galley,
+            galley_pos,
+            text_clip_rect,
+            selection_range,
+            0..usize::MAX,
+            fold_view.as_deref(),
+            &font_id,
+            badge_width,
+        );
 
         let cursor_in_view =
             finish_cursor_and_scroll(ui, &mut state, cursor_box, text_clip_rect, has_focus);

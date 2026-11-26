@@ -10,6 +10,7 @@ pub struct AccessKitRowCache {
     pub galley: Arc<Galley>,
     pub row: usize,
     pub bounds: egui::accesskit::Rect,
+    pub x_shift_bits: u32,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -99,6 +100,7 @@ pub(super) fn update_accesskit(
         }
 
         let line_height = ui.text_style_height(&egui::TextStyle::Monospace);
+        let unclamped_row_min_x = galley_pos.x + row.rect().min.x;
         let mut row_min = galley_pos + row.rect().min.to_vec2();
         let mut row_max = galley_pos + row.rect().max.to_vec2();
         if row_max.y - row_min.y < line_height {
@@ -128,6 +130,8 @@ pub(super) fn update_accesskit(
         if row_max.x - row_min.x < 2.0 {
             row_max.x = row_min.x + 2.0;
         }
+        let x_shift = row_min.x - unclamped_row_min_x;
+        let x_shift_bits = x_shift.to_bits();
         let row_bounds = egui::accesskit::Rect {
             x0: row_min.x.into(),
             y0: row_min.y.into(),
@@ -140,6 +144,7 @@ pub(super) fn update_accesskit(
                 Arc::ptr_eq(&c.galley, galley)
                     && c.row == global_row_idx
                     && c.bounds == row_bounds
+                    && c.x_shift_bits == x_shift_bits
             }
             None => false,
         };
@@ -179,11 +184,12 @@ pub(super) fn update_accesskit(
                     let old_len = value.len();
                     value.push(glyph.chr);
                     character_lengths.push((value.len() - old_len) as u8);
-                    character_positions.push(glyph.pos.x - row.rect().min.x);
+                    let gx = ((glyph.pos.x - row.rect().min.x) - x_shift).max(0.0);
+                    character_positions.push(gx);
                     character_widths.push(glyph.advance_width.max(1.0));
                 }
 
-                let end_x = row.rect().width();
+                let end_x = (row.rect().width() - x_shift).max(0.0);
                 value.push(if row.ends_with_newline { '\n' } else { ' ' });
                 character_lengths.push(1);
                 character_positions.push(end_x);
@@ -200,6 +206,7 @@ pub(super) fn update_accesskit(
                     galley: Arc::clone(galley),
                     row: global_row_idx,
                     bounds: row_bounds,
+                    x_shift_bits,
                 });
             }
         }

@@ -3,7 +3,10 @@
 //! Manages pseudo-terminal (PTY) child process execution, streaming I/O, VT100 escape sequence parsing,
 //! screen buffer rendering, and terminal keyboard input forwarding.
 
-use crate::editor::{terminal_id, FastEditor, FastEditorState};
+use crate::{
+    editor::{terminal_id, FastEditor, FastEditorState},
+    piece_table::PieceTable,
+};
 use eframe::egui;
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use std::{
@@ -14,6 +17,7 @@ use std::{
         mpsc, Arc, Mutex,
     },
     thread,
+    time::Duration,
 };
 
 pub const TERM_ROWS: u16 = 30;
@@ -22,6 +26,26 @@ pub const TERM_COLS: u16 = 120;
 pub const TERM_SCROLLBACK_LEN: usize = 2_000;
 /// Size of the read buffer for PTY output in bytes.
 pub const PTY_READ_BUF_SIZE: usize = 4096;
+
+enum PtyWriteCmd {
+    Bytes(Vec<u8>),
+    DelayedBytes(Duration, Vec<u8>),
+}
+
+fn update_dsr_tail(tail: &mut [u8; 3], tail_len: &mut usize, chunk: &[u8]) {
+    if chunk.len() >= 3 {
+        tail.copy_from_slice(&chunk[chunk.len() - 3..]);
+        *tail_len = 3;
+    } else {
+        let mut combined = [0u8; 5];
+        combined[..*tail_len].copy_from_slice(&tail[..*tail_len]);
+        combined[*tail_len..*tail_len + chunk.len()].copy_from_slice(chunk);
+        let total = *tail_len + chunk.len();
+        let keep = total.min(3);
+        tail[..keep].copy_from_slice(&combined[total - keep..total]);
+        *tail_len = keep;
+    }
+}
 
 /// Detects `\x1b[6n` (DSR cursor position request) within `chunk` or split across the
 /// previous chunk's trailing bytes (`tail[..*tail_len]`), updating the trailing buffer.
@@ -48,20 +72,65 @@ pub fn contains_dsr_request(tail: &mut [u8; 3], tail_len: &mut usize, chunk: &[u
         found = true;
     }
 
-    if chunk.len() >= 3 {
-        tail.copy_from_slice(&chunk[chunk.len() - 3..]);
-        *tail_len = 3;
-    } else {
-        let mut combined = [0u8; 5];
-        combined[..*tail_len].copy_from_slice(&tail[..*tail_len]);
-        combined[*tail_len..*tail_len + chunk.len()].copy_from_slice(chunk);
-        let total = *tail_len + chunk.len();
-        let keep = total.min(3);
-        tail[..keep].copy_from_slice(&combined[total - keep..total]);
-        *tail_len = keep;
+    update_dsr_tail(tail, tail_len, chunk);
+    found
+}
+
+/// Processes `chunk` through `parser` while evaluating every `\x1b[6n` (DSR) cursor-position
+/// query at its exact byte position (even when multiple queries or subsequent cursor moves
+/// appear in the same chunk, or when `\x1b[6n` spans a chunk boundary).
+pub fn process_chunk_with_dsr(
+    parser: &mut vt100::Parser,
+    tail: &mut [u8; 3],
+    tail_len: &mut usize,
+    chunk: &[u8],
+) -> Vec<Vec<u8>> {
+    const DSR: &[u8; 4] = b"\x1b[6n";
+    let mut replies = Vec::new();
+    if chunk.is_empty() {
+        return replies;
     }
 
-    found
+    let mut processed = 0usize;
+
+    if *tail_len > 0 {
+        let mut boundary = [0u8; 6];
+        boundary[..*tail_len].copy_from_slice(&tail[..*tail_len]);
+        let prefix_len = chunk.len().min(3);
+        boundary[*tail_len..*tail_len + prefix_len].copy_from_slice(&chunk[..prefix_len]);
+        if let Some(pos) = boundary[..*tail_len + prefix_len]
+            .windows(DSR.len())
+            .position(|w| w == DSR)
+        {
+            let dsr_end_in_chunk = (pos + DSR.len()).saturating_sub(*tail_len);
+            parser.process(&chunk[..dsr_end_in_chunk]);
+            let (row, col) = parser.screen().cursor_position();
+            replies.push(format!("\x1b[{};{}R", row + 1, col + 1).into_bytes());
+            processed = dsr_end_in_chunk;
+        }
+    }
+
+    while processed + DSR.len() <= chunk.len() {
+        if let Some(rel) = chunk[processed..]
+            .windows(DSR.len())
+            .position(|w| w == DSR)
+        {
+            let dsr_end = processed + rel + DSR.len();
+            parser.process(&chunk[processed..dsr_end]);
+            let (row, col) = parser.screen().cursor_position();
+            replies.push(format!("\x1b[{};{}R", row + 1, col + 1).into_bytes());
+            processed = dsr_end;
+        } else {
+            break;
+        }
+    }
+
+    if processed < chunk.len() {
+        parser.process(&chunk[processed..]);
+    }
+
+    update_dsr_tail(tail, tail_len, chunk);
+    replies
 }
 
 pub fn default_shell() -> String {
@@ -94,15 +163,18 @@ pub struct TerminalState {
 
 pub struct TerminalPane {
     pub term: Arc<Mutex<TerminalState>>,
-    pub term_screen_text: String,
+    pub term_screen_text: PieceTable,
+    render_scratch: String,
     pub term_revision: u64,
     pub term_cursor_idx: usize,
     pub rows: u16,
     pub cols: u16,
     pub size_text: String,
     shell_label: String,
+    /// Test-injectable raw byte writer channel (overrides internal `pty_cmd_tx` when `Some`).
     pub pty_writer: Option<mpsc::Sender<Vec<u8>>>,
-    dsr_writer: Arc<Mutex<Option<mpsc::Sender<Vec<u8>>>>>,
+    pty_cmd_tx: Option<mpsc::Sender<PtyWriteCmd>>,
+    dsr_writer: Arc<Mutex<Option<mpsc::Sender<PtyWriteCmd>>>>,
     pub(crate) _pty_master: Option<Box<dyn portable_pty::MasterPty + Send>>,
     pub(crate) _pty_child: Option<Box<dyn portable_pty::Child + Send + Sync>>,
     pub(crate) shutdown: Arc<AtomicBool>,
@@ -120,6 +192,7 @@ impl TerminalPane {
     fn shutdown_session(&mut self) {
         self.shutdown.store(true, Ordering::Relaxed);
         self.pty_writer = None;
+        self.pty_cmd_tx = None;
         self.dsr_writer
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -139,17 +212,28 @@ impl TerminalPane {
     }
 
     pub fn new(ctx: egui::Context, working_dir: Option<&Path>) -> Self {
+        Self::new_with_size(ctx, working_dir, TERM_ROWS, TERM_COLS)
+    }
+
+    pub fn new_with_size(
+        ctx: egui::Context,
+        working_dir: Option<&Path>,
+        rows: u16,
+        cols: u16,
+    ) -> Self {
+        let rows = rows.max(2);
+        let cols = cols.max(10);
         let term = Arc::new(Mutex::new(TerminalState {
             parser: vt100::Parser::new(
-                std::num::NonZeroU16::new(TERM_ROWS).unwrap(),
-                std::num::NonZeroU16::new(TERM_COLS).unwrap(),
+                std::num::NonZeroU16::new(rows).unwrap(),
+                std::num::NonZeroU16::new(cols).unwrap(),
                 TERM_SCROLLBACK_LEN,
             ),
             pty_updated: true,
         }));
         let shutdown = Arc::new(AtomicBool::new(false));
-        let mut pty_writer = None;
-        let dsr_writer_slot: Arc<Mutex<Option<mpsc::Sender<Vec<u8>>>>> =
+        let mut pty_cmd_tx = None;
+        let dsr_writer_slot: Arc<Mutex<Option<mpsc::Sender<PtyWriteCmd>>>> =
             Arc::new(Mutex::new(None));
         let mut pty_master = None;
         let mut pty_child = None;
@@ -158,8 +242,8 @@ impl TerminalPane {
 
         let pty_system = native_pty_system();
         if let Ok(pair) = pty_system.openpty(PtySize {
-            rows: TERM_ROWS,
-            cols: TERM_COLS,
+            rows,
+            cols,
             pixel_width: 0,
             pixel_height: 0,
         }) {
@@ -183,17 +267,29 @@ impl TerminalPane {
             drop(pair.slave);
 
             if let Ok(mut writer) = pair.master.take_writer() {
-                let (tx, rx) = mpsc::channel::<Vec<u8>>();
+                let (tx, rx) = mpsc::channel::<PtyWriteCmd>();
+                let writer_shutdown = Arc::clone(&shutdown);
                 let _ = thread::Builder::new()
                     .name("rusted-pty-writer".to_string())
                     .spawn(move || {
-                        while let Ok(bytes) = rx.recv() {
-                            let _ = writer.write_all(&bytes);
-                            let _ = writer.flush();
+                        while let Ok(cmd) = rx.recv() {
+                            match cmd {
+                                PtyWriteCmd::Bytes(bytes) => {
+                                    let _ = writer.write_all(&bytes);
+                                    let _ = writer.flush();
+                                }
+                                PtyWriteCmd::DelayedBytes(delay, bytes) => {
+                                    thread::sleep(delay);
+                                    if !writer_shutdown.load(Ordering::Relaxed) {
+                                        let _ = writer.write_all(&bytes);
+                                        let _ = writer.flush();
+                                    }
+                                }
+                            }
                         }
                     });
                 *dsr_writer_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx.clone());
-                pty_writer = Some(tx);
+                pty_cmd_tx = Some(tx);
             }
 
             if let Ok(mut reader) = pair.master.try_clone_reader() {
@@ -203,38 +299,41 @@ impl TerminalPane {
                 let _ = thread::Builder::new()
                     .name("rusted-pty-reader".to_string())
                     .spawn(move || {
-                    let mut buf = [0u8; PTY_READ_BUF_SIZE];
-                    let mut dsr_tail = [0u8; 3];
-                    let mut dsr_tail_len = 0usize;
-                    while !shutdown_flag.load(Ordering::Relaxed) {
-                        let Ok(n) = reader.read(&mut buf) else {
-                            break;
-                        };
-                        if n == 0 || shutdown_flag.load(Ordering::Relaxed) {
-                            break;
-                        }
-                        let mut lock = term_clone.lock().unwrap_or_else(|e| e.into_inner());
-                        lock.parser.process(&buf[..n]);
-                        let cpr_reply =
-                            contains_dsr_request(&mut dsr_tail, &mut dsr_tail_len, &buf[..n])
-                                .then(|| {
-                                    let (row, col) = lock.parser.screen().cursor_position();
-                                    format!("\x1b[{};{}R", row + 1, col + 1).into_bytes()
-                                });
-                        let was_updated = std::mem::replace(&mut lock.pty_updated, true);
-                        drop(lock);
-                        if let Some(reply) = cpr_reply {
-                            if let Some(tx) =
-                                dsr_writer.lock().unwrap_or_else(|e| e.into_inner()).as_ref()
-                            {
-                                let _ = tx.send(reply);
+                        let mut buf = [0u8; PTY_READ_BUF_SIZE];
+                        let mut dsr_tail = [0u8; 3];
+                        let mut dsr_tail_len = 0usize;
+                        while !shutdown_flag.load(Ordering::Relaxed) {
+                            let Ok(n) = reader.read(&mut buf) else {
+                                break;
+                            };
+                            if n == 0 || shutdown_flag.load(Ordering::Relaxed) {
+                                break;
+                            }
+                            let mut lock = term_clone.lock().unwrap_or_else(|e| e.into_inner());
+                            let cpr_replies = process_chunk_with_dsr(
+                                &mut lock.parser,
+                                &mut dsr_tail,
+                                &mut dsr_tail_len,
+                                &buf[..n],
+                            );
+                            let was_updated = std::mem::replace(&mut lock.pty_updated, true);
+                            drop(lock);
+                            if !cpr_replies.is_empty() {
+                                if let Some(tx) = dsr_writer
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .as_ref()
+                                {
+                                    for reply in cpr_replies {
+                                        let _ = tx.send(PtyWriteCmd::Bytes(reply));
+                                    }
+                                }
+                            }
+                            if !was_updated {
+                                ctx.request_repaint();
                             }
                         }
-                        if !was_updated {
-                            ctx.request_repaint();
-                        }
-                    }
-                });
+                    });
             }
 
             pty_master = Some(pair.master);
@@ -245,14 +344,16 @@ impl TerminalPane {
 
         Self {
             term,
-            term_screen_text: String::new(),
+            term_screen_text: PieceTable::new(),
+            render_scratch: String::new(),
             term_revision: 0,
             term_cursor_idx: 0,
-            rows: TERM_ROWS,
-            cols: TERM_COLS,
-            size_text: format!("{TERM_COLS}x{TERM_ROWS}"),
+            rows,
+            cols,
+            size_text: format!("{cols}x{rows}"),
             shell_label,
-            pty_writer,
+            pty_writer: None,
+            pty_cmd_tx,
             dsr_writer: dsr_writer_slot,
             _pty_master: pty_master,
             _pty_child: pty_child,
@@ -273,7 +374,8 @@ impl TerminalPane {
                 ),
                 pty_updated: false,
             })),
-            term_screen_text: String::new(),
+            term_screen_text: PieceTable::new(),
+            render_scratch: String::new(),
             term_revision: 0,
             term_cursor_idx: 0,
             rows: TERM_ROWS,
@@ -281,6 +383,7 @@ impl TerminalPane {
             size_text: format!("{TERM_COLS}x{TERM_ROWS}"),
             shell_label: format_shell_label(&shell),
             pty_writer: None,
+            pty_cmd_tx: None,
             dsr_writer: Arc::new(Mutex::new(None)),
             _pty_master: None,
             _pty_child: None,
@@ -325,11 +428,14 @@ impl TerminalPane {
         }
     }
 
-    /// Terminates the current PTY session (if any) and spawns a fresh terminal in `working_dir`.
+    /// Terminates the current PTY session (if any) and spawns a fresh terminal in `working_dir`
+    /// while preserving the current grid dimensions and clearing any stale selection.
     pub fn restart(&mut self, ctx: &egui::Context, working_dir: Option<&Path>) {
         let next_revision = self.term_revision.wrapping_add(1);
+        let (rows, cols) = (self.rows, self.cols);
+        self.clear_terminal_selection(ctx);
         self.shutdown_session();
-        *self = Self::new(ctx.clone(), working_dir);
+        *self = Self::new_with_size(ctx.clone(), working_dir, rows, cols);
         self.term_revision = next_revision;
         self.focus_terminal = true;
     }
@@ -337,6 +443,8 @@ impl TerminalPane {
     pub fn write_to_pty(&mut self, bytes: &[u8]) {
         if let Some(writer) = &self.pty_writer {
             let _ = writer.send(bytes.to_vec());
+        } else if let Some(tx) = &self.pty_cmd_tx {
+            let _ = tx.send(PtyWriteCmd::Bytes(bytes.to_vec()));
         }
     }
 
@@ -368,19 +476,15 @@ impl TerminalPane {
         if !payload.is_empty() {
             self.write_to_pty(&payload);
         }
-        if self._pty_master.is_some() {
+        if self.pty_writer.is_none() {
             // Live ConPTY TUIs (e.g. agy / Ink / crossterm) can miss or absorb `\r`
             // if it arrives in the exact same pipe read as the bracketed-paste terminator.
-            if let Some(tx) = self.pty_writer.clone() {
-                let shutdown = Arc::clone(&self.shutdown);
-                let _ = thread::Builder::new()
-                    .name("rusted-pty-submit".to_string())
-                    .spawn(move || {
-                        thread::sleep(std::time::Duration::from_millis(50));
-                        if !shutdown.load(Ordering::Relaxed) {
-                            let _ = tx.send(b"\r".to_vec());
-                        }
-                    });
+            // Queue the delayed `\r` on the single FIFO PTY writer thread to preserve keystroke order.
+            if let Some(tx) = &self.pty_cmd_tx {
+                let _ = tx.send(PtyWriteCmd::DelayedBytes(
+                    Duration::from_millis(50),
+                    b"\r".to_vec(),
+                ));
             }
         } else {
             self.write_to_pty(b"\r");
@@ -451,6 +555,15 @@ impl TerminalPane {
                             } else {
                                 true
                             }
+                        } else if modifiers.alt && !modifiers.ctrl {
+                            if let Some(alt_byte) = alt_key_byte(*key, modifiers.shift) {
+                                to_send.push(0x1b);
+                                to_send.push(alt_byte);
+                                clear_selection = true;
+                                false
+                            } else {
+                                true
+                            }
                         } else {
                             true
                         }
@@ -489,8 +602,9 @@ impl TerminalPane {
                 lock.pty_updated = false;
                 self.term_cursor_idx = render_vt100_screen_with_scrollback(
                     lock.parser.screen_mut(),
-                    &mut self.term_screen_text,
+                    &mut self.render_scratch,
                 );
+                self.term_screen_text.replace_with(&self.render_scratch);
                 self.term_revision = self.term_revision.wrapping_add(1);
                 true
             } else {
@@ -546,6 +660,7 @@ impl TerminalPane {
                     let output =
                         FastEditor::new(term_id, screen_text, available_size, &mut layouter)
                             .text_revision(term_revision)
+                            .virtualized(true)
                             .pointer_moves_caret(false)
                             .read_only(true)
                             .show(ui);
@@ -578,14 +693,23 @@ pub fn render_vt100_screen(screen: &vt100::Screen) -> (String, usize) {
 
 pub fn render_vt100_screen_into(screen: &vt100::Screen, full_text: &mut String) -> usize {
     let (rows, cols) = screen.size();
+    full_text.clear();
+    full_text.reserve((rows.get() as usize) * (cols.get() as usize + 1));
+    render_vt100_screen_append(screen, full_text, 0)
+}
+
+fn render_vt100_screen_append(
+    screen: &vt100::Screen,
+    full_text: &mut String,
+    prefix_chars: usize,
+) -> usize {
+    let (rows, cols) = screen.size();
     let rows = rows.get();
     let cols = cols.get();
     let (cur_row, cur_col) = screen.cursor_position();
 
-    full_text.clear();
-    full_text.reserve((rows as usize) * (cols as usize + 1));
-    let mut cursor_char_idx = 0;
-    let mut total_chars = 0;
+    let mut cursor_char_idx = prefix_chars;
+    let mut total_chars = prefix_chars;
 
     for (r, line) in screen.rows(0, cols).enumerate() {
         let r_u16 = r as u16;
@@ -679,10 +803,7 @@ pub fn render_vt100_screen_with_scrollback(
     }
 
     screen.set_scrollback(0);
-    let mut active_buf = String::with_capacity(rows_usize * (cols_u16 as usize + 1));
-    let active_cursor = render_vt100_screen_into(screen, &mut active_buf);
-    full_text.push_str(&active_buf);
-    prefix_chars + active_cursor
+    render_vt100_screen_append(screen, full_text, prefix_chars)
 }
 
 /// Encodes non-character terminal keys into VT100/xterm escape sequences, honoring
@@ -699,8 +820,22 @@ pub fn encode_terminal_key(
         + u8::from(modifiers.ctrl) * 4;
 
     match key {
-        egui::Key::Enter => Some(b"\r".to_vec()),
-        egui::Key::Backspace => Some(b"\x7f".to_vec()),
+        egui::Key::Enter => {
+            if modifiers.alt {
+                Some(b"\x1b\r".to_vec())
+            } else if modifiers.shift && !modifiers.ctrl {
+                Some(b"\x1b[13;2u".to_vec())
+            } else {
+                Some(b"\r".to_vec())
+            }
+        }
+        egui::Key::Backspace => {
+            if modifiers.alt {
+                Some(b"\x1b\x7f".to_vec())
+            } else {
+                Some(b"\x7f".to_vec())
+            }
+        }
         egui::Key::Tab if !modifiers.ctrl && !modifiers.command => {
             if modifiers.shift {
                 Some(b"\x1b[Z".to_vec())
@@ -828,4 +963,13 @@ fn ctrl_key_byte(key: egui::Key) -> Option<u8> {
         _ => return None,
     };
     Some(idx)
+}
+
+fn alt_key_byte(key: egui::Key, shift: bool) -> Option<u8> {
+    let base = ctrl_key_byte(key)?;
+    Some(if shift {
+        b'A' + (base - 1)
+    } else {
+        b'a' + (base - 1)
+    })
 }

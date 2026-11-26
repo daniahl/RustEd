@@ -343,12 +343,13 @@ impl TextEditor {
 
         if self.tab == Tab::Editor {
             let folder_input_focused = ctx.memory(|m| m.has_focus(project_folder_input_id()));
-            let (ctrl_s, ctrl_f, f3, fold_cur, unfold_cur, fold_all, unfold_all, ai_explain) =
+            let (ctrl_s, ctrl_f, shift_f3, f3, fold_cur, unfold_cur, fold_all, unfold_all, ai_explain) =
                 ctx.input_mut(|i| {
                     let ctrl_s = i.consume_key(egui::Modifiers::COMMAND, egui::Key::S)
                         || i.consume_key(egui::Modifiers::CTRL, egui::Key::S);
                     let ctrl_f = i.consume_key(egui::Modifiers::COMMAND, egui::Key::F)
                         || i.consume_key(egui::Modifiers::CTRL, egui::Key::F);
+                    let shift_f3 = i.consume_key(egui::Modifiers::SHIFT, egui::Key::F3);
                     let f3 = i.consume_key(egui::Modifiers::NONE, egui::Key::F3);
 
                     let (fold_cur, unfold_cur, fold_all, unfold_all, ai_explain) =
@@ -377,7 +378,8 @@ impl TextEditor {
                             (false, false, false, false, false)
                         };
                     (
-                        ctrl_s, ctrl_f, f3, fold_cur, unfold_cur, fold_all, unfold_all, ai_explain,
+                        ctrl_s, ctrl_f, shift_f3, f3, fold_cur, unfold_cur, fold_all, unfold_all,
+                        ai_explain,
                     )
                 });
             if ctrl_s && self.doc.can_save() {
@@ -386,7 +388,13 @@ impl TextEditor {
             if ctrl_f {
                 self.doc.open_find_dialog(ctx);
             }
-            if f3 {
+            if shift_f3 {
+                if self.doc.find_query.is_empty() {
+                    self.doc.open_find_dialog(ctx);
+                } else {
+                    self.doc.find_prev(ctx);
+                }
+            } else if f3 {
                 if self.doc.find_query.is_empty() {
                     self.doc.open_find_dialog(ctx);
                 } else {
@@ -448,6 +456,9 @@ impl TextEditor {
                         }
                         self.folder_input = self.explorer.folder_path.to_string_lossy().into_owned();
                         self.last_synced_folder = self.folder_input.clone();
+                    } else if resp.lost_focus() {
+                        // Discard uncommitted draft text when focus leaves without pressing Enter.
+                        self.folder_input = self.last_synced_folder.clone();
                     }
 
                     if ui
@@ -550,6 +561,7 @@ impl TextEditor {
 
         match self.tab {
             Tab::Editor => {
+                self.explorer.keyboard_blocked = self.confirm_close_open;
                 self.explorer.show_sidebar(ui, &mut self.doc);
                 if self.focus_editor_pending {
                     self.focus_editor_pending = false;

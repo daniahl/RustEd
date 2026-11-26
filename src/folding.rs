@@ -46,13 +46,111 @@ pub fn extension_uses_hash_comments(ext: &str) -> bool {
     )
 }
 
+/// Lexical rules used by the fold scanner to ignore braces inside comments and string literals.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FoldSyntax {
+    /// `# ...` line comments (Python, TOML, YAML, Shell, Ruby, R).
+    pub hash_comments: bool,
+    /// `// ...` line comments (Rust, C/C++, JS/TS, Go, Java, C#, SCSS, PHP).
+    pub slash_line_comments: bool,
+    /// `/* ... */` block comments.
+    pub block_comments: bool,
+    /// Whether `/* /* */ */` block comments nest (Rust) vs closing at the first `*/` (C/JS/CSS).
+    pub nested_block_comments: bool,
+    /// Whether `'...'` delimits multi-character string literals (Python, JS/TS, Shell, SQL, etc.)
+    /// rather than single-character literals / lifetimes (Rust, C/C++, Java, Go, C#).
+    pub single_quote_strings: bool,
+    /// Whether `r#"..."#` / `br#"..."#` raw strings are recognized (Rust).
+    pub rust_raw_strings: bool,
+}
+
+impl Default for FoldSyntax {
+    fn default() -> Self {
+        Self {
+            hash_comments: false,
+            slash_line_comments: true,
+            block_comments: true,
+            nested_block_comments: true,
+            single_quote_strings: false,
+            rust_raw_strings: true,
+        }
+    }
+}
+
+impl FoldSyntax {
+    /// Syntax profile for hash-comment languages (Python, Shell, YAML, TOML, Ruby, R).
+    pub const fn hash_comment() -> Self {
+        Self {
+            hash_comments: true,
+            slash_line_comments: false,
+            block_comments: false,
+            nested_block_comments: false,
+            single_quote_strings: true,
+            rust_raw_strings: false,
+        }
+    }
+
+    /// Selects lexical folding rules for a file extension (without leading dot).
+    pub fn from_extension(ext: &str) -> Self {
+        match ext.to_ascii_lowercase().as_str() {
+            "rs" => Self::default(),
+            "py" | "toml" | "yaml" | "yml" | "sh" | "bash" | "zsh" | "rb" | "r" => {
+                Self::hash_comment()
+            }
+            "js" | "ts" | "jsx" | "tsx" | "php" => Self {
+                hash_comments: false,
+                slash_line_comments: true,
+                block_comments: true,
+                nested_block_comments: false,
+                single_quote_strings: true,
+                rust_raw_strings: false,
+            },
+            "c" | "h" | "cpp" | "cxx" | "cc" | "hpp" | "cs" | "go" | "java" | "css" | "scss"
+            | "sass" => Self {
+                hash_comments: false,
+                slash_line_comments: true,
+                block_comments: true,
+                nested_block_comments: false,
+                single_quote_strings: false,
+                rust_raw_strings: false,
+            },
+            "sql" => Self {
+                hash_comments: false,
+                slash_line_comments: false,
+                block_comments: true,
+                nested_block_comments: false,
+                single_quote_strings: true,
+                rust_raw_strings: false,
+            },
+            "json" => Self {
+                hash_comments: false,
+                slash_line_comments: false,
+                block_comments: false,
+                nested_block_comments: false,
+                single_quote_strings: false,
+                rust_raw_strings: false,
+            },
+            "lua" | "html" | "htm" | "xml" => Self {
+                hash_comments: false,
+                slash_line_comments: false,
+                block_comments: false,
+                nested_block_comments: false,
+                single_quote_strings: true,
+                rust_raw_strings: false,
+            },
+            _ => Self::default(),
+        }
+    }
+}
+
 /// Streaming fold-range builder that scans lines sequentially without requiring a flattened buffer.
 struct FoldScanner {
     line_idx: usize,
     block_comment_depth: usize,
     in_double_quote: bool,
+    in_single_quote: bool,
     raw_string_hashes: Option<usize>,
-    hash_comments: bool,
+    syntax: FoldSyntax,
     brace_stack: Vec<usize>,
     brace_folds: HashMap<usize, usize>,
     indent_stack: Vec<(usize, usize)>,
@@ -61,13 +159,14 @@ struct FoldScanner {
 }
 
 impl FoldScanner {
-    fn new(hash_comments: bool) -> Self {
+    fn new(syntax: FoldSyntax) -> Self {
         Self {
             line_idx: 0,
             block_comment_depth: 0,
             in_double_quote: false,
+            in_single_quote: false,
             raw_string_hashes: None,
-            hash_comments,
+            syntax,
             brace_stack: Vec::new(),
             brace_folds: HashMap::new(),
             indent_stack: Vec::new(),
@@ -104,7 +203,11 @@ impl FoldScanner {
 
         while i < bytes.len() {
             if self.block_comment_depth > 0 {
-                if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+                if self.syntax.nested_block_comments
+                    && i + 1 < bytes.len()
+                    && bytes[i] == b'/'
+                    && bytes[i + 1] == b'*'
+                {
                     self.block_comment_depth += 1;
                     i += 2;
                 } else if i + 1 < bytes.len() && bytes[i] == b'*' && bytes[i + 1] == b'/' {
@@ -141,20 +244,38 @@ impl FoldScanner {
                 continue;
             }
 
+            if self.in_single_quote {
+                if bytes[i] == b'\\' {
+                    i += 2;
+                } else if bytes[i] == b'\'' {
+                    self.in_single_quote = false;
+                    i += 1;
+                } else {
+                    i += 1;
+                }
+                continue;
+            }
+
             match bytes[i] {
-                b'#' if self.hash_comments => {
+                b'#' if self.syntax.hash_comments => {
                     // Hash line comment (Python, TOML, YAML, Shell, Ruby, R)
                     break;
                 }
-                b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'/' => {
+                b'/' if self.syntax.slash_line_comments
+                    && i + 1 < bytes.len()
+                    && bytes[i + 1] == b'/' =>
+                {
                     // Line comment: ignore rest of line
                     break;
                 }
-                b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'*' => {
+                b'/' if self.syntax.block_comments
+                    && i + 1 < bytes.len()
+                    && bytes[i + 1] == b'*' =>
+                {
                     self.block_comment_depth += 1;
                     i += 2;
                 }
-                b'r' if !self.hash_comments => {
+                b'r' if self.syntax.rust_raw_strings => {
                     // Detect Rust raw string literals: `r"..."`, `r#"..."#`, `br#"..."#`, etc.
                     let valid_prefix = if i == 0 {
                         true
@@ -184,11 +305,26 @@ impl FoldScanner {
                     self.in_double_quote = true;
                     i += 1;
                 }
+                b'\'' if self.syntax.single_quote_strings => {
+                    self.in_single_quote = true;
+                    i += 1;
+                }
                 b'\'' => {
-                    // Skip simple char literals like '{', '}', '\'', '\n' without breaking on
-                    // Rust lifetimes such as `'a` or `'static`.
-                    if i + 3 < bytes.len() && bytes[i + 1] == b'\\' && bytes[i + 3] == b'\'' {
-                        i += 4;
+                    // Skip char literals like '{', '}', '\'', '\n', '\x7b', '\u{7b}' without
+                    // breaking on Rust lifetimes such as `'a` or `'static`.
+                    if i + 2 < bytes.len() && bytes[i + 1] == b'\\' {
+                        if i + 3 < bytes.len() && bytes[i + 3] == b'\'' {
+                            i += 4;
+                        } else {
+                            let max_end = (i + 14).min(bytes.len());
+                            if let Some(rel_close) =
+                                bytes[i + 2..max_end].iter().position(|&b| b == b'\'')
+                            {
+                                i = i + 2 + rel_close + 1;
+                            } else {
+                                i += 1;
+                            }
+                        }
                     } else if i + 2 < bytes.len()
                         && bytes[i + 1] != b'\''
                         && bytes[i + 1] != b'\\'
@@ -281,15 +417,25 @@ impl FoldScanner {
 ///
 /// Returned ranges are sorted by `start_line` with unique `start_line` values.
 pub fn compute_fold_ranges(text: &str) -> Vec<FoldRange> {
-    compute_fold_ranges_with_options(text, false)
+    compute_fold_ranges_with_syntax(text, FoldSyntax::default())
 }
 
 /// Like [`compute_fold_ranges`], optionally ignoring `#` line comments (for Python, TOML, YAML, Shell, etc.).
 pub fn compute_fold_ranges_with_options(text: &str, hash_comments: bool) -> Vec<FoldRange> {
+    let syntax = if hash_comments {
+        FoldSyntax::hash_comment()
+    } else {
+        FoldSyntax::default()
+    };
+    compute_fold_ranges_with_syntax(text, syntax)
+}
+
+/// Like [`compute_fold_ranges`], using an explicit [`FoldSyntax`] lexical profile.
+pub fn compute_fold_ranges_with_syntax(text: &str, syntax: FoldSyntax) -> Vec<FoldRange> {
     if text.is_empty() {
         return Vec::new();
     }
-    let mut scanner = FoldScanner::new(hash_comments);
+    let mut scanner = FoldScanner::new(syntax);
     for line in text.split('\n') {
         scanner.scan_line(line);
     }
@@ -298,7 +444,7 @@ pub fn compute_fold_ranges_with_options(text: &str, hash_comments: bool) -> Vec<
 
 /// Computes foldable line ranges by streaming chunks from an `EditorBuffer` without flattening it.
 pub fn compute_fold_ranges_buffer<T: EditorBuffer>(buffer: &T) -> Vec<FoldRange> {
-    compute_fold_ranges_buffer_with_options(buffer, false)
+    compute_fold_ranges_buffer_with_syntax(buffer, FoldSyntax::default())
 }
 
 /// Like [`compute_fold_ranges_buffer`], optionally ignoring `#` line comments.
@@ -306,7 +452,20 @@ pub fn compute_fold_ranges_buffer_with_options<T: EditorBuffer>(
     buffer: &T,
     hash_comments: bool,
 ) -> Vec<FoldRange> {
-    let mut scanner = FoldScanner::new(hash_comments);
+    let syntax = if hash_comments {
+        FoldSyntax::hash_comment()
+    } else {
+        FoldSyntax::default()
+    };
+    compute_fold_ranges_buffer_with_syntax(buffer, syntax)
+}
+
+/// Like [`compute_fold_ranges_buffer`], using an explicit [`FoldSyntax`] lexical profile.
+pub fn compute_fold_ranges_buffer_with_syntax<T: EditorBuffer>(
+    buffer: &T,
+    syntax: FoldSyntax,
+) -> Vec<FoldRange> {
+    let mut scanner = FoldScanner::new(syntax);
     let mut carry = String::new();
     let mut saw_any = false;
 
@@ -344,7 +503,7 @@ pub fn compute_fold_ranges_buffer_with_options<T: EditorBuffer>(
 #[derive(Clone, Debug, Default)]
 pub struct FoldState {
     cached_revision: Option<u64>,
-    hash_comments: bool,
+    syntax: FoldSyntax,
     ranges: Vec<FoldRange>,
     folded: BTreeSet<usize>,
     fold_version: u64,
@@ -358,8 +517,18 @@ impl FoldState {
 
     /// Configures whether `#` starts a line comment when scanning `{ }` braces.
     pub fn set_hash_comments(&mut self, enabled: bool) {
-        if self.hash_comments != enabled {
-            self.hash_comments = enabled;
+        let syntax = if enabled {
+            FoldSyntax::hash_comment()
+        } else {
+            FoldSyntax::default()
+        };
+        self.set_syntax(syntax);
+    }
+
+    /// Configures the lexical syntax profile used when scanning `{ }` braces.
+    pub fn set_syntax(&mut self, syntax: FoldSyntax) {
+        if self.syntax != syntax {
+            self.syntax = syntax;
             self.cached_revision = None;
         }
     }
@@ -406,7 +575,7 @@ impl FoldState {
         if self.cached_revision == Some(text_revision) {
             return;
         }
-        let ranges = compute_fold_ranges_with_options(text, self.hash_comments);
+        let ranges = compute_fold_ranges_with_syntax(text, self.syntax);
         self.apply_ranges(ranges, Some(text_revision));
     }
 
@@ -417,7 +586,7 @@ impl FoldState {
                 return;
             }
         }
-        let ranges = compute_fold_ranges_buffer_with_options(buffer, self.hash_comments);
+        let ranges = compute_fold_ranges_buffer_with_syntax(buffer, self.syntax);
         self.apply_ranges(ranges, text_revision);
     }
 

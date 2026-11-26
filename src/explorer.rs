@@ -6,11 +6,11 @@
 use crate::{
     app::{SIDEBAR_DEFAULT_WIDTH, SIDEBAR_MIN_WIDTH},
     document::Document,
-    watcher::{path_starts_with, path_strip_prefix, paths_equal},
+    watcher::{path_starts_with, path_strip_prefix, paths_equal, PathKey},
 };
 use eframe::egui;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
 };
@@ -74,8 +74,8 @@ pub fn validate_entry_name(raw_name: &str) -> Result<&str, Option<String>> {
     if name.ends_with('.') {
         return Err(Some(format!("Name cannot end with a dot: {name}")));
     }
-    // Check Windows reserved device names (with or without extension, e.g. `CON`, `NUL.txt`).
-    let stem = name.split('.').next().unwrap_or(name);
+    // Check Windows reserved device names (with or without extension/spaces before dot, e.g. `CON`, `NUL.txt`, `CON .txt`).
+    let stem = name.split('.').next().unwrap_or(name).trim_end();
     let upper = stem.to_ascii_uppercase();
     let is_reserved = matches!(
         upper.as_str(),
@@ -243,25 +243,24 @@ impl FileNode {
 
     pub fn load_children(&mut self) {
         self.children_loaded = true;
-        let mut old_dirs: HashMap<PathBuf, (bool, bool, Vec<FileNode>)> = self
+        let mut old_dirs: HashMap<PathKey, (bool, bool, Vec<FileNode>)> = self
             .children
             .drain(..)
             .filter(|c| c.is_dir && (c.expanded || c.children_loaded))
-            .map(|c| (c.path, (c.expanded, c.children_loaded, c.children)))
+            .map(|c| (PathKey::new(&c.path), (c.expanded, c.children_loaded, c.children)))
             .collect();
 
         if let Ok(entries) = fs::read_dir(&self.path) {
             for entry in entries.flatten() {
                 let path = entry.path();
-                let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
+                let is_dir = entry
+                    .file_type()
+                    .map(|ft| ft.is_dir() || (ft.is_symlink() && path.is_dir()))
+                    .unwrap_or(false);
                 let name = entry.file_name().to_string_lossy().into_owned();
                 let (expanded, children_loaded, children) = if is_dir {
                     old_dirs
-                        .remove(&path)
-                        .or_else(|| {
-                            let key = old_dirs.keys().find(|k| paths_equal(k, &path)).cloned()?;
-                            old_dirs.remove(&key)
-                        })
+                        .remove(&PathKey::new(&path))
                         .unwrap_or((false, false, Vec::new()))
                 } else {
                     (false, false, Vec::new())
@@ -310,14 +309,13 @@ impl FileNode {
 
     /// Walks down loaded directories toward `changed_path` and refreshes the deepest loaded
     /// directory that actually owns the visible change, avoiding scans inside collapsed folders.
-    pub fn refresh_for_path(&mut self, changed_path: &Path, refreshed: &mut Vec<PathBuf>) {
+    pub fn refresh_for_path(&mut self, changed_path: &Path, refreshed: &mut HashSet<PathKey>) {
         if !self.is_dir || !self.children_loaded || !path_starts_with(changed_path, &self.path) {
             return;
         }
         if paths_equal(changed_path, &self.path) {
-            if !refreshed.iter().any(|d| paths_equal(d, &self.path)) {
+            if refreshed.insert(PathKey::new(&self.path)) {
                 self.load_children();
-                refreshed.push(self.path.clone());
             }
             return;
         }
@@ -338,9 +336,8 @@ impl FileNode {
                             .file_name()
                             .is_some_and(|n| n.to_string_lossy() != child.name);
                         if !child.path.exists() || !child.path.is_dir() || name_changed {
-                            if !refreshed.iter().any(|d| paths_equal(d, &self.path)) {
+                            if refreshed.insert(PathKey::new(&self.path)) {
                                 self.load_children();
-                                refreshed.push(self.path.clone());
                             }
                         } else if child.children_loaded {
                             self.children[idx].refresh_for_path(changed_path, refreshed);
@@ -357,19 +354,31 @@ impl FileNode {
                             .file_name()
                             .is_some_and(|n| n.to_string_lossy() != child.name);
                     if (!child.path.exists() || child.path.is_dir() || name_changed)
-                        && !refreshed.iter().any(|d| paths_equal(d, &self.path))
+                        && refreshed.insert(PathKey::new(&self.path))
                     {
                         self.load_children();
-                        refreshed.push(self.path.clone());
                     }
                 }
             }
             None => {
                 // Missing direct child (newly created file/folder, or first level of `mkdir a\b`).
-                if !refreshed.iter().any(|d| paths_equal(d, &self.path)) {
+                if refreshed.insert(PathKey::new(&self.path)) {
                     self.load_children();
-                    refreshed.push(self.path.clone());
                 }
+            }
+        }
+    }
+
+    fn collect_expanded_relative_paths(&self, base: &Path, out: &mut Vec<PathBuf>) {
+        if !self.is_dir || !self.expanded {
+            return;
+        }
+        if let Some(rel) = path_strip_prefix(&self.path, base) {
+            out.push(rel);
+        }
+        for child in &self.children {
+            if child.is_dir && child.expanded {
+                child.collect_expanded_relative_paths(base, out);
             }
         }
     }
@@ -425,6 +434,7 @@ pub fn render_file_node(
     file_to_open: &mut Option<PathBuf>,
 ) {
     let mut label_buf = String::with_capacity(64);
+    let mut scroll_to_selected = false;
     render_file_node_with_buf(
         ui,
         node,
@@ -436,6 +446,7 @@ pub fn render_file_node(
         depth,
         file_to_open,
         &mut label_buf,
+        &mut scroll_to_selected,
     );
 }
 
@@ -451,6 +462,7 @@ fn render_file_node_with_buf(
     depth: usize,
     file_to_open: &mut Option<PathBuf>,
     label_buf: &mut String,
+    scroll_to_selected: &mut bool,
 ) {
     let indent = depth as f32 * 14.0;
     let is_renaming_self = matches!(
@@ -468,20 +480,34 @@ fn render_file_node_with_buf(
         None => false,
     };
 
+    let contains_scroll_target = *scroll_to_selected
+        && selected_node
+            .as_ref()
+            .is_some_and(|(p, _)| path_starts_with(p, &node.path));
+
     let clip_rect = ui.clip_rect();
     let row_height = ui.spacing().interact_size.y.max(18.0) + ui.spacing().item_spacing.y;
     let cursor_y = ui.cursor().min.y;
 
-    // Fast-path: if this node (and its entire subtree) is completely below the visible viewport,
-    // advance cursor by the total height of its visible rows and return immediately.
-    if !has_pending_edit && cursor_y > clip_rect.max.y {
-        let count = node.visible_count();
-        ui.add_space(count as f32 * row_height);
-        return;
+    // Fast-path: if this node (and its entire subtree) is completely below or above the visible
+    // viewport, advance cursor by the total height of its visible rows and return immediately.
+    if !has_pending_edit && !is_renaming_self && !contains_scroll_target {
+        if cursor_y > clip_rect.max.y {
+            let count = node.visible_count();
+            ui.add_space(count as f32 * row_height);
+            return;
+        }
+        let subtree_count = node.visible_count();
+        if cursor_y + subtree_count as f32 * row_height < clip_rect.min.y {
+            ui.add_space(subtree_count as f32 * row_height);
+            return;
+        }
     }
 
-    let row_above_clip =
-        !has_pending_edit && !is_renaming_self && (cursor_y + row_height < clip_rect.min.y);
+    let row_above_clip = !has_pending_edit
+        && !is_renaming_self
+        && !contains_scroll_target
+        && (cursor_y + row_height < clip_rect.min.y);
 
     if node.is_dir {
         if is_renaming_self {
@@ -506,6 +532,10 @@ fn render_file_node_with_buf(
                 label_buf.push_str(prefix);
                 label_buf.push_str(&node.name);
                 let resp = ui.selectable_label(is_selected, label_buf.as_str());
+                if is_selected && *scroll_to_selected {
+                    resp.scroll_to_me(None);
+                    *scroll_to_selected = false;
+                }
                 if resp.clicked() {
                     *selected_node = Some((node.path.clone(), true));
                     node.expanded = !node.expanded;
@@ -581,6 +611,7 @@ fn render_file_node_with_buf(
                     depth + 1,
                     file_to_open,
                     label_buf,
+                    scroll_to_selected,
                 );
             }
         }
@@ -610,6 +641,10 @@ fn render_file_node_with_buf(
             } else {
                 ui.selectable_label(is_selected, &node.name)
             };
+            if is_selected && *scroll_to_selected {
+                resp.scroll_to_me(None);
+                *scroll_to_selected = false;
+            }
             if resp.clicked() {
                 *selected_node = Some((node.path.clone(), false));
                 *file_to_open = Some(node.path.clone());
@@ -649,6 +684,9 @@ pub struct FileExplorer {
     /// File path waiting to open after confirming what to do with a dirty `Untitled` buffer.
     pub pending_open_after_untitled: Option<PathBuf>,
     pub last_fs_error: Option<String>,
+    /// Set by the app when an external modal (e.g. close confirmation) should block sidebar keys.
+    pub keyboard_blocked: bool,
+    scroll_to_selected: bool,
     label_buf: String,
 }
 
@@ -663,6 +701,8 @@ impl FileExplorer {
             pending_delete: None,
             pending_open_after_untitled: None,
             last_fs_error: None,
+            keyboard_blocked: false,
+            scroll_to_selected: false,
             label_buf: String::with_capacity(64),
         }
     }
@@ -670,8 +710,10 @@ impl FileExplorer {
     pub fn open_folder(&mut self, path: PathBuf) {
         self.pending_tree_edit = None;
         self.pending_delete = None;
+        self.pending_open_after_untitled = None;
         self.selected_node = None;
         self.last_fs_error = None;
+        self.scroll_to_selected = false;
         self.folder_path = path.clone();
         self.tree_root = Some(FileNode::new_root(path));
     }
@@ -691,7 +733,7 @@ impl FileExplorer {
             if rescan_all {
                 root.refresh_loaded_subtree();
             } else {
-                let mut refreshed = Vec::new();
+                let mut refreshed = HashSet::new();
                 for path in paths {
                     root.refresh_for_path(path, &mut refreshed);
                 }
@@ -917,7 +959,11 @@ impl FileExplorer {
             }
         }
         self.selected_node = Some((new_path.clone(), false));
-        doc.open_file(ctx, new_path.clone());
+        if doc.is_untitled_dirty() {
+            self.pending_open_after_untitled = Some(new_path.clone());
+        } else {
+            doc.open_file(ctx, new_path.clone());
+        }
         Some(new_path)
     }
 
@@ -966,18 +1012,26 @@ impl FileExplorer {
         doc.update_path_if_renamed(old_path, &new_path, is_dir);
 
         if let Some(root) = &mut self.tree_root {
-            let was_expanded = is_dir
-                && root
-                    .find_mut(old_path)
-                    .map(|n| n.expanded)
-                    .unwrap_or(false);
+            let mut expanded_rel_paths = Vec::new();
+            if is_dir {
+                if let Some(old_node) = root.find_mut(old_path) {
+                    old_node.collect_expanded_relative_paths(old_path, &mut expanded_rel_paths);
+                }
+            }
             if let Some(parent_node) = root.find_mut(parent) {
                 parent_node.load_children();
             }
-            if was_expanded {
-                if let Some(renamed_node) = root.find_mut(&new_path) {
-                    renamed_node.expanded = true;
-                    renamed_node.load_children();
+            for rel in expanded_rel_paths {
+                let target = if rel.as_os_str().is_empty() {
+                    new_path.clone()
+                } else {
+                    new_path.join(rel)
+                };
+                if let Some(node) = root.find_mut(&target) {
+                    node.expanded = true;
+                    if !node.children_loaded {
+                        node.load_children();
+                    }
                 }
             }
         }
@@ -1156,12 +1210,14 @@ impl FileExplorer {
                 None => 0,
             };
             self.selected_node = Some(visible[next].clone());
+            self.scroll_to_selected = true;
         } else if up {
             let prev = match cur_idx {
                 Some(i) => i.saturating_sub(1),
                 None => visible.len() - 1,
             };
             self.selected_node = Some(visible[prev].clone());
+            self.scroll_to_selected = true;
         } else if let Some((sel_path, is_dir)) = self.selected_node.clone() {
             if right && is_dir {
                 if let Some(node) = root.find_mut(&sel_path) {
@@ -1173,6 +1229,7 @@ impl FileExplorer {
                     } else if let Some(first_child) = node.children.first() {
                         self.selected_node =
                             Some((first_child.path.clone(), first_child.is_dir));
+                        self.scroll_to_selected = true;
                     }
                 }
             } else if left {
@@ -1195,6 +1252,7 @@ impl FileExplorer {
                         if !paths_equal(parent, &root.path) && path_starts_with(parent, &root.path)
                         {
                             self.selected_node = Some((parent.to_path_buf(), true));
+                            self.scroll_to_selected = true;
                         }
                     }
                 }
@@ -1243,6 +1301,7 @@ impl FileExplorer {
                 let mut navigate_parent = false;
 
                 let sidebar_keys_active = !doc.find_open
+                    && !self.keyboard_blocked
                     && self.pending_tree_edit.is_none()
                     && self.pending_delete.is_none()
                     && self.pending_open_after_untitled.is_none()
@@ -1261,6 +1320,7 @@ impl FileExplorer {
                 let selected_node = &mut self.selected_node;
                 let pending_edit = &mut self.pending_tree_edit;
                 let label_buf = &mut self.label_buf;
+                let scroll_to_selected = &mut self.scroll_to_selected;
 
                 let area_bottom = ui.max_rect().bottom();
                 egui::ScrollArea::vertical()
@@ -1310,8 +1370,10 @@ impl FileExplorer {
                                     0,
                                     &mut file_to_open,
                                     label_buf,
+                                    scroll_to_selected,
                                 );
                             }
+                            *scroll_to_selected = false;
                             // Empty space below the tree: right-click creates items at the project root.
                             let remaining = (area_bottom - ui.cursor().top()).max(24.0);
                             let empty = ui.allocate_response(

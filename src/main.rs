@@ -40,7 +40,7 @@ fn main() -> eframe::Result {
             {
                 use raw_window_handle::HasWindowHandle as _;
                 if let Ok(handle) = cc.window_handle() {
-                    rusted::platform::suppress_alt_menu_mode(handle.as_raw());
+                    rusted::platform::install_window_hooks(handle.as_raw());
                 }
             }
             Ok(Box::new(TextEditor::new(cc.egui_ctx.clone())))

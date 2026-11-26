@@ -317,22 +317,4 @@ impl EditorBuffer for PieceTable {
     fn slice_chars(&self, char_range: Range<usize>) -> String {
         PieceTable::slice_chars(self, char_range)
     }
-
-    fn delete_prev_word(&mut self, ccursor: CCursor) -> CCursor {
-        let target_start = self.prev_word_ccursor(ccursor);
-        let end = ccursor.index.0.min(self.char_count());
-        if target_start.index.0 < end {
-            self.delete_char_range(target_start.index.0..end);
-        }
-        target_start
-    }
-
-    fn delete_nxt_word(&mut self, ccursor: CCursor) -> CCursor {
-        let start = ccursor.index.0.min(self.char_count());
-        let target_end = self.next_word_ccursor(ccursor);
-        if target_end.index.0 > start {
-            self.delete_char_range(start..target_end.index.0);
-        }
-        CCursor::new(start)
-    }
 }

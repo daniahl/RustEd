@@ -623,3 +623,40 @@ fn test_selected_text_with_lines_single_multi_crlf_and_trailing_newline() {
         Some((2, 3, "beta\r\ngamma".to_string()))
     );
 }
+
+#[test]
+fn test_find_prev_case_insensitive_and_not_found_state() {
+    use rusted::editor::{code_editor_id, FastEditorState};
+
+    let ctx = egui::Context::default();
+    let mut doc = Document::new();
+    doc.set_text("Alpha beta ALPHA gamma alpha");
+    doc.find_query = "alpha".to_string();
+    doc.find_case_sensitive = false;
+
+    let get_sel = |ctx: &egui::Context| {
+        ctx.data(|d| d.get_temp::<FastEditorState>(code_editor_id()))
+            .and_then(|s| s.cursor.char_range())
+            .map(|r| (r.secondary.index.0, r.primary.index.0))
+    };
+
+    // Forward case-insensitive: matches "Alpha" (0..5), then "ALPHA" (11..16)
+    assert!(doc.find_next(&ctx));
+    assert!(!doc.find_not_found);
+    assert_eq!(get_sel(&ctx), Some((0, 5)));
+
+    assert!(doc.find_next(&ctx));
+    assert_eq!(get_sel(&ctx), Some((11, 16)));
+
+    // Backward (Shift+F3): returns to "Alpha" (0..5), then wraps to "alpha" (23..28)
+    assert!(doc.find_prev(&ctx));
+    assert_eq!(get_sel(&ctx), Some((0, 5)));
+
+    assert!(doc.find_prev(&ctx));
+    assert_eq!(get_sel(&ctx), Some((23, 28)));
+
+    // Missing query sets find_not_found
+    doc.find_query = "missing_token".to_string();
+    assert!(!doc.find_next(&ctx));
+    assert!(doc.find_not_found);
+}

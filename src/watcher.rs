@@ -7,7 +7,7 @@
 use eframe::egui;
 use std::{
     borrow::Cow,
-    collections::{HashSet, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     path::{Component, Path, PathBuf},
     sync::{Arc, Mutex},
     time::Duration,
@@ -103,6 +103,62 @@ impl From<&Path> for PathKey {
 impl From<&PathBuf> for PathKey {
     fn from(path: &PathBuf) -> Self {
         Self::new(path)
+    }
+}
+
+/// Windows-aware O(1) map keyed by [`PathKey`] that preserves each entry's original [`PathBuf`].
+#[derive(Clone, Debug)]
+pub struct PathMap<V> {
+    inner: HashMap<PathKey, (PathBuf, V)>,
+}
+
+impl<V> Default for PathMap<V> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<V> PathMap<V> {
+    pub fn new() -> Self {
+        Self {
+            inner: HashMap::new(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    pub fn insert(&mut self, path: PathBuf, value: V) -> Option<V> {
+        let key = PathKey::new(&path);
+        self.inner.insert(key, (path, value)).map(|(_, old)| old)
+    }
+
+    pub fn get(&self, path: &Path) -> Option<&V> {
+        self.inner.get(&PathKey::new(path)).map(|(_, v)| v)
+    }
+
+    pub fn remove(&mut self, path: &Path) -> Option<V> {
+        self.inner.remove(&PathKey::new(path)).map(|(_, v)| v)
+    }
+
+    pub fn contains_key(&self, path: &Path) -> bool {
+        self.inner.contains_key(&PathKey::new(path))
+    }
+
+    pub fn keys(&self) -> impl Iterator<Item = &PathBuf> {
+        self.inner.values().map(|(p, _)| p)
+    }
+
+    pub fn retain<F>(&mut self, mut f: F)
+    where
+        F: FnMut(&PathBuf, &mut V) -> bool,
+    {
+        self.inner.retain(|_, (p, v)| f(p, v));
     }
 }
 
@@ -229,6 +285,9 @@ impl FileWatcher {
         self.root_watch = None;
         self.root_dir = Some(root.to_path_buf());
         self.last_extra_file = None;
+        // Drop any stale queued events from the previous root so a `rescan_all` from the old
+        // watcher doesn't trigger a redundant full rescan of the newly opened folder.
+        let _ = self.shared.lock().unwrap_or_else(|e| e.into_inner()).take();
         if root.is_dir() {
             self.root_watch = DirWatchGuard::spawn(
                 self.ctx.clone(),
@@ -407,15 +466,15 @@ impl DirWatchGuard {
             })
             .ok()?;
 
-        // Wait until the watcher thread has opened `dir_handle` and armed `ReadDirectoryChangesW`
-        // so filesystem writes immediately following `spawn` cannot race ahead of registration.
-        if ready_rx.recv().unwrap_or(false) {
-            Some(Self {
+        // Wait briefly for the watcher thread to open `dir_handle` and arm `ReadDirectoryChangesW`
+        // so immediate local writes don't race ahead of registration, while bounding the wait so
+        // slow or unreachable SMB/network shares cannot stall the UI thread.
+        match ready_rx.recv_timeout(Duration::from_millis(150)) {
+            Ok(true) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Some(Self {
                 stop_event,
                 stopped,
-            })
-        } else {
-            None
+            }),
+            Ok(false) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => None,
         }
     }
 }

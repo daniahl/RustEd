@@ -1051,3 +1051,64 @@ fn demo() {
     );
 }
 
+#[test]
+fn test_fold_syntax_profiles_handle_python_js_and_rust_escapes() {
+    use rusted::folding::{compute_fold_ranges_with_syntax, FoldRange, FoldSyntax};
+
+    // Python: `//` floor division, `/*` glob, and `'{'` single-quoted string must not break folding
+    let py = "\
+def calc():
+    d = {
+        'pattern': '/* {',
+        'half': 10 // 2,
+    }
+    return d
+";
+    let py_ranges = compute_fold_ranges_with_syntax(py, FoldSyntax::from_extension("py"));
+    assert!(
+        py_ranges.contains(&FoldRange {
+            start_line: 1,
+            end_line: 3,
+        }),
+        "Python dict fold should survive `/*`, `//`, and single-quoted `{{`: {py_ranges:?}"
+    );
+
+    // JS: non-nested `/* /* */` block comments and single-quoted `'{'` strings
+    let js = "\
+function run() {
+    /* path /* */
+    const s = '{ not a block';
+    if (true) {
+        return s;
+    }
+}
+";
+    let js_ranges = compute_fold_ranges_with_syntax(js, FoldSyntax::from_extension("js"));
+    assert!(
+        js_ranges.contains(&FoldRange {
+            start_line: 0,
+            end_line: 5,
+        }) && js_ranges.contains(&FoldRange {
+            start_line: 3,
+            end_line: 4,
+        }),
+        "JS folds should handle non-nested block comments and single-quoted strings: {js_ranges:?}"
+    );
+
+    // Rust: unicode char escape `'\u{7b}'` must not corrupt brace matching
+    let rs = "\
+fn brace_char() {
+    let c = '\\u{7b}';
+    let x = c;
+}
+";
+    let rs_ranges = compute_fold_ranges_with_syntax(rs, FoldSyntax::from_extension("rs"));
+    assert!(
+        rs_ranges.contains(&FoldRange {
+            start_line: 0,
+            end_line: 2,
+        }),
+        "Rust unicode char escape should not break brace fold: {rs_ranges:?}"
+    );
+}
+

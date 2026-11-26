@@ -5,14 +5,14 @@
 
 use crate::{
     editor::{self, EditorBuffer, FastEditor},
-    folding::FoldState,
+    folding::{FoldState, FoldSyntax},
     piece_table::{PieceTable, PieceTableSnapshot},
-    watcher::{path_starts_with, path_strip_prefix, paths_equal},
+    watcher::{path_starts_with, path_strip_prefix, paths_equal, PathMap},
 };
 use eframe::egui;
 use egui_extras::syntax_highlighting::{self, CodeTheme};
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::BTreeSet,
     fs,
     path::{Path, PathBuf},
     sync::Arc,
@@ -91,68 +91,59 @@ fn is_transient_fs_error(err: &std::io::Error) -> bool {
     }
 }
 
-fn take_unsaved_entry(
-    map: &mut HashMap<PathBuf, UnsavedFileState>,
-    target: &Path,
-) -> Option<UnsavedFileState> {
-    if let Some(exact) = map.remove(target) {
-        return Some(exact);
-    }
-    let key = map.keys().find(|k| paths_equal(k, target)).cloned()?;
-    map.remove(&key)
-}
-
-fn has_unsaved_entry(map: &HashMap<PathBuf, UnsavedFileState>, target: &Path) -> bool {
-    map.contains_key(target) || map.keys().any(|k| paths_equal(k, target))
-}
-
 fn write_piece_table_atomic(path: &Path, text: &PieceTable) -> std::io::Result<()> {
-    let parent = path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let stem = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("file");
-    let pid = std::process::id();
+    // Preserve symlinks by writing through the link in place rather than replacing the symlink
+    // itself with a newly created regular file via rename.
+    let preserve_in_place = fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink());
 
-    let mut temp_file = None;
-    let mut temp_path = PathBuf::new();
-    for attempt in 0u32..32 {
-        let candidate = parent.join(format!(".{stem}.{pid}.{attempt}.tmp"));
-        match fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&candidate)
-        {
-            Ok(f) => {
-                temp_path = candidate;
-                temp_file = Some(f);
-                break;
+    if !preserve_in_place {
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let stem = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("file");
+        let pid = std::process::id();
+
+        let mut temp_file = None;
+        let mut temp_path = PathBuf::new();
+        for attempt in 0u32..32 {
+            let candidate = parent.join(format!(".{stem}.{pid}.{attempt}.tmp"));
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&candidate)
+            {
+                Ok(f) => {
+                    temp_path = candidate;
+                    temp_file = Some(f);
+                    break;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(_) => break,
             }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(_) => break,
         }
-    }
 
-    if let Some(file) = temp_file {
-        let write_res = (|| -> std::io::Result<()> {
-            let mut writer = std::io::BufWriter::new(file);
-            text.write_to(&mut writer)?;
-            let file = writer.into_inner().map_err(|e| e.into_error())?;
-            file.sync_all()?;
-            Ok(())
-        })();
+        if let Some(file) = temp_file {
+            let write_res = (|| -> std::io::Result<()> {
+                let mut writer = std::io::BufWriter::new(file);
+                text.write_to(&mut writer)?;
+                let file = writer.into_inner().map_err(|e| e.into_error())?;
+                file.sync_all()?;
+                Ok(())
+            })();
 
-        if let Err(err) = write_res {
+            if let Err(err) = write_res {
+                let _ = fs::remove_file(&temp_path);
+                return Err(err);
+            }
+            if fs::rename(&temp_path, path).is_ok() {
+                return Ok(());
+            }
             let _ = fs::remove_file(&temp_path);
-            return Err(err);
         }
-        if fs::rename(&temp_path, path).is_ok() {
-            return Ok(());
-        }
-        let _ = fs::remove_file(&temp_path);
     }
 
     // Fallback to direct write when atomic temp + rename isn't possible (e.g. symlink target or ACLs).
@@ -183,7 +174,7 @@ pub struct Document {
     pub saved_snapshot: Option<PieceTableSnapshot>,
     pub saved_revision: u64,
     pub is_current_dirty: bool,
-    pub unsaved_files: HashMap<PathBuf, UnsavedFileState>,
+    pub unsaved_files: PathMap<UnsavedFileState>,
     pub text_revision: u64,
     pub file_name: String,
     pub language_ext: String,
@@ -205,6 +196,8 @@ pub struct Document {
     pub(crate) status_pos_cache: Option<((usize, usize, usize), String)>,
     pub find_open: bool,
     pub find_query: String,
+    pub find_case_sensitive: bool,
+    pub find_not_found: bool,
     pub focus_find_input: bool,
     pub focus_editor: bool,
     pub disk_stamp: Option<DiskStamp>,
@@ -228,7 +221,7 @@ impl Document {
             saved_snapshot,
             saved_revision: 0,
             is_current_dirty: false,
-            unsaved_files: HashMap::new(),
+            unsaved_files: PathMap::new(),
             text_revision: 0,
             file_name: "Untitled".to_string(),
             language_ext: "txt".to_string(),
@@ -246,6 +239,8 @@ impl Document {
             status_pos_cache: None,
             find_open: false,
             find_query: String::new(),
+            find_case_sensitive: true,
+            find_not_found: false,
             focus_find_input: false,
             focus_editor: false,
             disk_stamp: None,
@@ -358,7 +353,7 @@ impl Document {
 
     pub fn is_file_dirty(&self, path: &Path) -> bool {
         (self.is_current_dirty && !self.path.as_os_str().is_empty() && paths_equal(&self.path, path))
-            || (!self.unsaved_files.is_empty() && has_unsaved_entry(&self.unsaved_files, path))
+            || self.unsaved_files.contains_key(path)
     }
 
     /// Saves the active buffer to `target_path` (Save As), updating `self.path` and metadata on success.
@@ -372,7 +367,7 @@ impl Document {
                 self.last_save_error = None;
                 self.disk_stamp = read_disk_stamp(&target_path);
                 self.external_conflict = None;
-                take_unsaved_entry(&mut self.unsaved_files, &target_path);
+                self.unsaved_files.remove(&target_path);
                 self.refresh_file_metadata();
                 true
             }
@@ -398,7 +393,7 @@ impl Document {
                     self.last_save_error = None;
                     self.disk_stamp = read_disk_stamp(&path);
                     self.external_conflict = None;
-                    take_unsaved_entry(&mut self.unsaved_files, &path);
+                    self.unsaved_files.remove(&path);
                 }
                 Err(err) => {
                     self.last_save_error = Some(format!("Failed to save {}: {err}", self.file_name));
@@ -417,7 +412,7 @@ impl Document {
             FromDisk(String, Option<DiskStamp>),
         }
 
-        let incoming = if let Some(unsaved) = take_unsaved_entry(&mut self.unsaved_files, &chosen) {
+        let incoming = if let Some(unsaved) = self.unsaved_files.remove(&chosen) {
             IncomingFile::Unsaved(Box::new(unsaved))
         } else {
             match fs::read_to_string(&chosen) {
@@ -662,7 +657,7 @@ impl Document {
         if is_dir {
             self.unsaved_files.retain(|k, _| !path_starts_with(k, path));
         } else {
-            take_unsaved_entry(&mut self.unsaved_files, path);
+            self.unsaved_files.remove(path);
         }
 
         if !self.path.as_os_str().is_empty() {
@@ -723,7 +718,7 @@ impl Document {
                         self.unsaved_files.insert(new_path.join(rel), state);
                     }
                 }
-            } else if let Some(state) = take_unsaved_entry(&mut self.unsaved_files, old_path) {
+            } else if let Some(state) = self.unsaved_files.remove(old_path) {
                 self.unsaved_files.insert(new_path.to_path_buf(), state);
             }
         }
@@ -756,7 +751,7 @@ impl Document {
         self.language_name = detect_language_name(&self.path.to_string_lossy());
         self.language_salt = hash_language_salt(&self.language_ext);
         self.folding
-            .set_hash_comments(crate::folding::extension_uses_hash_comments(&self.language_ext));
+            .set_syntax(FoldSyntax::from_extension(&self.language_ext));
         self.status_file_cache = None;
         self.refresh_line_ending();
     }
@@ -785,7 +780,7 @@ impl Document {
                     "{file_name} — {line_count} lines ({:.1} MB)",
                     bytes as f64 / MB as f64
                 );
-            } else if bytes >= 1024 {
+            } else if bytes >= KB {
                 let _ = write!(
                     s,
                     "{file_name} — {line_count} lines ({:.1} KB)",
@@ -847,11 +842,21 @@ impl Document {
             }
         }
         self.find_open = true;
+        self.find_not_found = false;
         self.focus_find_input = true;
     }
 
     pub fn find_next(&mut self, ctx: &egui::Context) -> bool {
+        self.find_in_direction(ctx, false)
+    }
+
+    pub fn find_prev(&mut self, ctx: &egui::Context) -> bool {
+        self.find_in_direction(ctx, true)
+    }
+
+    fn find_in_direction(&mut self, ctx: &egui::Context, backwards: bool) -> bool {
         if self.find_query.is_empty() || self.text.is_empty() {
+            self.find_not_found = !self.find_query.is_empty();
             return false;
         }
         let editor_id = editor::code_editor_id();
@@ -859,26 +864,59 @@ impl Document {
             .data_mut(|d| d.get_temp::<editor::FastEditorState>(editor_id))
             .unwrap_or_default();
 
-        let start_char_idx = state
-            .cursor
-            .char_range()
-            .map(|r| r.primary.index.0.max(r.secondary.index.0))
-            .unwrap_or(0);
-
-        let start_byte = self.text.char_to_byte(start_char_idx);
-        let match_byte = if let Some(mb) = self.text.find_from_byte(&self.find_query, start_byte) {
-            mb
-        } else if start_byte > 0 {
-            match self.text.find_from_byte(&self.find_query, 0) {
-                Some(mb) => mb,
-                None => return false,
-            }
+        let total_chars = self.text.char_count();
+        let match_range = if backwards {
+            let limit_char = state
+                .cursor
+                .char_range()
+                .map(|r| r.primary.index.0.min(r.secondary.index.0))
+                .unwrap_or(total_chars)
+                .min(total_chars);
+            self.text
+                .find_char_range(&self.find_query, limit_char, self.find_case_sensitive, true)
+                .or_else(|| {
+                    if limit_char < total_chars {
+                        self.text.find_char_range(
+                            &self.find_query,
+                            total_chars,
+                            self.find_case_sensitive,
+                            true,
+                        )
+                    } else {
+                        None
+                    }
+                })
         } else {
-            return false;
+            let start_char = state
+                .cursor
+                .char_range()
+                .map(|r| r.primary.index.0.max(r.secondary.index.0))
+                .unwrap_or(0)
+                .min(total_chars);
+            self.text
+                .find_char_range(&self.find_query, start_char, self.find_case_sensitive, false)
+                .or_else(|| {
+                    if start_char > 0 {
+                        self.text.find_char_range(
+                            &self.find_query,
+                            0,
+                            self.find_case_sensitive,
+                            false,
+                        )
+                    } else {
+                        None
+                    }
+                })
         };
 
-        let match_start_char = self.text.byte_to_char(match_byte);
-        let match_end_char = match_start_char + self.find_query.chars().count();
+        let Some(range) = match_range else {
+            self.find_not_found = true;
+            return false;
+        };
+        self.find_not_found = false;
+
+        let match_start_char = range.start;
+        let match_end_char = range.end;
 
         self.folding
             .ensure_updated_buffer(&self.text, Some(self.text_revision));
@@ -1026,26 +1064,22 @@ impl Document {
 
         let mut open = self.find_open;
         let mut trigger_find_next = false;
+        let mut trigger_find_prev = false;
         let mut close_dialog = false;
 
         egui::Window::new("Find")
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
-            .anchor(egui::Align2::RIGHT_TOP, egui::vec2(FIND_DIALOG_OFFSET_X, FIND_DIALOG_OFFSET_Y))
+            .anchor(
+                egui::Align2::RIGHT_TOP,
+                egui::vec2(FIND_DIALOG_OFFSET_X, FIND_DIALOG_OFFSET_Y),
+            )
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     let find_id = egui::Id::unique("find_query_input");
                     if self.focus_find_input {
                         ui.memory_mut(|m| m.request_focus(find_id));
-                        let mut st = egui::text_edit::TextEditState::load(ui.ctx(), find_id)
-                            .unwrap_or_default();
-                        let len = self.find_query.chars().count();
-                        st.cursor.set_char_range(Some(egui::text::CCursorRange::two(
-                            egui::text::CCursor::new(0),
-                            egui::text::CCursor::new(len),
-                        )));
-                        st.store(ui.ctx(), find_id);
                     }
 
                     let resp = egui::TextEdit::singleline(&mut self.find_query)
@@ -1054,6 +1088,10 @@ impl Document {
                         .desired_width(FIND_INPUT_WIDTH)
                         .show(ui)
                         .response;
+
+                    if resp.changed() {
+                        self.find_not_found = false;
+                    }
 
                     if self.focus_find_input {
                         resp.request_focus();
@@ -1068,11 +1106,21 @@ impl Document {
                         self.focus_find_input = false;
                     }
 
-                    let enter_pressed = ui.input(|i| i.key_pressed(egui::Key::Enter));
-                    let escape_pressed = ui.input(|i| i.key_pressed(egui::Key::Escape));
+                    let (enter_pressed, shift_held, escape_pressed) = ui.input(|i| {
+                        (
+                            i.key_pressed(egui::Key::Enter),
+                            i.modifiers.shift,
+                            i.key_pressed(egui::Key::Escape),
+                        )
+                    });
                     if enter_pressed {
                         ui.input_mut(|i| {
-                            i.consume_key(egui::Modifiers::NONE, egui::Key::Enter);
+                            let mods = if shift_held {
+                                egui::Modifiers::SHIFT
+                            } else {
+                                egui::Modifiers::NONE
+                            };
+                            i.consume_key(mods, egui::Key::Enter);
                         });
                     }
                     if escape_pressed {
@@ -1082,23 +1130,52 @@ impl Document {
                     }
 
                     if ui
-                        .add_enabled(!self.find_query.is_empty(), egui::Button::new("Find"))
-                        .on_hover_text("Find (Enter)")
+                        .selectable_label(self.find_case_sensitive, "Aa")
+                        .on_hover_text("Match Case")
                         .clicked()
-                        || (enter_pressed && !self.find_query.is_empty())
+                    {
+                        self.find_case_sensitive = !self.find_case_sensitive;
+                        self.find_not_found = false;
+                    }
+
+                    if ui
+                        .add_enabled(!self.find_query.is_empty(), egui::Button::new("Prev"))
+                        .on_hover_text("Find Previous (Shift+F3)")
+                        .clicked()
+                        || (enter_pressed && shift_held && !self.find_query.is_empty())
+                    {
+                        trigger_find_prev = true;
+                    }
+
+                    if ui
+                        .add_enabled(!self.find_query.is_empty(), egui::Button::new("Find"))
+                        .on_hover_text("Find Next (Enter / F3)")
+                        .clicked()
+                        || (enter_pressed && !shift_held && !self.find_query.is_empty())
                     {
                         trigger_find_next = true;
-                        close_dialog = true;
                     }
 
                     if escape_pressed {
                         close_dialog = true;
                     }
                 });
+                if self.find_not_found {
+                    ui.colored_label(ui.visuals().warn_fg_color, "No matches found");
+                }
             });
+
+        if trigger_find_prev {
+            if self.find_prev(ctx) {
+                close_dialog = true;
+            }
+        } else if trigger_find_next && self.find_next(ctx) {
+            close_dialog = true;
+        }
 
         if close_dialog {
             open = false;
+            self.find_not_found = false;
             editor::request_editor_focus(ctx, editor::code_editor_id());
             ctx.input_mut(|i| {
                 i.events.retain(|e| {
@@ -1113,10 +1190,6 @@ impl Document {
             });
         }
         self.find_open = open;
-
-        if trigger_find_next {
-            self.find_next(ctx);
-        }
     }
 
     /// Rebuilds the per-row logical line-number table only when the editor's galley changed.

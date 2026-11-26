@@ -1290,3 +1290,71 @@ fn test_untitled_dirty_tracking_save_as_and_undo_across_disk_reload() {
 
     let _ = fs::remove_dir_all(&temp_dir);
 }
+
+#[test]
+fn test_shift_f3_find_prev_and_no_match_keeps_find_dialog_open() {
+    let temp_dir =
+        std::env::temp_dir().join(format!("rusted_shift_f3_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    let ctx = egui::Context::default();
+    let mut app = TextEditor::new_headless(&temp_dir);
+    app.doc.set_text("one two one three one");
+    app.doc.find_query = "one".to_string();
+
+    // F3 finds first "one" (0..3), then second "one" (8..11)
+    let press_f3 = |shift: bool| egui::RawInput {
+        events: vec![egui::Event::Key {
+            key: egui::Key::F3,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: if shift {
+                egui::Modifiers::SHIFT
+            } else {
+                egui::Modifiers::NONE
+            },
+        }],
+        ..Default::default()
+    };
+    let get_sel = |ctx: &egui::Context| {
+        ctx.data(|d| d.get_temp::<FastEditorState>(rusted::editor::code_editor_id()))
+            .and_then(|s| s.cursor.char_range())
+            .map(|r| (r.secondary.index.0, r.primary.index.0))
+    };
+
+    let _ = run_ui(&ctx, press_f3(false), |ui| app.update_ui(ui));
+    assert_eq!(get_sel(&ctx), Some((0, 3)));
+    let _ = run_ui(&ctx, press_f3(false), |ui| app.update_ui(ui));
+    assert_eq!(get_sel(&ctx), Some((8, 11)));
+
+    // Shift+F3 moves back to (0..3), then wraps back to (18..21)
+    let _ = run_ui(&ctx, press_f3(true), |ui| app.update_ui(ui));
+    assert_eq!(get_sel(&ctx), Some((0, 3)));
+    let _ = run_ui(&ctx, press_f3(true), |ui| app.update_ui(ui));
+    assert_eq!(get_sel(&ctx), Some((18, 21)));
+
+    // Searching for a missing term via Enter keeps the Find dialog open with find_not_found set
+    app.doc.open_find_dialog(&ctx);
+    app.doc.find_query = "does_not_exist".to_string();
+    let _ = run_ui(&ctx, egui::RawInput::default(), |ui| app.update_ui(ui));
+    let _ = run_ui(
+        &ctx,
+        egui::RawInput {
+            events: vec![egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            ..Default::default()
+        },
+        |ui| app.update_ui(ui),
+    );
+    assert!(app.doc.find_open, "Find dialog should stay open when no match is found");
+    assert!(app.doc.find_not_found);
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
