@@ -2,7 +2,7 @@
 
 #[cfg(windows)]
 mod win {
-    use std::sync::Mutex;
+    use std::cell::RefCell;
     use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
     use windows::Win32::Graphics::Gdi::{CreateBitmap, DeleteObject, HBITMAP, HGDIOBJ};
     use windows::Win32::UI::Accessibility::NotifyWinEvent;
@@ -32,19 +32,20 @@ mod win {
         pre_activated: bool,
     }
 
-    static CARET: Mutex<CaretState> = Mutex::new(CaretState {
-        hwnd: 0,
-        bitmap: 0,
-        x: 0,
-        y: 0,
-        w: 0,
-        h: 0,
-        created_w: 0,
-        created_h: 0,
-        window_focused: false,
-        caret_created: false,
-        pre_activated: false,
-    });
+    // Win32 window subclassing and caret APIs are strictly main-thread-affine; `thread_local!`
+    // with `try_borrow_mut()` avoids atomic locking on every frame and cannot deadlock if an
+    // accessibility hook dispatches a synchronous message on the UI thread.
+    std::thread_local! {
+        static CARET: RefCell<CaretState> = RefCell::new(CaretState::default());
+    }
+
+    #[inline]
+    fn with_caret<R>(f: impl FnOnce(&mut CaretState) -> R) -> Option<R> {
+        CARET
+            .try_with(|cell| cell.try_borrow_mut().ok().map(|mut s| f(&mut s)))
+            .ok()
+            .flatten()
+    }
 
     unsafe fn apply_caret(state: &mut CaretState) -> Option<HWND> {
         if state.hwnd == 0 || !state.window_focused || state.w <= 0 || state.h <= 0 {
@@ -119,17 +120,15 @@ mod win {
             // `WM_SETFOCUS`. Pre-notify `accesskit_windows` via `WM_EXITMENULOOP` so its tree
             // reports `is_host_focused = true` when UIA queries `GetFocus()` during foreground
             // activation.
-            if let Ok(mut state) = CARET.lock() {
+            with_caret(|state| {
                 state.pre_activated = true;
-            }
+            });
             let _ = unsafe { DefSubclassProc(hwnd, WM_EXITMENULOOP, WPARAM(0), LPARAM(0)) };
         }
         if msg == WM_SETFOCUS {
-            let was_pre_activated = CARET
-                .lock()
-                .ok()
-                .map(|mut state| std::mem::replace(&mut state.pre_activated, false))
-                .unwrap_or(false);
+            let was_pre_activated =
+                with_caret(|state| std::mem::replace(&mut state.pre_activated, false))
+                    .unwrap_or(false);
             if was_pre_activated {
                 // Balance the synthetic `WM_EXITMENULOOP` above and reset `accesskit_windows`
                 // focus state to `false` first so the real `WM_SETFOCUS` transitions
@@ -138,7 +137,7 @@ mod win {
             }
         }
         if msg == WM_NCDESTROY {
-            if let Ok(mut state) = CARET.lock() {
+            with_caret(|state| {
                 if state.caret_created {
                     let _ = unsafe { DestroyCaret() };
                 }
@@ -146,28 +145,29 @@ mod win {
                     let _ = unsafe { DeleteObject(HGDIOBJ(state.bitmap as *mut _)) };
                 }
                 *state = CaretState::default();
-            }
+            });
             let _ = unsafe { RemoveWindowSubclass(hwnd, Some(subclass_proc), SUBCLASS_ID) };
         }
         let res = unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) };
         if msg == WM_SETFOCUS {
-            let notify_hwnd = CARET.lock().ok().and_then(|mut state| {
+            let notify_hwnd = with_caret(|state| {
                 state.window_focused = true;
                 state.caret_created = false;
-                unsafe { apply_caret(&mut state) }
-            });
+                unsafe { apply_caret(state) }
+            })
+            .flatten();
             if let Some(h) = notify_hwnd {
                 unsafe { notify_caret(h) };
             }
         } else if msg == WM_KILLFOCUS {
-            if let Ok(mut state) = CARET.lock() {
+            with_caret(|state| {
                 state.window_focused = false;
                 state.pre_activated = false;
                 if state.caret_created {
                     let _ = unsafe { DestroyCaret() };
                     state.caret_created = false;
                 }
-            }
+            });
         }
         res
     }
@@ -176,10 +176,10 @@ mod win {
         if let raw_window_handle::RawWindowHandle::Win32(h) = handle {
             let hwnd = HWND(h.hwnd.get() as *mut _);
             let focused = unsafe { GetForegroundWindow() == hwnd };
-            if let Ok(mut state) = CARET.lock() {
+            with_caret(|state| {
                 state.hwnd = hwnd.0 as isize;
                 state.window_focused = focused;
-            }
+            });
             unsafe {
                 let _ = SetWindowSubclass(hwnd, Some(subclass_proc), SUBCLASS_ID, 0);
             }
@@ -187,7 +187,7 @@ mod win {
     }
 
     pub fn update_caret(x: i32, y: i32, w: i32, h: i32, force_notify: bool) {
-        let notify_hwnd = CARET.lock().ok().and_then(|mut state| {
+        let notify_hwnd = with_caret(|state| {
             let changed = force_notify
                 || !state.caret_created
                 || state.x != x
@@ -199,11 +199,12 @@ mod win {
             state.w = w;
             state.h = h;
             if changed && state.window_focused {
-                unsafe { apply_caret(&mut state) }
+                unsafe { apply_caret(state) }
             } else {
                 None
             }
-        });
+        })
+        .flatten();
         if let Some(h) = notify_hwnd {
             unsafe { notify_caret(h) };
         }

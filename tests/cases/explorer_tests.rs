@@ -557,8 +557,40 @@ fn test_request_delete_prompts_when_dirty_and_keyboard_nav_moves_selection() {
     assert!(f1.exists());
     explorer.pending_delete = None;
 
-    // ArrowDown navigates through visible nodes (alpha -> b.txt -> c.txt)
+    // RequestDeleteNode on clean directory also prompts instead of silently trashing
+    explorer.handle_tree_action(
+        &ctx,
+        &mut doc,
+        TreeAction::RequestDeleteNode {
+            path: sub.clone(),
+            is_dir: true,
+        },
+    );
+    assert_eq!(explorer.pending_delete, Some((sub.clone(), true)));
+    assert!(sub.exists());
+    explorer.pending_delete = None;
+
+    // Unfocused sidebar ignores Delete and ArrowDown so background keys never delete files
     let mut labels = Vec::new();
+    explorer.selected_node = Some((f2.clone(), false));
+    run_sidebar_frame(
+        &ctx,
+        &mut explorer,
+        &mut doc,
+        vec![egui::Event::Key {
+            key: egui::Key::Delete,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }],
+        &mut labels,
+    );
+    assert!(f2.exists(), "Delete must be ignored when explorer does not have focus");
+    explorer.selected_node = None;
+
+    // Focus explorer tree, then ArrowDown navigates through visible nodes (alpha -> b.txt -> c.txt)
+    rusted::explorer::request_explorer_focus(&ctx);
     let key_down = || egui::Event::Key {
         key: egui::Key::ArrowDown,
         physical_key: None,

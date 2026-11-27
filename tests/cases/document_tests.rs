@@ -660,3 +660,175 @@ fn test_find_prev_case_insensitive_and_not_found_state() {
     assert!(!doc.find_next(&ctx));
     assert!(doc.find_not_found);
 }
+
+#[test]
+fn test_open_file_rejects_binary_and_invalid_utf8_and_save_all_detects_stashed_conflict() {
+    let dir = std::env::temp_dir().join(format!("rusted_doc_guards_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let ctx = egui::Context::default();
+    let mut doc = Document::new();
+    let good = dir.join("good.txt");
+    let bin = dir.join("artifact.bin");
+    let bad_utf8 = dir.join("invalid.txt");
+    std::fs::write(&good, "clean utf8").unwrap();
+    std::fs::write(&bin, b"ELF\x00\x01\x02binary").unwrap();
+    std::fs::write(&bad_utf8, [0xFF, 0xFE, 0xFD]).unwrap();
+
+    doc.open_file(&ctx, good.clone());
+    assert_eq!(doc.text, "clean utf8");
+
+    // Binary file is rejected without clobbering active document
+    doc.open_file(&ctx, bin);
+    assert_eq!(doc.text, "clean utf8");
+    assert!(doc
+        .last_save_error
+        .as_deref()
+        .is_some_and(|e| e.contains("binary")));
+
+    // Invalid UTF-8 file is rejected cleanly
+    doc.open_file(&ctx, bad_utf8);
+    assert_eq!(doc.text, "clean utf8");
+    assert!(doc
+        .last_save_error
+        .as_deref()
+        .is_some_and(|e| e.contains("UTF-8")));
+
+    // Stashed file modified externally on disk must NOT be overwritten by save_all()
+    let other = dir.join("other.txt");
+    std::fs::write(&other, "other").unwrap();
+    doc.set_text("local unsaved edit");
+    doc.is_current_dirty = true;
+    doc.open_file(&ctx, other);
+    assert!(doc.unsaved_files.contains_key(&good));
+
+    // Simulate external AI CLI tool writing to `good` while stashed
+    std::fs::write(&good, "external cli update on disk!").unwrap();
+    assert!(
+        !doc.save_all(),
+        "save_all must refuse to overwrite externally modified stashed file"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&good).unwrap(),
+        "external cli update on disk!",
+        "disk content must remain intact on conflict"
+    );
+    assert!(
+        doc.unsaved_files.contains_key(&good),
+        "stashed edits must remain preserved so user can resolve conflict"
+    );
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows::core::PCWSTR;
+        use windows::Win32::Storage::FileSystem::{
+            GetFileAttributesW, SetFileAttributesW, FILE_ATTRIBUTE_HIDDEN,
+        };
+
+        let hidden = dir.join(".hidden_env");
+        std::fs::write(&hidden, "KEY=1").unwrap();
+        let wide: Vec<u16> = hidden.as_os_str().encode_wide().chain([0]).collect();
+        unsafe {
+            SetFileAttributesW(PCWSTR(wide.as_ptr()), FILE_ATTRIBUTE_HIDDEN).unwrap();
+        }
+        let mut hdoc = Document::new();
+        hdoc.open_file(&ctx, hidden.clone());
+        hdoc.set_text("KEY=2");
+        hdoc.is_current_dirty = true;
+        hdoc.save_current_file();
+        assert!(!hdoc.is_current_dirty, "saving hidden file should succeed");
+        assert_eq!(std::fs::read_to_string(&hidden).unwrap(), "KEY=2");
+        let attrs = unsafe { GetFileAttributesW(PCWSTR(wide.as_ptr())) };
+        assert_ne!(
+            attrs & FILE_ATTRIBUTE_HIDDEN.0,
+            0,
+            "ReplaceFileW atomic save should preserve FILE_ATTRIBUTE_HIDDEN"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_external_write_matching_dirty_buffer_and_clean_view_state_preserved() {
+    use rusted::{
+        document::DiskSyncResult,
+        editor::{code_editor_id, FastEditorState},
+        PieceTable,
+    };
+
+    // 1. PieceTable::to_arc_str reuses original buffer without reallocation when unedited
+    let pt = PieceTable::from_str("zero copy arc");
+    let a1 = pt.to_arc_str();
+    let a2 = pt.to_arc_str();
+    assert!(std::sync::Arc::ptr_eq(&a1, &a2));
+    assert_eq!(&*a1, "zero copy arc");
+
+    let dir = std::env::temp_dir().join(format!("rusted_doc_sync_view_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let file_a = dir.join("a.rs");
+    let file_b = dir.join("b.rs");
+    std::fs::write(&file_a, "fn a() {\n    let x = 1;\n    let y = 2;\n}\n").unwrap();
+    std::fs::write(&file_b, "fn b() {}\n").unwrap();
+
+    let ctx = egui::Context::default();
+    let mut doc = Document::new();
+    doc.open_file(&ctx, file_a.clone());
+
+    // 2. Clean file view state (cursor + folds) is remembered when switching to file_b and back
+    doc.folding
+        .ensure_updated_buffer(&doc.text, Some(doc.text_revision));
+    assert!(doc.folding.fold_line(0));
+    ctx.data_mut(|d| {
+        let mut st = d.get_temp::<FastEditorState>(code_editor_id()).unwrap_or_default();
+        st.cursor.set_char_range(Some(egui::text::CCursorRange::one(
+            egui::text::CCursor::new(5),
+        )));
+        d.insert_temp(code_editor_id(), st);
+    });
+    doc.open_file(&ctx, file_b.clone());
+    assert_eq!(doc.file_name, "b.rs");
+    doc.open_file(&ctx, file_a.clone());
+    assert_eq!(doc.file_name, "a.rs");
+    assert!(doc.folding.is_folded(0), "clean file fold state should restore");
+    let restored_cursor = ctx
+        .data(|d| d.get_temp::<FastEditorState>(code_editor_id()))
+        .and_then(|s| s.cursor.char_range())
+        .map(|r| r.primary.index.0);
+    assert_eq!(restored_cursor, Some(5), "clean file cursor should restore");
+
+    // 3. External tool writes matching text to disk while buffer is dirty -> clears dirty & updates saved_snapshot
+    doc.set_text("fn a() { /* synced */ }\n");
+    doc.is_current_dirty = true;
+    std::fs::write(&file_a, "fn a() { /* synced */ }\n").unwrap();
+    assert_eq!(doc.sync_with_disk(&ctx, false), DiskSyncResult::Unchanged);
+    assert!(
+        !doc.is_current_dirty,
+        "sync_with_disk must clear dirty flag when disk now matches buffer"
+    );
+    assert!(
+        doc.saved_snapshot
+            .as_ref()
+            .is_some_and(|snap| doc.text.matches_snapshot(snap)),
+        "saved_snapshot must update to match the synced disk contents"
+    );
+
+    // 4. Same check when restoring a stashed dirty file whose content now matches disk
+    doc.set_text("fn a() { /* stashed */ }\n");
+    doc.is_current_dirty = true;
+    doc.open_file(&ctx, file_b.clone());
+    assert!(doc.unsaved_files.contains_key(&file_a));
+    std::fs::write(&file_a, "fn a() { /* stashed */ }\n").unwrap();
+    doc.open_file(&ctx, file_a.clone());
+    assert!(
+        !doc.is_current_dirty,
+        "opening a stashed file whose content now matches disk must clear dirty flag"
+    );
+    assert_eq!(doc.external_conflict, None);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

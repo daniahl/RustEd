@@ -5,7 +5,7 @@
 
 use crate::{
     document::{DiskSyncResult, Document},
-    explorer::{FileExplorer, PendingTreeEdit, TreeAction},
+    explorer::{explorer_tree_id, request_explorer_focus, FileExplorer, PendingTreeEdit, TreeAction},
     terminal::TerminalPane,
     watcher::{path_starts_with, path_strip_prefix, paths_equal, FileWatcher},
 };
@@ -60,11 +60,21 @@ impl TextEditor {
     }
 
     pub fn new(ctx: egui::Context) -> Self {
-        Self::new_with_folder(ctx, folder_from_args(std::env::args().skip(1)))
+        let (folder, initial_file) = startup_paths_from_args(std::env::args().skip(1));
+        Self::new_with_paths(ctx, folder, initial_file)
     }
 
     /// Creates the app showing `folder` (or the current directory when `None`).
     pub fn new_with_folder(ctx: egui::Context, folder: Option<PathBuf>) -> Self {
+        Self::new_with_paths(ctx, folder, None)
+    }
+
+    /// Creates the app showing `folder` and optionally opening `initial_file` at startup.
+    pub fn new_with_paths(
+        ctx: egui::Context,
+        folder: Option<PathBuf>,
+        initial_file: Option<PathBuf>,
+    ) -> Self {
         ctx.set_zoom_factor(1.2);
         ctx.global_style_mut(|s| {
             s.scroll_animation = egui::style::ScrollAnimation::none();
@@ -76,14 +86,14 @@ impl TextEditor {
         let initial_folder = folder
             .or_else(|| std::env::current_dir().ok())
             .unwrap_or_else(|| PathBuf::from("."));
-        let terminal = TerminalPane::new(ctx.clone(), Some(&initial_folder));
-        let watcher = Some(FileWatcher::new(ctx, &initial_folder));
+        let terminal = TerminalPane::new_lazy();
+        let watcher = Some(FileWatcher::new(ctx.clone(), &initial_folder));
         let explorer = FileExplorer::new(initial_folder);
         let folder_input = explorer.folder_path.to_string_lossy().into_owned();
         let last_synced_folder = explorer.folder_path.to_string_lossy().into_owned();
         let doc = Document::new();
 
-        Self {
+        let mut app = Self {
             tab: Tab::Editor,
             doc,
             explorer,
@@ -94,7 +104,11 @@ impl TextEditor {
             focus_editor_pending: true,
             confirm_close_open: false,
             allow_close: false,
+        };
+        if let Some(file_path) = initial_file {
+            app.open_file(&ctx, file_path);
         }
+        app
     }
 
     pub fn new_headless(folder: &Path) -> Self {
@@ -119,8 +133,13 @@ impl TextEditor {
     }
 
     pub fn open_file(&mut self, ctx: &egui::Context, chosen: PathBuf) {
-        self.explorer.selected_node = Some((chosen.clone(), false));
-        self.doc.open_file(ctx, chosen);
+        if self.doc.is_untitled_dirty() {
+            self.explorer.pending_open_after_untitled = Some(chosen);
+            ctx.request_repaint();
+        } else {
+            self.explorer.selected_node = Some((chosen.clone(), false));
+            self.doc.open_file(ctx, chosen);
+        }
     }
 
     pub fn handle_tree_action(&mut self, ctx: &egui::Context, action: TreeAction) {
@@ -147,6 +166,16 @@ impl TextEditor {
         self.doc.path.to_string_lossy().into_owned()
     }
 
+    fn ensure_terminal_started(&mut self, ctx: &egui::Context) {
+        let cwd = &self.explorer.folder_path;
+        let working_dir = if cwd.is_dir() {
+            Some(cwd.as_path())
+        } else {
+            None
+        };
+        self.terminal.ensure_started(ctx, working_dir);
+    }
+
     /// Sends the current editor selection to the integrated terminal as an AI Explain prompt,
     /// switches focus to the terminal tab, and submits it with Enter.
     /// Returns `true` when a non-empty selection was sent.
@@ -155,6 +184,7 @@ impl TextEditor {
         else {
             return false;
         };
+        self.ensure_terminal_started(ctx);
         let filename = self.explain_filename();
         let prompt = format_ai_explain_prompt(&filename, from_line, to_line, &selected_text);
         self.tab = Tab::Terminal;
@@ -217,20 +247,37 @@ impl TextEditor {
         }
     }
 
+    pub fn save_active_file_as(&mut self) -> bool {
+        let start_dir = self
+            .doc
+            .path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty() && p.is_dir())
+            .unwrap_or(&self.explorer.folder_path);
+        let default_name =
+            (!self.doc.path.as_os_str().is_empty()).then_some(self.doc.file_name.as_str());
+        let Some(dest) = pick_save_file_named(start_dir, default_name) else {
+            return false;
+        };
+        if self.doc.save_current_file_as(dest.clone()) {
+            self.explorer.selected_node = Some((dest.clone(), false));
+            self.explorer.refresh_watched_paths(&[dest], false);
+            return true;
+        }
+        false
+    }
+
     pub fn save_active_file(&mut self) -> bool {
         if !self.doc.can_save() {
             return true;
         }
-        if self.doc.is_untitled_dirty() {
-            let Some(dest) = pick_save_file(&self.explorer.folder_path) else {
-                return false;
-            };
-            if self.doc.save_current_file_as(dest.clone()) {
-                self.explorer.selected_node = Some((dest.clone(), false));
-                self.explorer.refresh_watched_paths(&[dest], false);
-                return true;
-            }
-            return false;
+        let missing_parent = self
+            .doc
+            .path
+            .parent()
+            .is_some_and(|p| !p.as_os_str().is_empty() && !p.is_dir());
+        if self.doc.is_untitled_dirty() || missing_parent {
+            return self.save_active_file_as();
         }
         self.doc.save_current_file();
         !self.doc.is_current_dirty
@@ -341,48 +388,123 @@ impl TextEditor {
             };
         }
 
+        let toggle_explorer_focus = if !self.doc.find_open
+            && !self.confirm_close_open
+            && self.explorer.pending_tree_edit.is_none()
+            && self.explorer.pending_delete.is_none()
+            && self.explorer.pending_open_after_untitled.is_none()
+        {
+            ctx.input_mut(|i| {
+                let cs = egui::Modifiers {
+                    ctrl: true,
+                    shift: true,
+                    ..Default::default()
+                };
+                let cmds = egui::Modifiers {
+                    command: true,
+                    shift: true,
+                    ..Default::default()
+                };
+                i.consume_key(cs, egui::Key::E) || i.consume_key(cmds, egui::Key::E)
+            })
+        } else {
+            false
+        };
+        if toggle_explorer_focus {
+            if self.tab == Tab::Editor && ctx.memory(|m| m.has_focus(explorer_tree_id())) {
+                self.focus_editor_pending = true;
+            } else {
+                self.tab = Tab::Editor;
+                self.focus_editor_pending = false;
+                self.doc.focus_editor = false;
+                self.explorer.ensure_default_selection(&self.doc.path);
+                request_explorer_focus(ctx);
+            }
+            ctx.request_repaint();
+        }
+
         if self.tab == Tab::Editor {
             let folder_input_focused = ctx.memory(|m| m.has_focus(project_folder_input_id()));
-            let (ctrl_s, ctrl_f, shift_f3, f3, fold_cur, unfold_cur, fold_all, unfold_all, ai_explain) =
-                ctx.input_mut(|i| {
-                    let ctrl_s = i.consume_key(egui::Modifiers::COMMAND, egui::Key::S)
-                        || i.consume_key(egui::Modifiers::CTRL, egui::Key::S);
-                    let ctrl_f = i.consume_key(egui::Modifiers::COMMAND, egui::Key::F)
-                        || i.consume_key(egui::Modifiers::CTRL, egui::Key::F);
-                    let shift_f3 = i.consume_key(egui::Modifiers::SHIFT, egui::Key::F3);
-                    let f3 = i.consume_key(egui::Modifiers::NONE, egui::Key::F3);
+            let (
+                ctrl_shift_s,
+                ctrl_s,
+                ctrl_f,
+                shift_f3,
+                f3,
+                fold_cur,
+                unfold_cur,
+                fold_all,
+                unfold_all,
+                ai_explain,
+            ) = ctx.input_mut(|i| {
+                let ctrl_shift = egui::Modifiers {
+                    ctrl: true,
+                    shift: true,
+                    ..Default::default()
+                };
+                let cmd_shift = egui::Modifiers {
+                    command: true,
+                    shift: true,
+                    ..Default::default()
+                };
+                let ctrl_shift_s = i.consume_key(cmd_shift, egui::Key::S)
+                    || i.consume_key(ctrl_shift, egui::Key::S);
+                let ctrl_s = !ctrl_shift_s
+                    && (i.consume_key(egui::Modifiers::COMMAND, egui::Key::S)
+                        || i.consume_key(egui::Modifiers::CTRL, egui::Key::S));
+                let ctrl_f = i.consume_key(egui::Modifiers::COMMAND, egui::Key::F)
+                    || i.consume_key(egui::Modifiers::CTRL, egui::Key::F);
+                let shift_f3 = i.consume_key(egui::Modifiers::SHIFT, egui::Key::F3);
+                let f3 = i.consume_key(egui::Modifiers::NONE, egui::Key::F3);
 
-                    let (fold_cur, unfold_cur, fold_all, unfold_all, ai_explain) =
-                        if !self.doc.find_open
-                            && !self.confirm_close_open
-                            && self.explorer.pending_tree_edit.is_none()
-                            && self.explorer.pending_delete.is_none()
-                            && self.explorer.pending_open_after_untitled.is_none()
-                            && !folder_input_focused
-                        {
-                            let alt = egui::Modifiers::ALT;
-                            let alt_shift = egui::Modifiers {
-                                alt: true,
-                                shift: true,
-                                ..Default::default()
-                            };
-                            // Check Alt+Shift before Alt because egui's `consume_key` matches
-                            // logically and can treat Shift as optional on arrow keys.
-                            let fold_all = i.consume_key(alt_shift, egui::Key::ArrowLeft);
-                            let unfold_all = i.consume_key(alt_shift, egui::Key::ArrowRight);
-                            let fold_cur = i.consume_key(alt, egui::Key::ArrowLeft);
-                            let unfold_cur = i.consume_key(alt, egui::Key::ArrowRight);
-                            let ai_explain = i.consume_key(alt, egui::Key::E);
-                            (fold_cur, unfold_cur, fold_all, unfold_all, ai_explain)
-                        } else {
-                            (false, false, false, false, false)
-                        };
-                    (
-                        ctrl_s, ctrl_f, shift_f3, f3, fold_cur, unfold_cur, fold_all, unfold_all,
-                        ai_explain,
-                    )
-                });
-            if ctrl_s && self.doc.can_save() {
+                let (fold_cur, unfold_cur, fold_all, unfold_all, ai_explain) = if !self
+                    .doc
+                    .find_open
+                    && !self.confirm_close_open
+                    && self.explorer.pending_tree_edit.is_none()
+                    && self.explorer.pending_delete.is_none()
+                    && self.explorer.pending_open_after_untitled.is_none()
+                    && !folder_input_focused
+                {
+                    let alt = egui::Modifiers::ALT;
+                    let alt_shift = egui::Modifiers {
+                        alt: true,
+                        shift: true,
+                        ..Default::default()
+                    };
+                    // Check Alt+Shift before Alt because egui's `consume_key` matches
+                    // logically and can treat Shift as optional on arrow keys.
+                    let fold_all = i.consume_key(alt_shift, egui::Key::ArrowLeft);
+                    let unfold_all = i.consume_key(alt_shift, egui::Key::ArrowRight);
+                    let fold_cur = i.consume_key(alt, egui::Key::ArrowLeft);
+                    let unfold_cur = i.consume_key(alt, egui::Key::ArrowRight);
+                    let ai_explain = i.consume_key(alt, egui::Key::E);
+                    if ai_explain {
+                        // Suppress any accompanying printable `Event::Text("e")` synthesized by
+                        // winit on Alt+E so it never mutates the buffer when selection is empty.
+                        i.events
+                            .retain(|e| !matches!(e, egui::Event::Text(t) if t.eq_ignore_ascii_case("e")));
+                    }
+                    (fold_cur, unfold_cur, fold_all, unfold_all, ai_explain)
+                } else {
+                    (false, false, false, false, false)
+                };
+                (
+                    ctrl_shift_s,
+                    ctrl_s,
+                    ctrl_f,
+                    shift_f3,
+                    f3,
+                    fold_cur,
+                    unfold_cur,
+                    fold_all,
+                    unfold_all,
+                    ai_explain,
+                )
+            });
+            if ctrl_shift_s {
+                self.save_active_file_as();
+            } else if ctrl_s && self.doc.can_save() {
                 self.save_active_file();
             }
             if ctrl_f {
@@ -481,6 +603,14 @@ impl TextEditor {
                         self.save_active_file();
                     }
 
+                    if ui
+                        .button("Save As")
+                        .on_hover_text("Save As (Ctrl+Shift+S)")
+                        .clicked()
+                    {
+                        self.save_active_file_as();
+                    }
+
                     if ui.button("Find").on_hover_text("Find (Ctrl+F)").clicked() {
                         self.doc.open_find_dialog(ctx);
                     }
@@ -572,6 +702,7 @@ impl TextEditor {
                 self.doc.show_editor(ui, panel_frame);
             }
             Tab::Terminal => {
+                self.ensure_terminal_started(ctx);
                 self.terminal.show(ui, panel_frame);
             }
         }
@@ -589,24 +720,52 @@ pub fn format_ai_explain_prompt(
     format!("Explain {filename}:{from_line}-{to_line}: {selected_text}")
 }
 
-/// Returns the first command-line argument that names an existing folder, made absolute.
-/// Non-folder arguments (flags, files, missing paths) are ignored.
-pub fn folder_from_args<I: IntoIterator<Item = String>>(args: I) -> Option<PathBuf> {
-    args.into_iter().map(PathBuf::from).find(|p| p.is_dir()).map(|p| {
-        // A bare Windows drive ("G:") is drive-relative, i.e. the current directory on that
-        // drive. When given as an argument the user means the drive root ("G:\").
-        let mut parts = p.components();
-        if let (Some(std::path::Component::Prefix(prefix)), None) = (parts.next(), parts.next()) {
-            let mut root = prefix.as_os_str().to_os_string();
-            root.push(std::path::MAIN_SEPARATOR_STR);
-            return PathBuf::from(root);
+fn make_arg_path_absolute(p: PathBuf) -> PathBuf {
+    // A bare Windows drive ("G:") is drive-relative, i.e. the current directory on that
+    // drive. When given as an argument the user means the drive root ("G:\").
+    let mut parts = p.components();
+    if let (Some(std::path::Component::Prefix(prefix)), None) = (parts.next(), parts.next()) {
+        let mut root = prefix.as_os_str().to_os_string();
+        root.push(std::path::MAIN_SEPARATOR_STR);
+        return PathBuf::from(root);
+    }
+    if p.is_absolute() {
+        p
+    } else {
+        std::path::absolute(&p)
+            .or_else(|_| std::env::current_dir().map(|cwd| cwd.join(&p)))
+            .unwrap_or(p)
+    }
+}
+
+/// Resolves optional `(folder, file)` startup arguments from the command line, made absolute.
+/// If a file argument is given without a folder argument, the file's parent directory is used as
+/// the project folder.
+pub fn startup_paths_from_args<I: IntoIterator<Item = String>>(
+    args: I,
+) -> (Option<PathBuf>, Option<PathBuf>) {
+    let mut folder = None;
+    let mut file = None;
+    for raw in args {
+        let candidate = PathBuf::from(&raw);
+        if folder.is_none() && candidate.is_dir() {
+            folder = Some(make_arg_path_absolute(candidate));
+        } else if file.is_none() && candidate.is_file() {
+            file = Some(make_arg_path_absolute(candidate));
         }
-        if p.is_absolute() {
-            p
-        } else {
-            std::env::current_dir().map_or(p.clone(), |cwd| cwd.join(&p))
+        if folder.is_some() && file.is_some() {
+            break;
         }
-    })
+    }
+    if folder.is_none() {
+        if let Some(ref f) = file {
+            folder = f
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty() && p.is_dir())
+                .map(Path::to_path_buf);
+        }
+    }
+    (folder, file)
 }
 
 /// Shows the native folder-selection dialog, starting at `start_dir` when it exists.
@@ -620,9 +779,16 @@ fn pick_folder(start_dir: &Path) -> Option<PathBuf> {
 
 /// Shows the native Save As dialog, starting at `start_dir` when it exists.
 pub(crate) fn pick_save_file(start_dir: &Path) -> Option<PathBuf> {
+    pick_save_file_named(start_dir, None)
+}
+
+fn pick_save_file_named(start_dir: &Path, default_name: Option<&str>) -> Option<PathBuf> {
     let mut dialog = rfd::FileDialog::new().set_title("Save file as");
     if start_dir.is_dir() {
         dialog = dialog.set_directory(start_dir);
+    }
+    if let Some(name) = default_name.filter(|s| !s.is_empty()) {
+        dialog = dialog.set_file_name(name);
     }
     dialog.save_file()
 }

@@ -865,6 +865,17 @@ impl PieceTable {
         s
     }
 
+    /// Returns the full buffer contents as an `Arc<str>`, cloning `original` in O(1) without
+    /// allocation when the table is an unmodified single original piece.
+    pub fn to_arc_str(&self) -> Arc<str> {
+        if let [p] = self.pieces.as_slice() {
+            if p.buffer == BufferType::Original && p.start == 0 && p.length == self.original.len() {
+                return Arc::clone(&self.original);
+            }
+        }
+        Arc::<str>::from(self.build_string())
+    }
+
     /// Streams all piece slices directly to `writer` without flattening the buffer in memory.
     pub fn write_to<W: std::io::Write>(&self, mut writer: W) -> std::io::Result<()> {
         for p in self.pieces.iter() {
@@ -1550,67 +1561,151 @@ impl PieceTable {
             return Some(match_start..match_start + needle_chars);
         }
 
-        // Non-ASCII case-insensitive search: compare Unicode lowercased char sequences so
-        // multi-codepoint case folds (e.g. 'İ') produce accurate original char ranges.
+        // Non-ASCII case-insensitive search: stream pieces without flattening the buffer so
+        // multi-codepoint case folds (e.g. 'İ') produce accurate original char ranges in O(needle) memory.
         let needle_lower: Vec<char> = needle.chars().flat_map(char::to_lowercase).collect();
-        if needle_lower.is_empty() {
+        let nlen = needle_lower.len();
+        if nlen == 0 {
             return None;
         }
-        self.with_str(|s| {
-            let mut lower_chars: Vec<char> = Vec::with_capacity(s.len());
-            let mut orig_char_idx: Vec<usize> = Vec::with_capacity(s.len());
-            for (ci, ch) in s.chars().enumerate() {
-                for lc in ch.to_lowercase() {
-                    lower_chars.push(lc);
-                    orig_char_idx.push(ci);
-                }
-            }
-            let nlen = needle_lower.len();
-            if lower_chars.len() < nlen {
+
+        if backwards {
+            let limit = start_char.min(self.total_chars);
+            if limit == 0 || self.pieces.is_empty() {
                 return None;
             }
-            if backwards {
-                let limit = start_char.min(self.total_chars);
-                let mut pos = lower_chars.len() - nlen;
-                loop {
-                    let orig_start = orig_char_idx[pos];
-                    let at_orig_boundary = pos == 0 || orig_char_idx[pos - 1] != orig_start;
-                    let end_at_orig_boundary = pos + nlen == lower_chars.len()
-                        || orig_char_idx[pos + nlen] != orig_char_idx[pos + nlen - 1];
-                    if orig_start < limit
-                        && at_orig_boundary
-                        && end_at_orig_boundary
-                        && lower_chars[pos..pos + nlen] == needle_lower[..]
-                    {
-                        let orig_end = orig_char_idx[pos + nlen - 1] + 1;
-                        return Some(orig_start..orig_end);
+            let max_end_char = (limit - 1).saturating_add(nlen).min(self.total_chars);
+            let end_hint = self.locate_char(max_end_char);
+            let mut idx = end_hint.idx;
+            let mut piece_char_start = end_hint.char_start;
+            let mut window: std::collections::VecDeque<(char, usize)> =
+                std::collections::VecDeque::with_capacity(nlen + 8);
+            let mut evicted_orig: Option<usize> = None;
+            let mut lc_buf = ['\0'; 4];
+
+            loop {
+                let p = &self.pieces[idx];
+                let take_chars = max_end_char
+                    .saturating_sub(piece_char_start)
+                    .min(p.char_count);
+                if take_chars > 0 {
+                    let text = p.get_text(&self.original, &self.added);
+                    let byte_end = if take_chars == p.char_count {
+                        p.length
+                    } else {
+                        p.char_to_byte_offset_indexed(
+                            &self.original,
+                            &self.added,
+                            &self.orig_checkpoints,
+                            take_chars,
+                        )
+                    };
+                    let mut ci = piece_char_start + take_chars;
+                    for ch in text[..byte_end].chars().rev() {
+                        ci -= 1;
+                        let mut lc_count = 0usize;
+                        for lc in ch.to_lowercase() {
+                            if lc_count < lc_buf.len() {
+                                lc_buf[lc_count] = lc;
+                                lc_count += 1;
+                            }
+                        }
+                        for k in (0..lc_count).rev() {
+                            window.push_back((lc_buf[k], ci));
+                        }
+                        while window.len() > nlen + 1 {
+                            evicted_orig = window.pop_front().map(|(_, orig)| orig);
+                        }
+                        if ci < limit && window.len() >= nlen {
+                            let start_pos = window.len() - nlen;
+                            let orig_last = window[start_pos].1;
+                            let prev_orig = if start_pos > 0 {
+                                Some(window[start_pos - 1].1)
+                            } else {
+                                evicted_orig
+                            };
+                            if prev_orig != Some(orig_last)
+                                && window
+                                    .iter()
+                                    .skip(start_pos)
+                                    .map(|(c, _)| *c)
+                                    .eq(needle_lower.iter().rev().copied())
+                            {
+                                return Some(ci..(orig_last + 1));
+                            }
+                        }
                     }
-                    if pos == 0 {
-                        break;
-                    }
-                    pos -= 1;
                 }
-                None
-            } else {
-                for pos in 0..=lower_chars.len() - nlen {
-                    let orig_start = orig_char_idx[pos];
-                    if orig_start < start_char {
-                        continue;
-                    }
-                    let at_orig_boundary = pos == 0 || orig_char_idx[pos - 1] != orig_start;
-                    let end_at_orig_boundary = pos + nlen == lower_chars.len()
-                        || orig_char_idx[pos + nlen] != orig_char_idx[pos + nlen - 1];
-                    if at_orig_boundary
-                        && end_at_orig_boundary
-                        && lower_chars[pos..pos + nlen] == needle_lower[..]
-                    {
-                        let orig_end = orig_char_idx[pos + nlen - 1] + 1;
-                        return Some(orig_start..orig_end);
-                    }
+                if idx == 0 {
+                    break;
                 }
-                None
+                idx -= 1;
+                piece_char_start -= self.pieces[idx].char_count;
             }
-        })
+            None
+        } else {
+            let clamped_start = start_char.min(self.total_chars);
+            if clamped_start >= self.total_chars || self.pieces.is_empty() {
+                return None;
+            }
+            let start_hint = self.locate_char(clamped_start);
+            let mut ci = start_hint.char_start;
+            let mut window: std::collections::VecDeque<(char, usize)> =
+                std::collections::VecDeque::with_capacity(nlen + 8);
+            let mut evicted_orig: Option<usize> = None;
+
+            for (piece_offset, p) in self.pieces[start_hint.idx..].iter().enumerate() {
+                let skip_chars = if piece_offset == 0 {
+                    clamped_start.saturating_sub(ci)
+                } else {
+                    0
+                };
+                if skip_chars >= p.char_count {
+                    ci += p.char_count;
+                    continue;
+                }
+                let text = p.get_text(&self.original, &self.added);
+                let byte_off = if skip_chars > 0 {
+                    p.char_to_byte_offset_indexed(
+                        &self.original,
+                        &self.added,
+                        &self.orig_checkpoints,
+                        skip_chars,
+                    )
+                } else {
+                    0
+                };
+                ci += skip_chars;
+                for ch in text[byte_off..].chars() {
+                    for lc in ch.to_lowercase() {
+                        window.push_back((lc, ci));
+                    }
+                    while window.len() > nlen + 1 {
+                        evicted_orig = window.pop_front().map(|(_, orig)| orig);
+                    }
+                    if window.len() >= nlen {
+                        let start_pos = window.len() - nlen;
+                        let orig_start = window[start_pos].1;
+                        let prev_orig = if start_pos > 0 {
+                            Some(window[start_pos - 1].1)
+                        } else {
+                            evicted_orig
+                        };
+                        if prev_orig != Some(orig_start)
+                            && window
+                                .iter()
+                                .skip(start_pos)
+                                .map(|(c, _)| *c)
+                                .eq(needle_lower.iter().copied())
+                        {
+                            return Some(orig_start..(ci + 1));
+                        }
+                    }
+                    ci += 1;
+                }
+            }
+            None
+        }
     }
 }
 
@@ -1751,6 +1846,36 @@ impl PieceTable {
     /// Deletes the character range `start..end`.
     pub fn delete_char_range(&mut self, range: Range<usize>) {
         self.delete(range);
+    }
+
+    /// Restores full-text content as a single `Original` piece while preserving the append-only
+    /// `added` buffer and `added_epoch` so later `PieceTableSnapshot`s from this table remain
+    /// valid across Undo/Redo transitions (e.g. undoing and redoing across a disk reload).
+    pub fn restore_full_text(&mut self, text: &Arc<str>) {
+        let byte_len = text.len();
+        let (char_count, line_feed_cnt, checkpoints) = scan_str_with_checkpoints(text);
+
+        self.original = Arc::clone(text);
+        self.orig_checkpoints = Arc::from(checkpoints);
+        self.added_piece_bytes = 0;
+        self.hint.set(PieceHint::default());
+        let pieces = Arc::make_mut(&mut self.pieces);
+        pieces.clear();
+        if byte_len > 0 {
+            pieces.push(Piece {
+                buffer: BufferType::Original,
+                start: 0,
+                length: byte_len,
+                char_count,
+                line_feed_cnt,
+                char_start: 0,
+                nl_start: 0,
+            });
+        }
+        self.total_chars = char_count;
+        self.total_bytes = byte_len;
+        self.total_line_feeds = line_feed_cnt;
+        *self.cached_text.borrow_mut() = None;
     }
 
     /// Replaces the entire buffer contents with `text`.

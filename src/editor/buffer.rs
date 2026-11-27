@@ -174,6 +174,14 @@ pub trait EditorBuffer {
         s
     }
 
+    /// Returns `true` if `char_idx` falls strictly between `'\r'` and `'\n'` of a CRLF pair.
+    fn is_mid_crlf(&self, char_idx: usize) -> bool {
+        if char_idx == 0 || char_idx >= self.char_count() {
+            return false;
+        }
+        self.slice_chars((char_idx - 1)..(char_idx + 1)) == "\r\n"
+    }
+
     fn prev_word_ccursor(&self, ccursor: CCursor) -> CCursor {
         let end = ccursor.index.0.min(self.char_count());
         if end == 0 {
@@ -284,7 +292,7 @@ impl EditorBuffer for PieceTable {
         match snapshot {
             UndoSnapshot::PieceTable(snap) => self.restore_snapshot(snap),
             UndoSnapshot::FullText(text) => {
-                self.replace_with(text);
+                self.restore_full_text(text);
                 true
             }
         }

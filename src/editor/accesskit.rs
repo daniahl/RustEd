@@ -23,6 +23,8 @@ pub(super) fn update_accesskit(
     rect: Rect,
     text_clip_rect: Rect,
     has_focus: bool,
+    read_only: bool,
+    accessible_label: Option<&str>,
     cursor_in_view: bool,
     galley_row_idx: usize,
     global_row_idx: usize,
@@ -30,6 +32,12 @@ pub(super) fn update_accesskit(
 ) {
     ui.ctx().accesskit_node_builder(id, |builder| {
         builder.set_role(egui::accesskit::Role::MultilineTextInput);
+        if read_only {
+            builder.set_read_only();
+        }
+        if let Some(label) = accessible_label {
+            builder.set_label(label);
+        }
         builder.set_bounds(egui::accesskit::Rect {
             x0: rect.min.x.into(),
             y0: rect.min.y.into(),
@@ -71,6 +79,9 @@ pub(super) fn update_accesskit(
                         node: row_accesskit_id,
                         character_index: target_idx,
                     };
+                    // Expose `anchor == focus` so `ITextRangeProvider::GetBoundingRectangles`
+                    // returns the 1px active caret rect for Windows Magnifier tracking rather
+                    // than jumping to the start/union of wide horizontal selections.
                     builder.set_text_selection(egui::accesskit::TextSelection {
                         anchor: focus_pos,
                         focus: focus_pos,

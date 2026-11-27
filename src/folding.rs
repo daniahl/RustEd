@@ -62,6 +62,8 @@ pub struct FoldSyntax {
     pub single_quote_strings: bool,
     /// Whether `r#"..."#` / `br#"..."#` raw strings are recognized (Rust).
     pub rust_raw_strings: bool,
+    /// Whether `"..."` / `'...'` string literals may span unescaped newlines.
+    pub multiline_quotes: bool,
 }
 
 impl Default for FoldSyntax {
@@ -73,6 +75,7 @@ impl Default for FoldSyntax {
             nested_block_comments: true,
             single_quote_strings: false,
             rust_raw_strings: true,
+            multiline_quotes: true,
         }
     }
 }
@@ -87,6 +90,21 @@ impl FoldSyntax {
             nested_block_comments: false,
             single_quote_strings: true,
             rust_raw_strings: false,
+            multiline_quotes: false,
+        }
+    }
+
+    /// Neutral syntax profile for prose, Markdown, and plain text where quotes and C comments
+    /// should not swallow braces across lines.
+    pub const fn plain_text() -> Self {
+        Self {
+            hash_comments: false,
+            slash_line_comments: false,
+            block_comments: false,
+            nested_block_comments: false,
+            single_quote_strings: false,
+            rust_raw_strings: false,
+            multiline_quotes: false,
         }
     }
 
@@ -94,16 +112,28 @@ impl FoldSyntax {
     pub fn from_extension(ext: &str) -> Self {
         match ext.to_ascii_lowercase().as_str() {
             "rs" => Self::default(),
-            "py" | "toml" | "yaml" | "yml" | "sh" | "bash" | "zsh" | "rb" | "r" => {
-                Self::hash_comment()
-            }
-            "js" | "ts" | "jsx" | "tsx" | "php" => Self {
+            "py" | "toml" | "yaml" | "yml" | "rb" | "r" => Self::hash_comment(),
+            "sh" | "bash" | "zsh" => Self {
+                multiline_quotes: true,
+                ..Self::hash_comment()
+            },
+            "js" | "ts" | "jsx" | "tsx" => Self {
                 hash_comments: false,
                 slash_line_comments: true,
                 block_comments: true,
                 nested_block_comments: false,
                 single_quote_strings: true,
                 rust_raw_strings: false,
+                multiline_quotes: false,
+            },
+            "php" => Self {
+                hash_comments: true,
+                slash_line_comments: true,
+                block_comments: true,
+                nested_block_comments: false,
+                single_quote_strings: true,
+                rust_raw_strings: false,
+                multiline_quotes: true,
             },
             "c" | "h" | "cpp" | "cxx" | "cc" | "hpp" | "cs" | "go" | "java" | "css" | "scss"
             | "sass" => Self {
@@ -113,6 +143,7 @@ impl FoldSyntax {
                 nested_block_comments: false,
                 single_quote_strings: false,
                 rust_raw_strings: false,
+                multiline_quotes: false,
             },
             "sql" => Self {
                 hash_comments: false,
@@ -121,6 +152,7 @@ impl FoldSyntax {
                 nested_block_comments: false,
                 single_quote_strings: true,
                 rust_raw_strings: false,
+                multiline_quotes: true,
             },
             "json" => Self {
                 hash_comments: false,
@@ -129,15 +161,27 @@ impl FoldSyntax {
                 nested_block_comments: false,
                 single_quote_strings: false,
                 rust_raw_strings: false,
+                multiline_quotes: false,
             },
-            "lua" | "html" | "htm" | "xml" => Self {
+            "lua" => Self {
                 hash_comments: false,
                 slash_line_comments: false,
                 block_comments: false,
                 nested_block_comments: false,
                 single_quote_strings: true,
                 rust_raw_strings: false,
+                multiline_quotes: false,
             },
+            "html" | "htm" | "xml" => Self {
+                hash_comments: false,
+                slash_line_comments: false,
+                block_comments: false,
+                nested_block_comments: false,
+                single_quote_strings: true,
+                rust_raw_strings: false,
+                multiline_quotes: true,
+            },
+            "txt" | "md" | "markdown" | "bat" | "cmd" => Self::plain_text(),
             _ => Self::default(),
         }
     }
@@ -361,6 +405,14 @@ impl FoldScanner {
                     i += 1;
                 }
             }
+        }
+
+        // In single-line-quote languages, unclosed quotes at end of line (without a trailing `\`
+        // escape, which advances `i` to `bytes.len() + 1`) reset so typing an opening quote does
+        // not invert brace folding across the remainder of the file.
+        if !self.syntax.multiline_quotes && i == bytes.len() {
+            self.in_double_quote = false;
+            self.in_single_quote = false;
         }
     }
 

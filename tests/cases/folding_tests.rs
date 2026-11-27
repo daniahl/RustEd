@@ -1112,3 +1112,148 @@ fn brace_char() {
     );
 }
 
+#[test]
+fn test_undo_redo_restores_shifted_folds_and_single_line_quote_reset() {
+    use rusted::folding::{compute_fold_ranges_with_syntax, FoldSyntax};
+
+    // 1. Unclosed single-line quote in JS/Python/C and prose in Markdown must not break downstream folds
+    let js_unclosed = "\
+function typing() {
+    const s = \"unclosed string while typing
+}
+function intact() {
+    const ok = \"valid\";
+    return ok;
+}
+";
+    let js_ranges = compute_fold_ranges_with_syntax(js_unclosed, FoldSyntax::from_extension("js"));
+    assert!(
+        js_ranges.contains(&FoldRange {
+            start_line: 3,
+            end_line: 5,
+        }),
+        "Unclosed quote on an earlier JS line must not corrupt folds below it: {js_ranges:?}"
+    );
+
+    let md = "\
+It's a Markdown doc with \"unclosed quote and /* not a comment
+example {
+    nested item 1
+    nested item 2
+}
+";
+    let md_ranges = compute_fold_ranges_with_syntax(md, FoldSyntax::from_extension("md"));
+    assert!(
+        md_ranges.contains(&FoldRange {
+            start_line: 1,
+            end_line: 3,
+        }),
+        "Markdown syntax profile should not treat prose quotes/slashes as Rust tokens: {md_ranges:?}"
+    );
+
+    // 2. Undo and Redo restore shifted collapsed fold lines accurately
+    let ctx = egui::Context::default();
+    let id = Id::unique("test_undo_redo_folds");
+    let mut pt = PieceTable::from_str(
+        "fn alpha() {\n    a();\n}\nfn beta() {\n    b1();\n    b2();\n}\n",
+    );
+    let mut rev = 1u64;
+    let mut fold_state = FoldState::new();
+    fold_state.ensure_updated_buffer(&pt, Some(rev));
+    // Fold `fn beta()` starting on line 3
+    assert!(fold_state.fold_line(3));
+
+    let run = |pt: &mut PieceTable,
+               rev: &mut u64,
+               fold_state: &mut FoldState,
+               time: f64,
+               events: Vec<Event>| {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(600.0, 400.0))),
+            time: Some(time),
+            events,
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(input, |ui| {
+            let mut layouter = |ui: &Ui, s: &str, w: f32| {
+                let job = LayoutJob::simple(
+                    s.to_owned(),
+                    egui::TextStyle::Monospace.resolve(ui.style()),
+                    Color32::WHITE,
+                    w,
+                );
+                ui.fonts_mut(|f| f.layout_job(job))
+            };
+            let output = FastEditor::new(id, pt, Vec2::new(500.0, 300.0), &mut layouter)
+                .text_revision(*rev)
+                .fold_state(fold_state)
+                .show(ui);
+            rusted::editor::request_editor_focus(ui.ctx(), output.response.id);
+            if output.text_changed {
+                *rev = rev.wrapping_add(1);
+            }
+        });
+        out.textures_delta.clear();
+    };
+
+    run(&mut pt, &mut rev, &mut fold_state, 0.0, vec![]);
+    // Insert two newlines at (0, 0) -> `fn beta()` shifts from line 3 to line 5
+    let enter = Event::Key {
+        key: Key::Enter,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: Modifiers::NONE,
+    };
+    run(
+        &mut pt,
+        &mut rev,
+        &mut fold_state,
+        1.0,
+        vec![enter.clone(), enter],
+    );
+    assert!(fold_state.is_folded(5));
+    assert!(!fold_state.is_folded(3));
+
+    // Stabilize undoer
+    run(&mut pt, &mut rev, &mut fold_state, 3.0, vec![]);
+
+    // Ctrl+Z undoes the 2-line insertion AND restores `fn beta()` fold back to line 3!
+    run(
+        &mut pt,
+        &mut rev,
+        &mut fold_state,
+        4.0,
+        vec![Event::Key {
+            key: Key::Z,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::COMMAND,
+        }],
+    );
+    assert!(
+        fold_state.is_folded(3),
+        "Undo must restore shifted fold back to line 3, got {:?}",
+        fold_state.folded_lines()
+    );
+    assert!(!fold_state.is_folded(5));
+
+    // Ctrl+Y redoes the insertion AND shifts `fn beta()` fold back to line 5!
+    run(
+        &mut pt,
+        &mut rev,
+        &mut fold_state,
+        5.0,
+        vec![Event::Key {
+            key: Key::Y,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::COMMAND,
+        }],
+    );
+    assert!(fold_state.is_folded(5));
+    assert!(!fold_state.is_folded(3));
+}
+

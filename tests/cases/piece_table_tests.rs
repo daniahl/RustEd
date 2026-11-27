@@ -738,3 +738,54 @@ fn test_byte_to_char_mid_utf8_and_reverse_case_insensitive_search() {
     assert_eq!(uni.find_char_range("über", 4, false, false), Some(10..14));
     assert_eq!(uni.find_char_range("über", 10, false, true), Some(0..4));
 }
+
+#[test]
+fn test_restore_full_text_preserves_post_reload_snapshots_and_streaming_unicode_search() {
+    use rusted::editor::{EditorBuffer, UndoSnapshot};
+    use std::sync::Arc;
+
+    // 1. Simulate post-reload editing -> Undo to FullText -> Redo to post-reload PieceTableSnapshot
+    let mut pt = PieceTable::from_str("external reload");
+    let snap_reload = pt.undo_snapshot();
+    pt.insert(15, " + user edit!");
+    let snap_edited = pt.undo_snapshot();
+
+    let pre_reload = UndoSnapshot::FullText(Arc::from("draft before reload"));
+    assert!(pt.restore_undo_snapshot(&pre_reload));
+    assert_eq!(pt, "draft before reload");
+
+    // Redoing through snap_reload to snap_edited (which references `added`) must succeed!
+    assert!(pt.restore_undo_snapshot(&snap_reload));
+    assert_eq!(pt, "external reload");
+    assert!(
+        pt.restore_undo_snapshot(&snap_edited),
+        "Post-reload PieceTableSnapshot must remain valid after FullText undo"
+    );
+    assert_eq!(pt, "external reload + user edit!");
+
+    // 2. Streaming non-ASCII case-insensitive search across piece boundaries + multi-codepoint 'İ'
+    let mut multi_uni = PieceTable::from_str("prefix İstan");
+    multi_uni.insert(multi_uni.char_count(), "bul café ÜB");
+    multi_uni.insert(multi_uni.char_count(), "ER suffix");
+    // 'İ' lowercases to 'i' + '\u{307}': searching plain "i" must NOT match mid-expansion of 'İ' (index 7),
+    // it must match 'i' in "prefix" (index 4) or "suffix".
+    assert_eq!(multi_uni.find_char_range("i", 0, false, false), Some(4..5));
+    assert_eq!(multi_uni.find_char_range("i", 5, false, false), Some(30..31));
+    assert_eq!(
+        multi_uni.find_char_range("i\u{307}stanbul", 0, false, false),
+        Some(7..15)
+    );
+    // Cross-piece non-ASCII case-insensitive match ("ÜB" + "ER") forward & backward
+    assert_eq!(
+        multi_uni.find_char_range("über", 0, false, false),
+        Some(21..25)
+    );
+    assert_eq!(
+        multi_uni.find_char_range("über", 25, false, true),
+        Some(21..25)
+    );
+    assert_eq!(
+        multi_uni.find_char_range("über", 21, false, true),
+        None
+    );
+}

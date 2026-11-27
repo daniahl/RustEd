@@ -154,6 +154,10 @@ impl<V> PathMap<V> {
         self.inner.values().map(|(p, _)| p)
     }
 
+    pub fn iter(&self) -> impl Iterator<Item = (&PathBuf, &V)> {
+        self.inner.values().map(|(p, v)| (p, v))
+    }
+
     pub fn retain<F>(&mut self, mut f: F)
     where
         F: FnMut(&PathBuf, &mut V) -> bool,
@@ -532,41 +536,81 @@ fn run_windows_watch_loop(
         return;
     };
 
-    // 32 KiB 4-byte aligned buffer works reliably on both local NTFS and SMB network shares.
-    let mut buffer = vec![0u32; 8192];
-    let mut overlapped = OVERLAPPED {
-        hEvent: io_event,
-        ..Default::default()
-    };
+    // RAII guard ensures any in-flight overlapped `ReadDirectoryChangesW` IRP is cancelled and
+    // waited to completion before `buffer` / `overlapped` are dropped—even if the loop unwinds.
+    struct OverlappedDirWatch {
+        dir_handle: windows::Win32::Foundation::HANDLE,
+        io_event: windows::Win32::Foundation::HANDLE,
+        // 32 KiB 4-byte aligned buffer works reliably on both local NTFS and SMB network shares.
+        buffer: Vec<u32>,
+        overlapped: Box<OVERLAPPED>,
+        io_pending: bool,
+    }
 
-    let issue_read = |buf: &mut [u32], ov: &mut OVERLAPPED| -> bool {
-        unsafe {
-            let _ = ResetEvent(io_event);
+    impl OverlappedDirWatch {
+        fn issue_read(&mut self, recursive: bool) -> bool {
+            unsafe {
+                let _ = ResetEvent(self.io_event);
+            }
+            *self.overlapped = OVERLAPPED {
+                hEvent: self.io_event,
+                ..Default::default()
+            };
+            self.io_pending = unsafe {
+                ReadDirectoryChangesW(
+                    self.dir_handle,
+                    self.buffer.as_mut_ptr().cast(),
+                    std::mem::size_of_val(self.buffer.as_slice()) as u32,
+                    recursive,
+                    FILE_NOTIFY_CHANGE_FILE_NAME
+                        | FILE_NOTIFY_CHANGE_DIR_NAME
+                        | FILE_NOTIFY_CHANGE_SIZE
+                        | FILE_NOTIFY_CHANGE_LAST_WRITE,
+                    None,
+                    Some(&mut *self.overlapped),
+                    None,
+                )
+                .is_ok()
+            };
+            self.io_pending
         }
-        *ov = OVERLAPPED {
+    }
+
+    impl Drop for OverlappedDirWatch {
+        fn drop(&mut self) {
+            if self.io_pending {
+                unsafe {
+                    let _ = CancelIoEx(self.dir_handle, Some(&*self.overlapped));
+                    let mut cancelled_bytes = 0u32;
+                    let _ = GetOverlappedResult(
+                        self.dir_handle,
+                        &*self.overlapped,
+                        &mut cancelled_bytes,
+                        true,
+                    );
+                }
+                self.io_pending = false;
+            }
+            unsafe {
+                let _ = CloseHandle(self.io_event);
+                let _ = CloseHandle(self.dir_handle);
+            }
+        }
+    }
+
+    let mut watch = OverlappedDirWatch {
+        dir_handle,
+        io_event,
+        buffer: vec![0u32; 8192],
+        overlapped: Box::new(OVERLAPPED {
             hEvent: io_event,
             ..Default::default()
-        };
-        unsafe {
-            ReadDirectoryChangesW(
-                dir_handle,
-                buf.as_mut_ptr().cast(),
-                std::mem::size_of_val(buf) as u32,
-                recursive,
-                FILE_NOTIFY_CHANGE_FILE_NAME
-                    | FILE_NOTIFY_CHANGE_DIR_NAME
-                    | FILE_NOTIFY_CHANGE_SIZE
-                    | FILE_NOTIFY_CHANGE_LAST_WRITE,
-                None,
-                Some(ov),
-                None,
-            )
-            .is_ok()
-        }
+        }),
+        io_pending: false,
     };
 
-    let mut io_pending = issue_read(&mut buffer, &mut overlapped);
-    let _ = ready_tx.send(io_pending);
+    let armed = watch.issue_read(recursive);
+    let _ = ready_tx.send(armed);
     let mut pending_paths: Vec<PathBuf> = Vec::new();
     let mut pending_seen: HashSet<PathKey> = HashSet::new();
     let mut pending_rescan = false;
@@ -595,9 +639,9 @@ fn run_windows_watch_loop(
         *last_at = None;
     };
 
-    let handles = [stop_event.0, io_event];
+    let handles = [stop_event.0, watch.io_event];
     let mut stopped_by_request = false;
-    while io_pending {
+    while watch.io_pending {
         let wait_ms = if let (Some(first_at), Some(last_at)) = (first_event_at, last_event_at) {
             let now = std::time::Instant::now();
             let target = (last_at + DEBOUNCE_WINDOW).min(first_at + MAX_COALESCE_WINDOW);
@@ -626,10 +670,15 @@ fn run_windows_watch_loop(
                 );
             }
             WAIT_OBJECT_1 => {
-                io_pending = false;
+                watch.io_pending = false;
                 let mut bytes_transferred = 0u32;
                 let res = unsafe {
-                    GetOverlappedResult(dir_handle, &overlapped, &mut bytes_transferred, false)
+                    GetOverlappedResult(
+                        watch.dir_handle,
+                        &*watch.overlapped,
+                        &mut bytes_transferred,
+                        false,
+                    )
                 };
                 if res.is_err() {
                     let err = unsafe { GetLastError() };
@@ -655,7 +704,7 @@ fn run_windows_watch_loop(
                 } else {
                     let byte_slice = unsafe {
                         std::slice::from_raw_parts(
-                            buffer.as_ptr().cast::<u8>(),
+                            watch.buffer.as_ptr().cast::<u8>(),
                             bytes_transferred as usize,
                         )
                     };
@@ -718,17 +767,9 @@ fn run_windows_watch_loop(
                     }
                 }
 
-                io_pending = issue_read(&mut buffer, &mut overlapped);
+                watch.issue_read(recursive);
             }
             _ => break,
-        }
-    }
-
-    if io_pending {
-        unsafe {
-            let _ = CancelIoEx(dir_handle, Some(&overlapped));
-            let mut cancelled_bytes = 0u32;
-            let _ = GetOverlappedResult(dir_handle, &overlapped, &mut cancelled_bytes, true);
         }
     }
 
@@ -741,11 +782,7 @@ fn run_windows_watch_loop(
             &mut last_event_at,
         );
     }
-
-    unsafe {
-        let _ = CloseHandle(io_event);
-        let _ = CloseHandle(dir_handle);
-    }
+    drop(watch);
 }
 
 #[cfg(not(target_os = "windows"))]

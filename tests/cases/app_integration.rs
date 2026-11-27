@@ -281,9 +281,10 @@ fn test_tree_new_folder_new_file_rename_and_f2() {
     assert_eq!(Path::new(&app.doc.path), new_file.as_path());
     assert_eq!(app.explorer.selected_node, Some((new_file.clone(), false)));
 
-    // 3. Edit the open file (so it has unsaved state) and press F2 to rename it
+    // 3. Edit the open file (so it has unsaved state), focus Explorer, and press F2 to rename it
     app.doc.text = "fn main() {}".into();
     app.doc.is_current_dirty = true;
+    rusted::explorer::request_explorer_focus(&ctx);
 
     let mut f2_input = egui::RawInput::default();
     f2_input.events.push(egui::Event::Key {
@@ -499,23 +500,29 @@ fn test_editor_has_focus_on_startup_when_requested() {
 
 #[test]
 fn test_folder_from_args_picks_first_existing_folder() {
-    use rusted::app::folder_from_args;
+    use rusted::app::startup_paths_from_args;
     let dir = std::env::temp_dir().join(format!("rusted_args_{}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(dir.join("proj")).unwrap();
     fs::write(dir.join("file.txt"), "").unwrap();
     let s = |p: std::path::PathBuf| p.to_string_lossy().into_owned();
 
-    assert_eq!(folder_from_args(Vec::<String>::new()), None);
-    assert_eq!(folder_from_args(["--flag".to_string(), s(dir.join("nope"))]), None);
-    // Files are ignored; the first existing folder wins.
+    assert_eq!(startup_paths_from_args(Vec::<String>::new()), (None, None));
     assert_eq!(
-        folder_from_args([s(dir.join("file.txt")), s(dir.join("proj")), s(dir.clone())]),
-        Some(dir.join("proj"))
+        startup_paths_from_args(["--flag".to_string(), s(dir.join("nope"))]),
+        (None, None)
+    );
+    // Explicit folder wins even when a file is also passed.
+    assert_eq!(
+        startup_paths_from_args([s(dir.join("file.txt")), s(dir.join("proj")), s(dir.clone())]),
+        (Some(dir.join("proj")), Some(dir.join("file.txt")))
     );
     // Relative paths are made absolute.
     let cwd = std::env::current_dir().unwrap();
-    assert_eq!(folder_from_args(["src".to_string()]), Some(cwd.join("src")));
+    assert_eq!(
+        startup_paths_from_args(["src".to_string()]).0,
+        Some(cwd.join("src"))
+    );
 
     let _ = fs::remove_dir_all(&dir);
 }
@@ -528,6 +535,8 @@ fn test_new_with_folder_uses_given_folder() {
     let app = TextEditor::new_with_folder(egui::Context::default(), Some(dir.clone()));
     assert_eq!(app.explorer.folder_path, dir);
     assert_eq!(app.explorer.tree_root.as_ref().unwrap().path, dir);
+    // ConPTY is spawned lazily on first terminal use rather than eagerly at startup.
+    assert!(app.terminal.term_screen_text.is_empty());
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -556,7 +565,7 @@ fn test_sidebar_lists_startup_folder_contents() {
 #[cfg(windows)]
 #[test]
 fn test_folder_from_args_bare_drive_means_drive_root() {
-    use rusted::app::folder_from_args;
+    use rusted::app::startup_paths_from_args;
     let drive = std::env::current_dir()
         .unwrap()
         .components()
@@ -564,7 +573,7 @@ fn test_folder_from_args_bare_drive_means_drive_root() {
         .map(|c| c.as_os_str().to_string_lossy().into_owned())
         .unwrap();
     // e.g. "G:" must resolve to "G:\", not the current directory on that drive.
-    let resolved = folder_from_args([drive.clone()]).unwrap();
+    let resolved = startup_paths_from_args([drive.clone()]).0.unwrap();
     assert_eq!(resolved, std::path::PathBuf::from(format!("{drive}\\")));
     assert!(resolved.is_absolute());
 }
@@ -1355,6 +1364,158 @@ fn test_shift_f3_find_prev_and_no_match_keeps_find_dialog_open() {
     );
     assert!(app.doc.find_open, "Find dialog should stay open when no match is found");
     assert!(app.doc.find_not_found);
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_ctrl_shift_e_explorer_focus_startup_file_arg_and_large_file_scrollbars() {
+    use rusted::{
+        app::startup_paths_from_args,
+        explorer::explorer_tree_id,
+    };
+
+    let temp_dir =
+        std::env::temp_dir().join(format!("rusted_shortcuts_polish_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&temp_dir);
+    let sub = temp_dir.join("pkg");
+    fs::create_dir_all(&sub).unwrap();
+    let f1 = temp_dir.join("alpha.rs");
+    let f2 = temp_dir.join("beta.rs");
+    fs::write(&f1, "fn alpha() {}\n").unwrap();
+    fs::write(&f2, "fn beta() {}\n").unwrap();
+
+    // 1. startup_paths_from_args resolves a single file argument to (parent_folder, file)
+    let (resolved_folder, resolved_file) =
+        startup_paths_from_args([f1.to_string_lossy().into_owned()]);
+    assert_eq!(resolved_folder.as_deref(), Some(temp_dir.as_path()));
+    assert_eq!(resolved_file.as_deref(), Some(f1.as_path()));
+
+    let ctx = egui::Context::default();
+    let mut app = TextEditor::new_headless(&temp_dir);
+    app.focus_editor_pending = true;
+    let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::Vec2::new(900.0, 500.0));
+
+    let run_events = |app: &mut TextEditor, events: Vec<egui::Event>| {
+        run_ui(
+            &ctx,
+            egui::RawInput {
+                screen_rect: Some(screen),
+                events,
+                ..Default::default()
+            },
+            |ui| app.update_ui(ui),
+        )
+    };
+
+    let _ = run_events(&mut app, vec![]);
+    let _ = run_events(&mut app, vec![]);
+    assert!(ctx.memory(|m| m.has_focus(rusted::editor::code_editor_id())));
+
+    // 2. Alt+E with accompanying winit Event::Text("e") when selection is empty must NOT insert 'e'
+    let _ = run_events(
+        &mut app,
+        vec![
+            egui::Event::Key {
+                key: egui::Key::E,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::ALT,
+            },
+            egui::Event::Text("e".to_string()),
+        ],
+    );
+    assert!(
+        app.doc.text.is_empty(),
+        "Alt+E without selection must not insert 'e' into editor"
+    );
+
+    // 3. TextEditor::open_file guards dirty Untitled buffer via pending_open_after_untitled
+    app.doc.set_text("unsaved untitled");
+    app.doc.is_current_dirty = true;
+    app.open_file(&ctx, f1.clone());
+    assert_eq!(app.explorer.pending_open_after_untitled, Some(f1.clone()));
+    assert_eq!(app.doc.text, "unsaved untitled");
+    app.explorer.pending_open_after_untitled = None;
+    app.doc.set_text("");
+    app.doc.is_current_dirty = false;
+
+    // 4. Ctrl+Shift+E moves keyboard focus to File Explorer and selects the first visible entry (`pkg`)
+    let ctrl_shift_e = egui::Event::Key {
+        key: egui::Key::E,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: egui::Modifiers {
+            ctrl: true,
+            shift: true,
+            ..Default::default()
+        },
+    };
+    let _ = run_events(&mut app, vec![ctrl_shift_e.clone()]);
+    assert!(
+        ctx.memory(|m| m.has_focus(explorer_tree_id())),
+        "Ctrl+Shift+E should focus the File Explorer sidebar"
+    );
+    assert_eq!(app.explorer.selected_node, Some((sub.clone(), true)));
+
+    // ArrowDown selects `alpha.rs`; Enter opens `alpha.rs` and returns focus to Editor!
+    let _ = run_events(
+        &mut app,
+        vec![egui::Event::Key {
+            key: egui::Key::ArrowDown,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }],
+    );
+    assert_eq!(app.explorer.selected_node, Some((f1.clone(), false)));
+    let _ = run_events(
+        &mut app,
+        vec![egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }],
+    );
+    assert_eq!(app.doc.path, f1);
+    assert!(
+        ctx.memory(|m| m.has_focus(rusted::editor::code_editor_id())),
+        "Opening a file with Enter from Explorer should focus the editor"
+    );
+
+    // Ctrl+Shift+E focuses Explorer again; Escape returns focus to Editor
+    let _ = run_events(&mut app, vec![ctrl_shift_e]);
+    assert!(ctx.memory(|m| m.has_focus(explorer_tree_id())));
+    let _ = run_events(
+        &mut app,
+        vec![egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }],
+    );
+    assert!(ctx.memory(|m| m.has_focus(rusted::editor::code_editor_id())));
+
+    // 5. Large virtualized file (> 64 KB) renders inside viewport-bounded ScrollArea::both
+    let big_line = "x".repeat(300);
+    let big_doc: String = (0..400).map(|i| format!("{i:04}_{big_line}\n")).collect();
+    assert!(big_doc.len() > rusted::document::MAX_HIGHLIGHT_BYTES);
+    app.doc.set_text(big_doc);
+    let _ = run_events(&mut app, vec![]);
+    let _ = run_events(&mut app, vec![]);
+    let editor_resp = ctx
+        .read_response(rusted::editor::code_editor_id())
+        .expect("virtualized editor response");
+    // Total virtualized content is > 4000px tall, while clip rect stays bounded to the 500px screen
+    assert!(editor_resp.rect.height() > 2000.0);
+    assert!(app.doc.gutter_cache.as_ref().unwrap().0.rows.len() < 80);
 
     let _ = fs::remove_dir_all(&temp_dir);
 }

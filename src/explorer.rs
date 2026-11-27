@@ -169,6 +169,26 @@ pub enum TreeEditOutcome {
     Cancel,
 }
 
+pub fn explorer_tree_id() -> egui::Id {
+    egui::Id::unique("explorer_tree")
+}
+
+pub fn request_explorer_focus(ctx: &egui::Context) {
+    let id = explorer_tree_id();
+    ctx.memory_mut(|m| {
+        m.request_focus(id);
+        m.set_focus_lock_filter(
+            id,
+            egui::EventFilter {
+                horizontal_arrows: true,
+                vertical_arrows: true,
+                tab: false,
+                escape: true,
+            },
+        );
+    });
+}
+
 pub struct FileNode {
     pub name: String,
     pub path: PathBuf,
@@ -176,6 +196,7 @@ pub struct FileNode {
     pub expanded: bool,
     pub children_loaded: bool,
     pub children: Vec<FileNode>,
+    cached_visible_rows: usize,
 }
 
 impl FileNode {
@@ -192,6 +213,7 @@ impl FileNode {
             expanded: true,
             children_loaded: false,
             children: Vec::new(),
+            cached_visible_rows: 1,
         };
         node.load_children();
         node
@@ -229,15 +251,39 @@ impl FileNode {
         if !self.is_dir || !self.expanded {
             return 1;
         }
+        1 + self
+            .children
+            .iter()
+            .map(|child| {
+                if child.is_dir && child.expanded {
+                    child.visible_count()
+                } else {
+                    1
+                }
+            })
+            .sum::<usize>()
+    }
+
+    /// Computes `cached_visible_rows` across the loaded expanded subtree in a single O(N) pass
+    /// so viewport culling during `render_file_node_with_buf` runs in O(1) per node.
+    fn refresh_cached_visible_rows(&mut self) -> usize {
+        if !self.is_dir || !self.expanded {
+            self.cached_visible_rows = 1;
+            return 1;
+        }
         let mut total = 1 + self.children.len();
-        for child in &self.children {
-            if !child.is_dir {
-                break;
-            }
-            if child.expanded {
-                total += child.visible_count() - 1;
+        for child in &mut self.children {
+            if child.is_dir {
+                if child.expanded {
+                    total += child.refresh_cached_visible_rows() - 1;
+                } else {
+                    child.cached_visible_rows = 1;
+                }
+            } else {
+                child.cached_visible_rows = 1;
             }
         }
+        self.cached_visible_rows = total;
         total
     }
 
@@ -272,6 +318,7 @@ impl FileNode {
                     expanded,
                     children_loaded,
                     children,
+                    cached_visible_rows: 1,
                 });
             }
             // Folders first, then files sorted case-insensitively without per-comparison heap allocations
@@ -329,13 +376,16 @@ impl FileNode {
             Some(idx) => {
                 let child = &self.children[idx];
                 if child.is_dir {
-                    if paths_equal(changed_path, &child.path) {
-                        // Direct child directory created/deleted/renamed/replaced: refresh parent
-                        // if missing, replaced by a file, or case-renamed; else refresh if loaded.
+                    let child_gone = !child.path.exists() || !child.path.is_dir();
+                    if child_gone {
+                        if refreshed.insert(PathKey::new(&self.path)) {
+                            self.load_children();
+                        }
+                    } else if paths_equal(changed_path, &child.path) {
                         let name_changed = changed_path
                             .file_name()
                             .is_some_and(|n| n.to_string_lossy() != child.name);
-                        if !child.path.exists() || !child.path.is_dir() || name_changed {
+                        if name_changed {
                             if refreshed.insert(PathKey::new(&self.path)) {
                                 self.load_children();
                             }
@@ -361,8 +411,13 @@ impl FileNode {
                 }
             }
             None => {
-                // Missing direct child (newly created file/folder, or first level of `mkdir a\b`).
-                if refreshed.insert(PathKey::new(&self.path)) {
+                // Skip rescans for transient temp files (e.g. atomic-save `.tmp` files) that were
+                // created and already renamed/deleted before the watcher debounce fired.
+                let transient_gone = changed_path
+                    .parent()
+                    .is_some_and(|p| paths_equal(p, &self.path))
+                    && !changed_path.exists();
+                if !transient_gone && refreshed.insert(PathKey::new(&self.path)) {
                     self.load_children();
                 }
             }
@@ -407,8 +462,11 @@ pub fn render_inline_tree_edit(
         .show(ui)
         .response;
 
-    let enter_pressed = ui.input(|i| i.key_pressed(egui::Key::Enter));
-    let escape_pressed = ui.input(|i| i.key_pressed(egui::Key::Escape));
+    let (enter_pressed, escape_pressed) = ui.input_mut(|i| {
+        let esc = i.consume_key(egui::Modifiers::NONE, egui::Key::Escape);
+        let enter = !esc && i.consume_key(egui::Modifiers::NONE, egui::Key::Enter);
+        (enter, esc)
+    });
 
     if escape_pressed {
         *edit_outcome = Some(TreeEditOutcome::Cancel);
@@ -433,6 +491,7 @@ pub fn render_file_node(
     depth: usize,
     file_to_open: &mut Option<PathBuf>,
 ) {
+    node.refresh_cached_visible_rows();
     let mut label_buf = String::with_capacity(64);
     let mut scroll_to_selected = false;
     render_file_node_with_buf(
@@ -492,12 +551,11 @@ fn render_file_node_with_buf(
     // Fast-path: if this node (and its entire subtree) is completely below or above the visible
     // viewport, advance cursor by the total height of its visible rows and return immediately.
     if !has_pending_edit && !is_renaming_self && !contains_scroll_target {
+        let subtree_count = node.cached_visible_rows.max(1);
         if cursor_y > clip_rect.max.y {
-            let count = node.visible_count();
-            ui.add_space(count as f32 * row_height);
+            ui.add_space(subtree_count as f32 * row_height);
             return;
         }
-        let subtree_count = node.visible_count();
         if cursor_y + subtree_count as f32 * row_height < clip_rect.min.y {
             ui.add_space(subtree_count as f32 * row_height);
             return;
@@ -538,6 +596,7 @@ fn render_file_node_with_buf(
                 }
                 if resp.clicked() {
                     *selected_node = Some((node.path.clone(), true));
+                    request_explorer_focus(ui.ctx());
                     node.expanded = !node.expanded;
                     if node.expanded && !node.children_loaded {
                         node.load_children();
@@ -545,6 +604,7 @@ fn render_file_node_with_buf(
                 }
                 if resp.secondary_clicked() {
                     *selected_node = Some((node.path.clone(), true));
+                    request_explorer_focus(ui.ctx());
                 }
                 resp.context_menu(|ui| {
                     *selected_node = Some((node.path.clone(), true));
@@ -647,10 +707,12 @@ fn render_file_node_with_buf(
             }
             if resp.clicked() {
                 *selected_node = Some((node.path.clone(), false));
+                request_explorer_focus(ui.ctx());
                 *file_to_open = Some(node.path.clone());
             }
             if resp.secondary_clicked() {
                 *selected_node = Some((node.path.clone(), false));
+                request_explorer_focus(ui.ctx());
             }
             resp.context_menu(|ui| {
                 *selected_node = Some((node.path.clone(), false));
@@ -831,7 +893,7 @@ impl FileExplorer {
                 let _ = self.delete_node(ctx, doc, &path, is_dir);
             }
             TreeAction::RequestDeleteNode { path, is_dir } => {
-                if doc.has_dirty_in_path(&path, is_dir) {
+                if is_dir || doc.has_dirty_in_path(&path, is_dir) {
                     self.pending_delete = Some((path, is_dir));
                 } else {
                     let _ = self.delete_node(ctx, doc, &path, is_dir);
@@ -1071,22 +1133,36 @@ impl FileExplorer {
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| path.to_string_lossy().into_owned());
 
+            let has_dirty = doc.has_dirty_in_path(&path, is_dir);
+            let prompt = if has_dirty {
+                format!(
+                    "\"{name}\" has unsaved edits in memory that will be discarded if deleted."
+                )
+            } else {
+                format!("Move folder \"{name}\" and its contents to Trash?")
+            };
+            let confirm_label = if has_dirty {
+                "Delete & Discard Edits"
+            } else {
+                "Move to Trash"
+            };
+
             egui::Window::new("Confirm Delete")
                 .open(&mut open)
                 .collapsible(false)
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
                 .show(ctx, |ui| {
-                    ui.label(format!(
-                        "\"{name}\" has unsaved edits in memory that will be discarded if deleted."
-                    ));
+                    ui.label(prompt);
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
-                        if ui.button("Delete & Discard Edits").clicked() {
+                        if ui.button(confirm_label).clicked() {
                             confirm_delete = true;
                         }
                         if ui.button("Cancel").clicked()
-                            || ui.input(|i| i.key_pressed(egui::Key::Escape))
+                            || ui.input_mut(|i| {
+                                i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)
+                            })
                         {
                             cancel = true;
                         }
@@ -1124,7 +1200,9 @@ impl FileExplorer {
                             discard_and_open = true;
                         }
                         if ui.button("Cancel").clicked()
-                            || ui.input(|i| i.key_pressed(egui::Key::Escape))
+                            || ui.input_mut(|i| {
+                                i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)
+                            })
                         {
                             cancel = true;
                         }
@@ -1159,13 +1237,15 @@ impl FileExplorer {
         ui: &egui::Ui,
         tree_action: &mut Option<TreeAction>,
         file_to_open: &mut Option<PathBuf>,
+        focus_editor_after_open: &mut bool,
     ) {
-        let (f2, up, down, left, right, enter, del) = ui.input(|i| {
+        let (esc, f2, up, down, left, right, enter, del) = ui.input(|i| {
             let no_mods = !i.modifiers.ctrl && !i.modifiers.alt && !i.modifiers.command;
             if !no_mods {
-                return (false, false, false, false, false, false, false);
+                return (false, false, false, false, false, false, false, false);
             }
             (
+                i.key_pressed(egui::Key::Escape),
                 i.key_pressed(egui::Key::F2),
                 i.key_pressed(egui::Key::ArrowUp),
                 i.key_pressed(egui::Key::ArrowDown),
@@ -1176,6 +1256,14 @@ impl FileExplorer {
             )
         });
 
+        let tree_had_focus = ui.memory(|m| {
+            m.has_focus(explorer_tree_id())
+                || (m.had_focus_last_frame(explorer_tree_id()) && m.focused().is_none())
+        });
+        if esc && tree_had_focus && !ui.ctx().any_popup_open() {
+            crate::editor::request_editor_focus(ui.ctx(), crate::editor::code_editor_id());
+            return;
+        }
         if f2 {
             self.start_rename_selected();
             return;
@@ -1266,7 +1354,33 @@ impl FileExplorer {
                     }
                 } else {
                     *file_to_open = Some(sel_path);
+                    *focus_editor_after_open = true;
                 }
+            }
+        }
+    }
+
+    /// Selects the active document path in the tree if present, or falls back to the first visible item.
+    pub fn ensure_default_selection(&mut self, active_doc_path: &Path) {
+        if self.selected_node.is_some() {
+            return;
+        }
+        if let Some(root) = &self.tree_root {
+            let mut visible = Vec::new();
+            root.collect_visible_entries(&mut visible);
+            if !active_doc_path.as_os_str().is_empty() {
+                if let Some(found) = visible
+                    .iter()
+                    .find(|(p, _)| paths_equal(p, active_doc_path))
+                {
+                    self.selected_node = Some(found.clone());
+                    self.scroll_to_selected = true;
+                    return;
+                }
+            }
+            if let Some(first) = visible.into_iter().next() {
+                self.selected_node = Some(first);
+                self.scroll_to_selected = true;
             }
         }
     }
@@ -1296,27 +1410,70 @@ impl FileExplorer {
                 }
 
                 let mut file_to_open: Option<PathBuf> = None;
+                let mut focus_editor_after_open = false;
                 let mut tree_action: Option<TreeAction> = None;
                 let mut edit_outcome: Option<TreeEditOutcome> = None;
                 let mut navigate_parent = false;
 
+                let tree_id = explorer_tree_id();
+                ui.interact(
+                    egui::Rect::NOTHING,
+                    tree_id,
+                    egui::Sense::focusable_noninteractive(),
+                );
+                let tree_has_focus = ui.memory(|m| m.has_focus(tree_id));
+                if tree_has_focus {
+                    ui.memory_mut(|m| {
+                        m.set_focus_lock_filter(
+                            tree_id,
+                            egui::EventFilter {
+                                horizontal_arrows: true,
+                                vertical_arrows: true,
+                                tab: false,
+                                escape: true,
+                            },
+                        );
+                    });
+                }
+
+                let tree_had_focus_for_esc = ui.memory(|m| {
+                    m.has_focus(tree_id)
+                        || (m.had_focus_last_frame(tree_id) && m.focused().is_none())
+                });
                 let sidebar_keys_active = !doc.find_open
                     && !self.keyboard_blocked
                     && self.pending_tree_edit.is_none()
                     && self.pending_delete.is_none()
                     && self.pending_open_after_untitled.is_none()
-                    && !ui.memory(|m| {
-                        m.has_focus(crate::app::project_folder_input_id())
-                            || m.has_focus(crate::editor::code_editor_id())
-                    });
+                    && (tree_has_focus || tree_had_focus_for_esc);
                 if sidebar_keys_active {
-                    self.handle_keyboard_navigation(ui, &mut tree_action, &mut file_to_open);
+                    if tree_has_focus {
+                        self.handle_keyboard_navigation(
+                            ui,
+                            &mut tree_action,
+                            &mut file_to_open,
+                            &mut focus_editor_after_open,
+                        );
+                    } else if tree_had_focus_for_esc
+                        && !ui.ctx().any_popup_open()
+                        && ui.input_mut(|i| {
+                            i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)
+                        })
+                    {
+                        crate::editor::request_editor_focus(
+                            ui.ctx(),
+                            crate::editor::code_editor_id(),
+                        );
+                    }
                 }
 
                 let has_parent = self
                     .folder_path
                     .parent()
                     .is_some_and(|p| !p.as_os_str().is_empty());
+                if let Some(root) = &mut self.tree_root {
+                    root.refresh_cached_visible_rows();
+                }
                 let selected_node = &mut self.selected_node;
                 let pending_edit = &mut self.pending_tree_edit;
                 let label_buf = &mut self.label_buf;
@@ -1422,6 +1579,12 @@ impl FileExplorer {
                     } else {
                         self.selected_node = Some((chosen.clone(), false));
                         doc.open_file(ctx, chosen);
+                        if focus_editor_after_open {
+                            crate::editor::request_editor_focus(
+                                ctx,
+                                crate::editor::code_editor_id(),
+                            );
+                        }
                     }
                 }
             });

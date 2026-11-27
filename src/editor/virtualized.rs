@@ -2,11 +2,11 @@
 
 use super::{
     accesskit::update_accesskit,
-    collect_relevant_events, edit_affected_lines, feed_undoer_after_edit, feed_undoer_if_in_flux,
-    finish_cursor_and_scroll, load_editor_state, paint_editor_contents, resolve_selection_range,
-    restore_focus_on_escape, store_editor_state, try_unfold_clicked_badge, EditorBuffer,
-    EditorOutput, FastEditor, VirtualLayoutCache, EDITOR_MARGIN, PAGE_JUMP_ROWS,
-    VIRTUALIZED_OVERSCAN,
+    collect_relevant_events, compute_badge_extra, edit_affected_lines, ensure_min_cursor_height,
+    feed_undoer_after_edit, feed_undoer_if_in_flux, finish_cursor_and_scroll, load_editor_state,
+    paint_editor_contents, resolve_selection_range, restore_focus_on_escape, store_editor_state,
+    try_unfold_clicked_badge, EditorBuffer, EditorOutput, FastEditor, VirtualLayoutCache,
+    EDITOR_MARGIN, PAGE_JUMP_ROWS, VIRTUALIZED_OVERSCAN,
 };
 use crate::folding::{FoldState, FoldView};
 use eframe::egui::{
@@ -114,12 +114,12 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
         if !text_unchanged {
             state.last_undo_snapshot = None;
         }
-        let prev_max_width = state
+        let (prev_max_width, prev_max_width_window) = state
             .virtual_layout_cache
             .as_ref()
             .filter(|c| c.key == cache_key && text_unchanged)
-            .map(|c| c.max_content_width)
-            .unwrap_or(0.0);
+            .map(|c| (c.max_content_width, c.max_width_window))
+            .unwrap_or((0.0, (0, 0)));
 
         let alloc_width = ui
             .available_width()
@@ -225,77 +225,17 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
         // Pointer interaction inside the visible window
         if !clicked_fold_badge {
             if self.pointer_moves_caret {
-                if let Some(pointer_pos) = ui.ctx().pointer_interact_pos() {
-                    if response.hovered() || response.dragged() || response.clicked() {
-                        let is_being_dragged = ui.ctx().is_being_dragged(self.id);
-                        let cursor_at_pointer =
-                            galley.cursor_from_pos(pointer_pos - window_galley_pos);
-
-                        let mut local_cursor_state = state.cursor;
-                        let clamped_local = if let Some(fv) = fold_view.as_deref() {
-                            CCursorRange::two(
-                                CCursor::new(fv.doc_to_disp(ccursor_range.secondary.index.0)),
-                                CCursor::new(fv.doc_to_disp(ccursor_range.primary.index.0)),
-                            )
-                        } else {
-                            CCursorRange::two(
-                                CCursor::new(
-                                    ccursor_range
-                                        .secondary
-                                        .index
-                                        .0
-                                        .saturating_sub(window_start_char)
-                                        .min(window_end_char - window_start_char),
-                                ),
-                                CCursor::new(
-                                    ccursor_range
-                                        .primary
-                                        .index
-                                        .0
-                                        .saturating_sub(window_start_char)
-                                        .min(window_end_char - window_start_char),
-                                ),
-                            )
-                        };
-                        let prev_clamped_sec = clamped_local.secondary.index.0;
-                        local_cursor_state.set_char_range(Some(clamped_local));
-
-                        let did_interact = local_cursor_state.pointer_interaction(
-                            ui,
-                            &response,
-                            cursor_at_pointer,
-                            &galley,
-                            is_being_dragged,
-                        );
-                        if did_interact || response.clicked() {
-                            response.request_focus();
-                            state.last_interaction_time = ui.input(|i| i.time);
-                            state.preferred_col = None;
-                            if let Some(r) = local_cursor_state.char_range() {
-                                let secondary = if is_being_dragged
-                                    && !response.clicked()
-                                    && r.secondary.index.0 == prev_clamped_sec
-                                {
-                                    ccursor_range.secondary
-                                } else if let Some(fv) = fold_view.as_deref() {
-                                    CCursor::new(fv.disp_to_doc(r.secondary.index.0).min(total_chars))
-                                } else {
-                                    CCursor::new(
-                                        (window_start_char + r.secondary.index.0).min(total_chars),
-                                    )
-                                };
-                                let primary = if let Some(fv) = fold_view.as_deref() {
-                                    CCursor::new(fv.disp_to_doc(r.primary.index.0).min(total_chars))
-                                } else {
-                                    CCursor::new(
-                                        (window_start_char + r.primary.index.0).min(total_chars),
-                                    )
-                                };
-                                ccursor_range = CCursorRange::two(secondary, primary);
-                            }
-                            state.cursor = local_cursor_state;
-                        }
-                    }
+                if self.handle_caret_pointer_windowed(
+                    ui,
+                    &response,
+                    &galley,
+                    window_galley_pos,
+                    &mut state,
+                    &mut ccursor_range,
+                    window_start_char..window_end_char,
+                    fold_view.as_deref(),
+                ) {
+                    state.preferred_col = None;
                 }
             } else {
                 self.handle_selection_pointer_windowed(
@@ -312,11 +252,18 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
 
         let mut text_changed = false;
         let mut should_feed_undoer = false;
+        let mut edited_line_span: Option<(usize, usize)> = None;
         let has_focus = restore_focus_on_escape(ui, &response, self.id);
 
         if has_focus {
             let now = ui.input(|i| i.time);
-            feed_undoer_if_in_flux(&mut state, self.text, now, ccursor_range);
+            feed_undoer_if_in_flux(
+                &mut state,
+                self.text,
+                now,
+                ccursor_range,
+                self.fold_state.as_deref(),
+            );
 
             let events = collect_relevant_events(ui);
 
@@ -573,21 +520,13 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
                         state.last_interaction_time = now;
                     }
                     _ => {
-                        let old_line_count = if self.fold_state.is_some() {
-                            self.text.line_count()
-                        } else {
-                            0
-                        };
-                        let affected_lines = if self.fold_state.is_some() {
-                            edit_affected_lines(
-                                self.text,
-                                event,
-                                ccursor_range,
-                                self.fold_state.as_deref(),
-                            )
-                        } else {
-                            (0, usize::MAX, 0)
-                        };
+                        let old_line_count = self.text.line_count();
+                        let affected_lines = edit_affected_lines(
+                            self.text,
+                            event,
+                            ccursor_range,
+                            self.fold_state.as_deref(),
+                        );
                         let outcome = self.handle_common_edit_event(
                             ui,
                             event,
@@ -606,6 +545,11 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
                             &mut should_feed_undoer,
                         ) {
                             state.preferred_col = None;
+                            let (s, e) = (affected_lines.0, affected_lines.2);
+                            edited_line_span = Some(match edited_line_span {
+                                Some((ps, pe)) => (ps.min(s), pe.max(e)),
+                                None => (s, e),
+                            });
                         }
                     }
                 }
@@ -641,11 +585,23 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
             layout_dirty = true;
         }
 
-        let needed_width = galley.size().x + MARGIN.x * 2.0;
-        let max_content_width = if text_changed {
-            needed_width
+        let badge_extra = compute_badge_extra(fold_view.as_deref(), badge_width);
+        let needed_width = galley.size().x + MARGIN.x * 2.0 + badge_extra;
+        let (max_content_width, max_width_window) = if text_changed {
+            let overlaps_max_window = total_chars_after == 0
+                || total_lines_after <= prev_max_width_window.0
+                || edited_line_span.is_none_or(|(es, ee)| {
+                    es < prev_max_width_window.1 && ee >= prev_max_width_window.0
+                });
+            if overlaps_max_window || needed_width >= prev_max_width {
+                (needed_width, (first_line, last_line))
+            } else {
+                (prev_max_width, prev_max_width_window)
+            }
+        } else if needed_width >= prev_max_width {
+            (needed_width, (first_line, last_line))
         } else {
-            prev_max_width.max(needed_width)
+            (prev_max_width, prev_max_width_window)
         };
         if needed_width > alloc_width + 1.0 {
             ui.ctx().request_repaint();
@@ -654,7 +610,13 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
         state.cursor.set_char_range(Some(ccursor_range));
 
         if should_feed_undoer {
-            feed_undoer_after_edit(ui, &mut state, self.text, ccursor_range);
+            feed_undoer_after_edit(
+                ui,
+                &mut state,
+                self.text,
+                ccursor_range,
+                self.fold_state.as_deref(),
+            );
         }
 
         let (cur_line, cur_col) = self.text.char_to_line_col(ccursor_range.primary.index.0);
@@ -679,18 +641,18 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
             None
         };
 
-        let mut cursor_box = if let Some(lp) = local_primary {
-            galley
-                .pos_from_layout_cursor(&lp)
-                .translate(window_galley_pos.to_vec2())
-        } else {
-            let x = base_pos.x + cur_col as f32 * char_width;
-            let y = base_pos.y + cur_vis_line as f32 * line_height;
-            Rect::from_min_size(Pos2::new(x, y), Vec2::new(1.0, line_height))
-        };
-        if cursor_box.height() < line_height {
-            cursor_box.max.y = cursor_box.min.y + line_height;
-        }
+        let cursor_box = ensure_min_cursor_height(
+            if let Some(lp) = local_primary {
+                galley
+                    .pos_from_layout_cursor(&lp)
+                    .translate(window_galley_pos.to_vec2())
+            } else {
+                let x = base_pos.x + cur_col as f32 * char_width;
+                let y = base_pos.y + cur_vis_line as f32 * line_height;
+                Rect::from_min_size(Pos2::new(x, y), Vec2::new(1.0, line_height))
+            },
+            line_height,
+        );
 
         let cursor_moved = ccursor_range != prev_ccursor_range;
         if has_focus && (text_changed || cursor_moved) {
@@ -737,6 +699,8 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
             rect,
             text_clip_rect,
             has_focus,
+            self.read_only,
+            self.accessible_label,
             cursor_in_view && cursor_in_window,
             local_row,
             cur_line,
@@ -767,6 +731,7 @@ impl<'a, T: EditorBuffer> FastEditor<'a, T> {
                 window_start_char,
                 window_end_char,
                 max_content_width,
+                max_width_window,
                 galley: Arc::clone(&galley),
                 fold_view,
             }));

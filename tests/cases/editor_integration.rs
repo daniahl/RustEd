@@ -731,6 +731,149 @@ fn test_virtualized_crlf_navigation_and_editing() {
     assert_eq!(pt, "alphabeta\r\ngamma");
 }
 
+#[test]
+fn test_non_virtualized_crlf_navigation_and_editing() {
+    use rusted::PieceTable;
+
+    let ctx = egui::Context::default();
+    let mut pt = PieceTable::from_str("alpha\r\nbeta\r\ngamma");
+    let mut rev = 1u64;
+    let id = Id::unique("test_non_virtualized_crlf");
+    let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), Vec2::new(600.0, 300.0));
+
+    let run_frame = |pt: &mut PieceTable, rev: &mut u64, events: Vec<Event>| {
+        let input = egui::RawInput {
+            screen_rect: Some(screen),
+            events,
+            ..Default::default()
+        };
+        let mut last_cursor = None;
+        let mut out = ctx.run_ui(input, |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
+                let mut layouter = |ui: &Ui, s: &str, wrap: f32| {
+                    let job = LayoutJob::simple(
+                        s.to_owned(),
+                        egui::TextStyle::Monospace.resolve(ui.style()),
+                        Color32::WHITE,
+                        wrap,
+                    );
+                    ui.fonts_mut(|f| f.layout_job(job))
+                };
+                let output = FastEditor::new(id, pt, Vec2::new(400.0, 200.0), &mut layouter)
+                    .text_revision(*rev)
+                    .newline("\r\n")
+                    .show(ui);
+                rusted::editor::request_editor_focus(ui.ctx(), output.response.id);
+                last_cursor = output.cursor_range;
+                if output.text_changed {
+                    *rev = rev.wrapping_add(1);
+                }
+            });
+        });
+        out.textures_delta.clear();
+        last_cursor.unwrap()
+    };
+
+    let key = |k: Key, modifiers: Modifiers| Event::Key {
+        key: k,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers,
+    };
+
+    // Frame 1: acquire focus at 0
+    assert_eq!(run_frame(&mut pt, &mut rev, vec![]).primary.index.0, 0);
+
+    // End stops before '\r' (index 5), never between '\r' and '\n' (index 6)
+    assert_eq!(
+        run_frame(&mut pt, &mut rev, vec![key(Key::End, Modifiers::NONE)])
+            .primary
+            .index
+            .0,
+        5
+    );
+
+    // ArrowRight skips over "\r\n" directly to index 7 ("beta")
+    assert_eq!(
+        run_frame(&mut pt, &mut rev, vec![key(Key::ArrowRight, Modifiers::NONE)])
+            .primary
+            .index
+            .0,
+        7
+    );
+
+    // ArrowLeft skips back over "\r\n" directly to index 5 (before '\r')
+    assert_eq!(
+        run_frame(&mut pt, &mut rev, vec![key(Key::ArrowLeft, Modifiers::NONE)])
+            .primary
+            .index
+            .0,
+        5
+    );
+
+    // Shift+ArrowRight selects the whole "\r\n" pair (5..7)
+    let sel = run_frame(&mut pt, &mut rev, vec![key(Key::ArrowRight, Modifiers::SHIFT)]);
+    assert_eq!((sel.secondary.index.0, sel.primary.index.0), (5, 7));
+
+    // Clicking far to the right of line 0 snaps before '\r' (index 5), not mid-CRLF
+    let click_pos = egui::pos2(350.0, 12.0);
+    let _ = run_frame(
+        &mut pt,
+        &mut rev,
+        vec![
+            Event::PointerMoved(click_pos),
+            Event::PointerButton {
+                pos: click_pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: Modifiers::NONE,
+            },
+        ],
+    );
+    let clicked = run_frame(
+        &mut pt,
+        &mut rev,
+        vec![Event::PointerButton {
+            pos: click_pos,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: Modifiers::NONE,
+        }],
+    );
+    assert_eq!(clicked.primary.index.0, 5);
+
+    // Enter at End inserts "\r\n" cleanly without orphan '\r'
+    assert_eq!(
+        run_frame(&mut pt, &mut rev, vec![key(Key::Enter, Modifiers::NONE)])
+            .primary
+            .index
+            .0,
+        7
+    );
+    assert_eq!(pt, "alpha\r\n\r\nbeta\r\ngamma");
+
+    // Backspace removes "\r\n" atomically
+    assert_eq!(
+        run_frame(&mut pt, &mut rev, vec![key(Key::Backspace, Modifiers::NONE)])
+            .primary
+            .index
+            .0,
+        5
+    );
+    assert_eq!(pt, "alpha\r\nbeta\r\ngamma");
+
+    // Delete removes "\r\n" atomically
+    assert_eq!(
+        run_frame(&mut pt, &mut rev, vec![key(Key::Delete, Modifiers::NONE)])
+            .primary
+            .index
+            .0,
+        5
+    );
+    assert_eq!(pt, "alphabeta\r\ngamma");
+}
+
 /// After the OS window loses and regains focus, UIA clients must keep seeing a text
 /// selection and receive a fresh selection change (magnifier caret tracking).
 #[test]

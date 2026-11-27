@@ -562,35 +562,40 @@ fn test_terminal_mouse_drag_select_and_copy_without_moving_caret() {
 
 #[test]
 fn test_contains_dsr_request_across_chunks() {
-    use rusted::terminal::contains_dsr_request;
+    use rusted::terminal::process_chunk_with_dsr;
 
+    let mut parser = vt100::Parser::new(
+        std::num::NonZeroU16::new(24).unwrap(),
+        std::num::NonZeroU16::new(80).unwrap(),
+        0,
+    );
     let mut tail = [0u8; 3];
     let mut tail_len = 0usize;
 
     // Single chunk match
-    assert!(contains_dsr_request(&mut tail, &mut tail_len, b"abc\x1b[6ndef"));
+    assert!(!process_chunk_with_dsr(&mut parser, &mut tail, &mut tail_len, b"abc\x1b[6ndef").is_empty());
 
     // Split across two chunks (2 + 2 bytes)
     let mut tail = [0u8; 3];
     let mut tail_len = 0usize;
-    assert!(!contains_dsr_request(&mut tail, &mut tail_len, b"prefix\x1b["));
-    assert!(contains_dsr_request(&mut tail, &mut tail_len, b"6nsuffix"));
+    assert!(process_chunk_with_dsr(&mut parser, &mut tail, &mut tail_len, b"prefix\x1b[").is_empty());
+    assert!(!process_chunk_with_dsr(&mut parser, &mut tail, &mut tail_len, b"6nsuffix").is_empty());
 
     // Split 1 byte at a time, including an empty intermediate chunk
     let mut tail = [0u8; 3];
     let mut tail_len = 0usize;
-    assert!(!contains_dsr_request(&mut tail, &mut tail_len, b"\x1b"));
-    assert!(!contains_dsr_request(&mut tail, &mut tail_len, b""));
-    assert!(!contains_dsr_request(&mut tail, &mut tail_len, b"["));
-    assert!(!contains_dsr_request(&mut tail, &mut tail_len, b"6"));
-    assert!(contains_dsr_request(&mut tail, &mut tail_len, b"n"));
+    assert!(process_chunk_with_dsr(&mut parser, &mut tail, &mut tail_len, b"\x1b").is_empty());
+    assert!(process_chunk_with_dsr(&mut parser, &mut tail, &mut tail_len, b"").is_empty());
+    assert!(process_chunk_with_dsr(&mut parser, &mut tail, &mut tail_len, b"[").is_empty());
+    assert!(process_chunk_with_dsr(&mut parser, &mut tail, &mut tail_len, b"6").is_empty());
+    assert!(!process_chunk_with_dsr(&mut parser, &mut tail, &mut tail_len, b"n").is_empty());
 
     // Non-matching byte breaks partial sequence
     let mut tail = [0u8; 3];
     let mut tail_len = 0usize;
-    assert!(!contains_dsr_request(&mut tail, &mut tail_len, b"\x1b[6"));
-    assert!(!contains_dsr_request(&mut tail, &mut tail_len, b"m"));
-    assert!(!contains_dsr_request(&mut tail, &mut tail_len, b"n"));
+    assert!(process_chunk_with_dsr(&mut parser, &mut tail, &mut tail_len, b"\x1b[6").is_empty());
+    assert!(process_chunk_with_dsr(&mut parser, &mut tail, &mut tail_len, b"m").is_empty());
+    assert!(process_chunk_with_dsr(&mut parser, &mut tail, &mut tail_len, b"n").is_empty());
 }
 
 #[test]
@@ -782,4 +787,197 @@ fn test_process_chunk_with_dsr_and_ai_cli_keys() {
         .textures_delta
         .clear();
     assert_eq!(rx.try_recv().unwrap(), b"\x1bb");
+}
+
+#[test]
+fn test_winit_style_ctrl_c_ctrl_x_alt_text_dedup_and_incremental_scrollback() {
+    use rusted::terminal::render_vt100_screen_with_scrollback;
+
+    let ctx = egui::Context::default();
+    let mut pane = TerminalPane::new_headless();
+    let (tx, rx) = mpsc::channel();
+    pane.pty_writer = Some(tx);
+
+    let drain = || {
+        let mut out = Vec::new();
+        while let Ok(b) = rx.try_recv() {
+            out.extend_from_slice(&b);
+        }
+        out
+    };
+
+    // 1. Live `egui-winit` translates Ctrl+C into Event::Copy WITHOUT Event::Key(C)
+    ctx.run_ui(
+        egui::RawInput {
+            events: vec![
+                egui::Event::ModifiersChanged(egui::Modifiers::CTRL),
+                egui::Event::Copy,
+            ],
+            ..Default::default()
+        },
+        |ui| pane.handle_terminal_input(ui.ctx(), true),
+    )
+    .textures_delta
+    .clear();
+    assert_eq!(
+        drain(),
+        b"\x03",
+        "Event::Copy without active selection must send ^C (0x03)"
+    );
+
+    // 2. Live `egui-winit` translates Ctrl+X into Event::Cut WITHOUT Event::Key(X)
+    ctx.run_ui(
+        egui::RawInput {
+            events: vec![
+                egui::Event::ModifiersChanged(egui::Modifiers::CTRL),
+                egui::Event::Cut,
+            ],
+            ..Default::default()
+        },
+        |ui| pane.handle_terminal_input(ui.ctx(), true),
+    )
+    .textures_delta
+    .clear();
+    assert_eq!(drain(), b"\x18", "Event::Cut with Ctrl must send ^X (0x18)");
+
+    // 3. Windows Shift+Delete translates into Event::Cut with Modifiers::SHIFT
+    ctx.run_ui(
+        egui::RawInput {
+            events: vec![
+                egui::Event::ModifiersChanged(egui::Modifiers::SHIFT),
+                egui::Event::Cut,
+            ],
+            ..Default::default()
+        },
+        |ui| pane.handle_terminal_input(ui.ctx(), true),
+    )
+    .textures_delta
+    .clear();
+    assert_eq!(
+        drain(),
+        b"\x1b[3;2~",
+        "Event::Cut with Shift must send xterm Shift+Delete"
+    );
+
+    // 4. Live `egui-winit` emits BOTH Event::Key(Alt+B) and Event::Text("b") on Alt+B
+    ctx.run_ui(
+        egui::RawInput {
+            events: vec![
+                egui::Event::ModifiersChanged(egui::Modifiers::ALT),
+                egui::Event::Key {
+                    key: egui::Key::B,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::ALT,
+                },
+                egui::Event::Text("b".to_string()),
+            ],
+            ..Default::default()
+        },
+        |ui| pane.handle_terminal_input(ui.ctx(), true),
+    )
+    .textures_delta
+    .clear();
+    assert_eq!(
+        drain(),
+        b"\x1bb",
+        "Alt+B with accompanying Event::Text(\"b\") must not send duplicate 'b'"
+    );
+
+    // 5. Incremental scrollback sync matches full render across prompt edits, streaming, and ESC[3J
+    let screen_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::Vec2::new(800.0, 400.0));
+    let mut step_and_verify = |chunk: &[u8]| {
+        {
+            let mut lock = pane.term.lock().unwrap();
+            lock.parser.process(chunk);
+            lock.pty_updated = true;
+        }
+        ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen_rect),
+                ..Default::default()
+            },
+            |ui| pane.show(ui, egui::Frame::default()),
+        )
+        .textures_delta
+        .clear();
+
+        let mut expected_text = String::new();
+        let expected_cursor = {
+            let mut lock = pane.term.lock().unwrap();
+            render_vt100_screen_with_scrollback(lock.parser.screen_mut(), &mut expected_text)
+        };
+        assert_eq!(pane.term_screen_text.build_string(), expected_text);
+        assert_eq!(pane.term_cursor_idx, expected_cursor);
+    };
+
+    // Push 60 lines to populate scrollback
+    let initial_lines: String = (0..60).map(|i| format!("history line {i}\r\n")).collect();
+    step_and_verify(initial_lines.as_bytes());
+    // Edit in-place on active prompt without scrolling
+    step_and_verify(b"C:\\Proj>cargo ");
+    step_and_verify(b"test");
+    // Stream 5 more lines into scrollback
+    step_and_verify(b"\r\nout 1\r\nout 2\r\nout 3\r\nout 4\r\nout 5\r\nC:\\Proj>");
+    // Clear scrollback (\x1b[3J) + clear screen (\x1b[2J\x1b[H) + fresh output
+    step_and_verify(b"\x1b[3J\x1b[2J\x1b[Hfresh start\r\nsecond\r\n");
+}
+
+#[test]
+fn test_incremental_scrollback_at_full_capacity_and_scroll_pinning() {
+    use rusted::terminal::{render_vt100_screen_with_scrollback, TERM_SCROLLBACK_LEN};
+
+    let ctx = egui::Context::default();
+    let mut pane = TerminalPane::new_headless();
+    let screen_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::Vec2::new(800.0, 400.0));
+
+    let step_and_verify = |pane: &mut TerminalPane, chunk: &[u8]| {
+        {
+            let mut lock = pane.term.lock().unwrap();
+            lock.parser.process(chunk);
+            lock.pty_updated = true;
+        }
+        ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen_rect),
+                ..Default::default()
+            },
+            |ui| pane.show(ui, egui::Frame::default()),
+        )
+        .textures_delta
+        .clear();
+
+        let mut expected_text = String::new();
+        let expected_cursor = {
+            let mut lock = pane.term.lock().unwrap();
+            render_vt100_screen_with_scrollback(lock.parser.screen_mut(), &mut expected_text)
+        };
+        assert_eq!(pane.term_screen_text.build_string(), expected_text);
+        assert_eq!(pane.term_cursor_idx, expected_cursor);
+    };
+
+    // Push past TERM_SCROLLBACK_LEN (2,000) so scrollback hits full ring-buffer capacity
+    let bulk: String = (0..TERM_SCROLLBACK_LEN + 60)
+        .map(|i| format!("full_sb_line_{i}\r\n"))
+        .collect();
+    step_and_verify(&mut pane, bulk.as_bytes());
+    assert_eq!(
+        pane.term.lock().unwrap().parser.screen().scrollback_len(),
+        TERM_SCROLLBACK_LEN
+    );
+
+    // 1. In-place prompt edit at full capacity (evicted == 0)
+    step_and_verify(&mut pane, b"prompt> cargo ");
+    step_and_verify(&mut pane, b"check");
+
+    // 2. Single-line and multi-line shifts at full capacity (evicted == 1, 5, 20)
+    step_and_verify(&mut pane, b"\r\nshift_one_0\r\n");
+    let five: String = (0..5).map(|i| format!("shift_five_{i}\r\n")).collect();
+    step_and_verify(&mut pane, five.as_bytes());
+    let twenty: String = (0..20).map(|i| format!("shift_twenty_{i}\r\n")).collect();
+    step_and_verify(&mut pane, twenty.as_bytes());
+
+    // 3. Clearing scrollback from full capacity recovers cleanly
+    step_and_verify(&mut pane, b"\x1b[3J\x1b[2J\x1b[Hafter_clear\r\n");
 }

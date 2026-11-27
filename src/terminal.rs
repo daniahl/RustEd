@@ -27,6 +27,9 @@ pub const TERM_SCROLLBACK_LEN: usize = 2_000;
 /// Size of the read buffer for PTY output in bytes.
 pub const PTY_READ_BUF_SIZE: usize = 4096;
 
+/// Number of newest scrollback lines cached as an anchor for ring-buffer incremental sync.
+const TAIL_ANCHOR_LINES: usize = 4;
+
 enum PtyWriteCmd {
     Bytes(Vec<u8>),
     DelayedBytes(Duration, Vec<u8>),
@@ -45,35 +48,6 @@ fn update_dsr_tail(tail: &mut [u8; 3], tail_len: &mut usize, chunk: &[u8]) {
         tail[..keep].copy_from_slice(&combined[total - keep..total]);
         *tail_len = keep;
     }
-}
-
-/// Detects `\x1b[6n` (DSR cursor position request) within `chunk` or split across the
-/// previous chunk's trailing bytes (`tail[..*tail_len]`), updating the trailing buffer.
-pub fn contains_dsr_request(tail: &mut [u8; 3], tail_len: &mut usize, chunk: &[u8]) -> bool {
-    const DSR: &[u8; 4] = b"\x1b[6n";
-    if chunk.is_empty() {
-        return false;
-    }
-
-    let mut found = false;
-    if *tail_len > 0 {
-        let mut boundary = [0u8; 6];
-        boundary[..*tail_len].copy_from_slice(&tail[..*tail_len]);
-        let prefix_len = chunk.len().min(3);
-        boundary[*tail_len..*tail_len + prefix_len].copy_from_slice(&chunk[..prefix_len]);
-        if boundary[..*tail_len + prefix_len]
-            .windows(DSR.len())
-            .any(|w| w == DSR)
-        {
-            found = true;
-        }
-    }
-    if !found && chunk.windows(DSR.len()).any(|w| w == DSR) {
-        found = true;
-    }
-
-    update_dsr_tail(tail, tail_len, chunk);
-    found
 }
 
 /// Processes `chunk` through `parser` while evaluating every `\x1b[6n` (DSR) cursor-position
@@ -165,6 +139,11 @@ pub struct TerminalPane {
     pub term: Arc<Mutex<TerminalState>>,
     pub term_screen_text: PieceTable,
     render_scratch: String,
+    cached_scrollback_len: usize,
+    cached_scrollback_chars: usize,
+    cached_first_sb_line: String,
+    cached_tail_sb_lines: Vec<String>,
+    scrollback_edits_bytes: usize,
     pub term_revision: u64,
     pub term_cursor_idx: usize,
     pub rows: u16,
@@ -178,6 +157,10 @@ pub struct TerminalPane {
     pub(crate) _pty_master: Option<Box<dyn portable_pty::MasterPty + Send>>,
     pub(crate) _pty_child: Option<Box<dyn portable_pty::Child + Send + Sync>>,
     pub(crate) shutdown: Arc<AtomicBool>,
+    /// When `true`, the OS PTY is deferred until the user opens the terminal or invokes AI Explain.
+    lazy_spawn: bool,
+    /// Whether the terminal scroll area was near the bottom on the last rendered frame.
+    pinned_to_bottom: bool,
     pub focus_terminal: bool,
     pub selecting_in_terminal: bool,
 }
@@ -346,6 +329,11 @@ impl TerminalPane {
             term,
             term_screen_text: PieceTable::new(),
             render_scratch: String::new(),
+            cached_scrollback_len: 0,
+            cached_scrollback_chars: 0,
+            cached_first_sb_line: String::new(),
+            cached_tail_sb_lines: Vec::new(),
+            scrollback_edits_bytes: 0,
             term_revision: 0,
             term_cursor_idx: 0,
             rows,
@@ -358,9 +346,35 @@ impl TerminalPane {
             _pty_master: pty_master,
             _pty_child: pty_child,
             shutdown,
+            lazy_spawn: false,
+            pinned_to_bottom: true,
             focus_terminal: false,
             selecting_in_terminal: false,
         }
+    }
+
+    /// Creates a terminal pane whose ConPTY shell is spawned lazily on first use via
+    /// [`Self::ensure_started`], keeping cold editor startup fast and ensuring the shell
+    /// inherits whichever project folder is active when the terminal is first opened.
+    pub fn new_lazy() -> Self {
+        let mut pane = Self::new_headless();
+        pane.lazy_spawn = true;
+        pane
+    }
+
+    /// Spawns the underlying ConPTY session if this pane was created with [`Self::new_lazy`]
+    /// and has not started yet.
+    pub fn ensure_started(&mut self, ctx: &egui::Context, working_dir: Option<&Path>) {
+        if !self.lazy_spawn {
+            return;
+        }
+        self.lazy_spawn = false;
+        let next_revision = self.term_revision.wrapping_add(1);
+        let (rows, cols) = (self.rows, self.cols);
+        let focus = self.focus_terminal;
+        *self = Self::new_with_size(ctx.clone(), working_dir, rows, cols);
+        self.term_revision = next_revision;
+        self.focus_terminal = focus;
     }
 
     pub fn new_headless() -> Self {
@@ -376,6 +390,11 @@ impl TerminalPane {
             })),
             term_screen_text: PieceTable::new(),
             render_scratch: String::new(),
+            cached_scrollback_len: 0,
+            cached_scrollback_chars: 0,
+            cached_first_sb_line: String::new(),
+            cached_tail_sb_lines: Vec::new(),
+            scrollback_edits_bytes: 0,
             term_revision: 0,
             term_cursor_idx: 0,
             rows: TERM_ROWS,
@@ -388,6 +407,8 @@ impl TerminalPane {
             _pty_master: None,
             _pty_child: None,
             shutdown: Arc::new(AtomicBool::new(false)),
+            lazy_spawn: false,
+            pinned_to_bottom: true,
             focus_terminal: false,
             selecting_in_terminal: false,
         }
@@ -422,6 +443,11 @@ impl TerminalPane {
         if let (Some(nz_rows), Some(nz_cols)) =
             (std::num::NonZeroU16::new(rows), std::num::NonZeroU16::new(cols))
         {
+            self.cached_scrollback_len = 0;
+            self.cached_scrollback_chars = 0;
+            self.cached_first_sb_line.clear();
+            self.cached_tail_sb_lines.clear();
+            self.scrollback_edits_bytes = 0;
             let mut lock = self.term.lock().unwrap_or_else(|e| e.into_inner());
             lock.parser.screen_mut().set_size(nz_rows, nz_cols);
             lock.pty_updated = true;
@@ -472,6 +498,7 @@ impl TerminalPane {
     /// and presses Enter (`\r`) to submit it.
     pub fn paste_and_submit(&mut self, ctx: &egui::Context, text: &str) {
         self.clear_terminal_selection(ctx);
+        self.pinned_to_bottom = true;
         let payload = encode_paste_bytes(text, self.is_bracketed_paste());
         if !payload.is_empty() {
             self.write_to_pty(&payload);
@@ -506,9 +533,63 @@ impl TerminalPane {
 
         ctx.input_mut(|i| {
             let has_paste_event = i.events.iter().any(|e| matches!(e, egui::Event::Paste(_)));
+            let has_ctrl_c_key = i.events.iter().any(|e| {
+                matches!(
+                    e,
+                    egui::Event::Key {
+                        key: egui::Key::C,
+                        pressed: true,
+                        modifiers,
+                        ..
+                    } if modifiers.ctrl || modifiers.command
+                )
+            });
+            let has_ctrl_x_key = i.events.iter().any(|e| {
+                matches!(
+                    e,
+                    egui::Event::Key {
+                        key: egui::Key::X,
+                        pressed: true,
+                        modifiers,
+                        ..
+                    } if modifiers.ctrl || modifiers.command
+                )
+            });
+            // Pre-collect Alt+<letter> keys handled by `alt_key_byte` so any accompanying
+            // printable `Event::Text` synthesized by winit in the same frame is not sent twice.
+            let mut suppress_alt_text: Vec<u8> = i
+                .events
+                .iter()
+                .filter_map(|e| match e {
+                    egui::Event::Key {
+                        key,
+                        pressed: true,
+                        modifiers,
+                        ..
+                    } if modifiers.alt
+                        && !modifiers.ctrl
+                        && !modifiers.command
+                        && encode_terminal_key(*key, *modifiers, application_cursor).is_none() =>
+                    {
+                        alt_key_byte(*key, modifiers.shift)
+                    }
+                    _ => None,
+                })
+                .collect();
+
             i.events.retain(|event| {
                 match event {
                     egui::Event::Text(text) => {
+                        if text.len() == 1 {
+                            let ch = text.as_bytes()[0];
+                            if let Some(pos) = suppress_alt_text
+                                .iter()
+                                .position(|&ab| ab.eq_ignore_ascii_case(&ch))
+                            {
+                                suppress_alt_text.remove(pos);
+                                return false;
+                            }
+                        }
                         to_send.extend_from_slice(text.as_bytes());
                         clear_selection = true;
                         false
@@ -518,12 +599,33 @@ impl TerminalPane {
                         clear_selection = true;
                         false
                     }
-                    egui::Event::Cut => false,
+                    egui::Event::Cut => {
+                        if i.modifiers.shift && !i.modifiers.ctrl && !i.modifiers.command {
+                            if let Some(bytes) = encode_terminal_key(
+                                egui::Key::Delete,
+                                i.modifiers,
+                                application_cursor,
+                            ) {
+                                to_send.extend_from_slice(&bytes);
+                                clear_selection = true;
+                            }
+                        } else if !has_ctrl_x_key {
+                            // `egui-winit` translates Ctrl+X into Event::Cut without Event::Key.
+                            to_send.push(0x18);
+                            clear_selection = true;
+                        }
+                        false
+                    }
                     egui::Event::Copy => {
                         if self.selecting_in_terminal {
                             true
                         } else {
-                            // `Event::Key` for `Ctrl+C` sends `0x03` right after `Event::Copy`.
+                            // `egui-winit` translates Ctrl+C into Event::Copy without Event::Key;
+                            // forward ^C (0x03) unless a synthetic Event::Key(Ctrl+C) is also queued.
+                            if !has_ctrl_c_key {
+                                to_send.push(0x03);
+                                clear_selection = true;
+                            }
                             false
                         }
                     }
@@ -577,6 +679,7 @@ impl TerminalPane {
             self.clear_terminal_selection(ctx);
         }
         if !to_send.is_empty() {
+            self.pinned_to_bottom = true;
             self.write_to_pty(&to_send);
         }
     }
@@ -593,18 +696,17 @@ impl TerminalPane {
                 .is_some_and(|r| r.primary != r.secondary)
         });
 
+        let was_pinned = self.pinned_to_bottom;
         self.handle_terminal_input(ctx, term_focused);
+        let user_sent_input = !was_pinned && self.pinned_to_bottom;
 
         let pty_updated = {
-            let mut lock = self.term.lock().unwrap_or_else(|e| e.into_inner());
+            let term = Arc::clone(&self.term);
+            let mut lock = term.lock().unwrap_or_else(|e| e.into_inner());
             let updated = lock.pty_updated || self.term_screen_text.is_empty();
             if updated {
                 lock.pty_updated = false;
-                self.term_cursor_idx = render_vt100_screen_with_scrollback(
-                    lock.parser.screen_mut(),
-                    &mut self.render_scratch,
-                );
-                self.term_screen_text.replace_with(&self.render_scratch);
+                self.sync_screen_buffer(lock.parser.screen_mut());
                 self.term_revision = self.term_revision.wrapping_add(1);
                 true
             } else {
@@ -612,14 +714,21 @@ impl TerminalPane {
             }
         };
 
-        if pty_updated {
+        let mut requested_scroll = false;
+        if pty_updated || user_sent_input {
+            let should_scroll =
+                user_sent_input || (self.pinned_to_bottom && !self.selecting_in_terminal);
             ctx.data_mut(|d| {
                 let mut state = d.get_temp::<FastEditorState>(term_id).unwrap_or_default();
                 let target_range =
                     egui::text::CCursorRange::one(egui::text::CCursor::new(self.term_cursor_idx));
-                if state.cursor.char_range() != Some(target_range) {
+                let cursor_changed = state.cursor.char_range() != Some(target_range);
+                if cursor_changed {
                     state.cursor.set_char_range(Some(target_range));
+                }
+                if should_scroll && (cursor_changed || user_sent_input) {
                     state.scroll_to_cursor = true;
+                    requested_scroll = true;
                 }
                 d.insert_temp(term_id, state);
             });
@@ -628,7 +737,9 @@ impl TerminalPane {
         let screen_text = &mut self.term_screen_text;
         let term_revision = self.term_revision;
         let focus_terminal = &mut self.focus_terminal;
+        let shell_label = self.shell_label.as_str();
         let mut target_grid: Option<(u16, u16)> = None;
+        let mut next_pinned_to_bottom = self.pinned_to_bottom;
 
         egui::CentralPanel::default().frame(panel_frame).show(ui, |ui| {
             let font_id = egui::TextStyle::Monospace.resolve(ui.style());
@@ -646,31 +757,45 @@ impl TerminalPane {
             let available_size = ui.available_size();
             let row_height = ui.fonts_mut(|f| f.row_height(&font_id)).max(1.0);
             let char_width = ui.fonts_mut(|f| f.glyph_width(&font_id, ' ')).max(1.0);
-            let inner_w = (available_size.x - 16.0).max(char_width * 10.0);
-            let inner_h = (available_size.y - 8.0).max(row_height * 2.0);
-            let new_cols = (inner_w / char_width).floor().clamp(10.0, 500.0) as u16;
+            let inner_h =
+                (available_size.y - crate::editor::EDITOR_MARGIN.y * 2.0).max(row_height * 2.0);
             let new_rows = (inner_h / row_height).floor().clamp(2.0, 200.0) as u16;
-            target_grid = Some((new_rows, new_cols));
 
-            egui::ScrollArea::vertical()
+            let scroll_out = egui::ScrollArea::vertical()
                 .id_salt("terminal_scroll_area")
                 .auto_shrink([false, false])
                 .animated(false)
                 .show(ui, |ui| {
-                    let output =
-                        FastEditor::new(term_id, screen_text, available_size, &mut layouter)
-                            .text_revision(term_revision)
-                            .virtualized(true)
-                            .pointer_moves_caret(false)
-                            .read_only(true)
-                            .show(ui);
+                    let editor_w = ui.available_width();
+                    let inner_w = (editor_w - crate::editor::EDITOR_MARGIN.x * 2.0)
+                        .max(char_width * 10.0);
+                    let new_cols = (inner_w / char_width).floor().clamp(10.0, 500.0) as u16;
+                    target_grid = Some((new_rows, new_cols));
+
+                    let min_size = egui::vec2(editor_w, available_size.y);
+                    let output = FastEditor::new(term_id, screen_text, min_size, &mut layouter)
+                        .text_revision(term_revision)
+                        .virtualized(true)
+                        .pointer_moves_caret(false)
+                        .read_only(true)
+                        .accessible_label(shell_label)
+                        .show(ui);
 
                     if *focus_terminal {
                         crate::editor::request_editor_focus(ui.ctx(), output.response.id);
                         *focus_terminal = false;
                     }
                 });
+
+            if !requested_scroll {
+                let max_scroll_y =
+                    (scroll_out.content_size.y - scroll_out.inner_rect.height()).max(0.0);
+                next_pinned_to_bottom =
+                    scroll_out.state.clamped_offset().y >= max_scroll_y - row_height * 2.0;
+            }
         });
+
+        self.pinned_to_bottom = next_pinned_to_bottom;
 
         if let Some((new_rows, new_cols)) = target_grid {
             let prev = (self.rows, self.cols);
@@ -679,6 +804,211 @@ impl TerminalPane {
                 ctx.request_repaint();
             }
         }
+    }
+
+    /// Updates `term_screen_text` and `term_cursor_idx` from `screen`, incrementally splicing
+    /// only newly scrolled lines and the active viewport rows when existing scrollback is intact.
+    fn sync_screen_buffer(&mut self, screen: &mut vt100::Screen) {
+        let cols_u16 = screen.size().1.get();
+        let rows_usize = screen.size().0.get() as usize;
+        let sb_len = if screen.alternate_screen() {
+            0
+        } else {
+            screen.scrollback_len()
+        };
+
+        if sb_len == 0 {
+            self.term_cursor_idx = render_vt100_screen_into(screen, &mut self.render_scratch);
+            self.term_screen_text.replace_with(&self.render_scratch);
+            self.cached_scrollback_len = 0;
+            self.cached_scrollback_chars = 0;
+            self.cached_first_sb_line.clear();
+            self.cached_tail_sb_lines.clear();
+            self.scrollback_edits_bytes = 0;
+            return;
+        }
+
+        // Growing scrollback (`sb_len < TERM_SCROLLBACK_LEN`): verify oldest scrollback row
+        // matches so an inline `\x1b[3J` (clear scrollback) cannot be mistaken for an append.
+        let can_incremental_grow = !self.term_screen_text.is_empty()
+            && self.cached_scrollback_len > 0
+            && sb_len >= self.cached_scrollback_len
+            && sb_len < TERM_SCROLLBACK_LEN
+            && {
+                screen.set_scrollback(sb_len);
+                let first_matches = screen
+                    .rows(0, cols_u16)
+                    .next()
+                    .is_some_and(|first| first == self.cached_first_sb_line);
+                screen.set_scrollback(0);
+                first_matches
+            };
+
+        if can_incremental_grow {
+            let delta = sb_len - self.cached_scrollback_len;
+            self.render_scratch.clear();
+            let mut delta_chars = 0usize;
+            let new_lines = read_recent_scrollback_lines(screen, delta, cols_u16, rows_usize);
+            for line in &new_lines {
+                let lc = line
+                    .as_bytes()
+                    .iter()
+                    .filter(|&&b| (b & 0xC0) != 0x80)
+                    .count();
+                self.render_scratch.push_str(line);
+                self.render_scratch.push('\n');
+                delta_chars += lc + 1;
+            }
+            if !new_lines.is_empty() {
+                append_tail_anchor(&mut self.cached_tail_sb_lines, &new_lines);
+            }
+            let new_sb_chars = self.cached_scrollback_chars + delta_chars;
+            self.term_cursor_idx =
+                render_vt100_screen_append(screen, &mut self.render_scratch, new_sb_chars);
+
+            let old_total = self.term_screen_text.char_count();
+            self.term_screen_text
+                .delete(self.cached_scrollback_chars..old_total);
+            self.term_screen_text
+                .insert(self.cached_scrollback_chars, &self.render_scratch);
+            self.cached_scrollback_len = sb_len;
+            self.cached_scrollback_chars = new_sb_chars;
+            self.scrollback_edits_bytes += self.render_scratch.len();
+            if self.scrollback_edits_bytes > 65_536 {
+                let compacted = self.term_screen_text.build_string();
+                self.term_screen_text.replace_with(&compacted);
+                self.scrollback_edits_bytes = 0;
+            }
+            return;
+        }
+
+        // Full-capacity ring-buffer scrollback (`sb_len == TERM_SCROLLBACK_LEN`): detect
+        // in-place updates (`evicted == 0`) or small ring-buffer shifts (`evicted = 1..=probe`)
+        // by matching both the cached tail anchor and the shifted oldest line in `term_screen_text`.
+        if !self.term_screen_text.is_empty()
+            && self.cached_scrollback_len == TERM_SCROLLBACK_LEN
+            && sb_len == TERM_SCROLLBACK_LEN
+            && !self.cached_tail_sb_lines.is_empty()
+        {
+            screen.set_scrollback(sb_len);
+            let first_now = screen.rows(0, cols_u16).next();
+            screen.set_scrollback(0);
+
+            if let Some(first_now) = first_now {
+                let anchor_len = self.cached_tail_sb_lines.len();
+                let probe_count = (rows_usize.max(32) + anchor_len).min(sb_len);
+                let recent =
+                    read_recent_scrollback_lines(screen, probe_count, cols_u16, rows_usize);
+                if recent.len() >= anchor_len {
+                    let max_shift = recent.len() - anchor_len;
+                    let mut verified_shift = None;
+                    for k in 0..=max_shift {
+                        let start = recent.len() - anchor_len - k;
+                        if recent[start..start + anchor_len] == self.cached_tail_sb_lines[..] {
+                            let head_matches = if k == 0 {
+                                first_now == self.cached_first_sb_line
+                            } else {
+                                let range = self.term_screen_text.line_char_range(k);
+                                self.term_screen_text.slice_chars(range) == first_now
+                            };
+                            if head_matches {
+                                verified_shift = Some(k);
+                                break;
+                            }
+                        }
+                    }
+
+                    if let Some(k) = verified_shift {
+                        if k > 0 {
+                            let drop_chars = self.term_screen_text.line_to_char(k);
+                            self.term_screen_text.delete(0..drop_chars);
+                            self.cached_scrollback_chars -= drop_chars;
+                            self.cached_first_sb_line = first_now;
+                        }
+                        self.render_scratch.clear();
+                        let mut delta_chars = 0usize;
+                        for line in &recent[recent.len() - k..] {
+                            let lc = line
+                                .as_bytes()
+                                .iter()
+                                .filter(|&&b| (b & 0xC0) != 0x80)
+                                .count();
+                            self.render_scratch.push_str(line);
+                            self.render_scratch.push('\n');
+                            delta_chars += lc + 1;
+                        }
+                        let new_sb_chars = self.cached_scrollback_chars + delta_chars;
+                        self.term_cursor_idx = render_vt100_screen_append(
+                            screen,
+                            &mut self.render_scratch,
+                            new_sb_chars,
+                        );
+                        let old_total = self.term_screen_text.char_count();
+                        self.term_screen_text
+                            .delete(self.cached_scrollback_chars..old_total);
+                        self.term_screen_text
+                            .insert(self.cached_scrollback_chars, &self.render_scratch);
+                        self.cached_scrollback_chars = new_sb_chars;
+                        let tail_start = recent.len().saturating_sub(TAIL_ANCHOR_LINES);
+                        self.cached_tail_sb_lines.clear();
+                        self.cached_tail_sb_lines
+                            .extend_from_slice(&recent[tail_start..]);
+                        self.scrollback_edits_bytes += self.render_scratch.len();
+                        if self.scrollback_edits_bytes > 65_536 {
+                            let compacted = self.term_screen_text.build_string();
+                            self.term_screen_text.replace_with(&compacted);
+                            self.scrollback_edits_bytes = 0;
+                        }
+                        return;
+                    }
+                }
+            }
+        }
+
+        let (cursor_idx, actual_sb_len, sb_chars, first_line, tail_lines) =
+            render_vt100_screen_with_scrollback_meta(screen, &mut self.render_scratch);
+        self.term_cursor_idx = cursor_idx;
+        self.term_screen_text.replace_with(&self.render_scratch);
+        self.cached_scrollback_len = actual_sb_len;
+        self.cached_scrollback_chars = sb_chars;
+        self.cached_first_sb_line = first_line;
+        self.cached_tail_sb_lines = tail_lines;
+        self.scrollback_edits_bytes = 0;
+    }
+}
+
+fn read_recent_scrollback_lines(
+    screen: &mut vt100::Screen,
+    count: usize,
+    cols: u16,
+    rows: usize,
+) -> Vec<String> {
+    let mut out = Vec::with_capacity(count);
+    let mut rem = count;
+    while rem > 0 {
+        screen.set_scrollback(rem);
+        let take = rem.min(rows);
+        for line in screen.rows(0, cols).take(take) {
+            out.push(line);
+        }
+        rem -= take;
+    }
+    if count > 0 {
+        screen.set_scrollback(0);
+    }
+    out
+}
+
+fn append_tail_anchor(anchor: &mut Vec<String>, new_lines: &[String]) {
+    if new_lines.len() >= TAIL_ANCHOR_LINES {
+        anchor.clear();
+        anchor.extend_from_slice(&new_lines[new_lines.len() - TAIL_ANCHOR_LINES..]);
+    } else {
+        let total = anchor.len() + new_lines.len();
+        if total > TAIL_ANCHOR_LINES {
+            anchor.drain(..total - TAIL_ANCHOR_LINES);
+        }
+        anchor.extend_from_slice(new_lines);
     }
 }
 
@@ -771,25 +1101,48 @@ pub fn render_vt100_screen_with_scrollback(
     screen: &mut vt100::Screen,
     full_text: &mut String,
 ) -> usize {
+    render_vt100_screen_with_scrollback_meta(screen, full_text).0
+}
+
+fn render_vt100_screen_with_scrollback_meta(
+    screen: &mut vt100::Screen,
+    full_text: &mut String,
+) -> (usize, usize, usize, String, Vec<String>) {
     let (rows, cols) = screen.size();
     let rows_usize = rows.get() as usize;
     let cols_u16 = cols.get();
 
-    screen.set_scrollback(usize::MAX);
-    let scrollback_len = screen.scrollback();
+    let scrollback_len = if screen.alternate_screen() {
+        0
+    } else {
+        screen.scrollback_len()
+    };
     if scrollback_len == 0 {
-        return render_vt100_screen_into(screen, full_text);
+        screen.set_scrollback(0);
+        let cursor = render_vt100_screen_into(screen, full_text);
+        return (cursor, 0, 0, String::new(), Vec::new());
     }
 
     full_text.clear();
     full_text.reserve((scrollback_len + rows_usize) * (cols_u16 as usize + 1));
     let mut prefix_chars = 0usize;
+    let mut first_line = Option::<String>::None;
+    let mut tail_lines = Vec::with_capacity(TAIL_ANCHOR_LINES);
+    let mut written_lines = 0usize;
+    let tail_start_idx = scrollback_len.saturating_sub(TAIL_ANCHOR_LINES);
 
     let mut remaining = scrollback_len;
     while remaining > 0 {
         screen.set_scrollback(remaining);
         let take = remaining.min(rows_usize);
         for line in screen.rows(0, cols_u16).take(take) {
+            if first_line.is_none() {
+                first_line = Some(line.clone());
+            }
+            if written_lines >= tail_start_idx {
+                tail_lines.push(line.clone());
+            }
+            written_lines += 1;
             let line_chars = line
                 .as_bytes()
                 .iter()
@@ -803,7 +1156,14 @@ pub fn render_vt100_screen_with_scrollback(
     }
 
     screen.set_scrollback(0);
-    render_vt100_screen_append(screen, full_text, prefix_chars)
+    let cursor = render_vt100_screen_append(screen, full_text, prefix_chars);
+    (
+        cursor,
+        scrollback_len,
+        prefix_chars,
+        first_line.unwrap_or_default(),
+        tail_lines,
+    )
 }
 
 /// Encodes non-character terminal keys into VT100/xterm escape sequences, honoring

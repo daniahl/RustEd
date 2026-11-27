@@ -20,6 +20,10 @@ use std::{
 };
 
 pub const MAX_HIGHLIGHT_BYTES: usize = 65_536;
+/// Maximum file size (64 MB) allowed when opening or syncing a document into memory.
+pub const MAX_OPEN_FILE_BYTES: u64 = 64 * 1024 * 1024;
+/// Initial byte prefix inspected for NUL bytes to reject binary files cleanly.
+const BINARY_SNIFF_BYTES: usize = 8192;
 
 /// Flag OR'ed into gutter-cache row numbers marking wrapped continuation rows
 /// (logical line continues from the previous visual row).
@@ -38,8 +42,8 @@ const FIND_DIALOG_OFFSET_Y: f32 = 36.0;
 const FIND_INPUT_WIDTH: f32 = 180.0;
 /// Minimum gutter digit count (so "1" through "999" all get the same width).
 const GUTTER_MIN_DIGITS: usize = 3;
-/// Approximate width of one monospace digit in points.
-const GUTTER_DIGIT_WIDTH: f32 = 9.0;
+/// Maximum number of recently visited clean files whose cursor and fold state are remembered.
+const MAX_RECENT_VIEW_STATES: usize = 64;
 /// Extra padding added to the computed gutter width.
 const GUTTER_PADDING: f32 = 16.0;
 /// Width reserved in the gutter for clickable code-folding chevrons.
@@ -91,6 +95,69 @@ fn is_transient_fs_error(err: &std::io::Error) -> bool {
     }
 }
 
+enum ReadFileFailure {
+    Io(std::io::Error),
+    Rejected(String),
+}
+
+fn read_text_file_checked(path: &Path) -> Result<(String, DiskStamp), ReadFileFailure> {
+    use std::io::Read;
+
+    let mut file = fs::File::open(path).map_err(ReadFileFailure::Io)?;
+    let meta = file.metadata().map_err(ReadFileFailure::Io)?;
+    let len = meta.len();
+    if len > MAX_OPEN_FILE_BYTES {
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
+        return Err(ReadFileFailure::Rejected(format!(
+            "Cannot open {name}: file is {:.1} MB (limit is {} MB)",
+            len as f64 / MB as f64,
+            MAX_OPEN_FILE_BYTES / MB as u64
+        )));
+    }
+    let stamp = DiskStamp {
+        len,
+        modified: meta.modified().ok(),
+    };
+    let mut bytes = Vec::with_capacity(len as usize);
+    file.read_to_end(&mut bytes).map_err(ReadFileFailure::Io)?;
+    let sniff_len = bytes.len().min(BINARY_SNIFF_BYTES);
+    if bytes[..sniff_len].contains(&0) {
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
+        return Err(ReadFileFailure::Rejected(format!(
+            "Cannot open binary file {name}"
+        )));
+    }
+    let content = String::from_utf8(bytes).map_err(|_| {
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
+        ReadFileFailure::Rejected(format!("Cannot open {name}: file is not valid UTF-8"))
+    })?;
+    Ok((content, stamp))
+}
+
+#[cfg(target_os = "windows")]
+fn atomic_replace_existing(temp_path: &Path, target_path: &Path) -> bool {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::PCWSTR;
+    use windows::Win32::Storage::FileSystem::{ReplaceFileW, REPLACE_FILE_FLAGS};
+
+    if !target_path.exists() {
+        return false;
+    }
+    let target_w: Vec<u16> = target_path.as_os_str().encode_wide().chain([0]).collect();
+    let temp_w: Vec<u16> = temp_path.as_os_str().encode_wide().chain([0]).collect();
+    unsafe {
+        ReplaceFileW(
+            PCWSTR(target_w.as_ptr()),
+            PCWSTR(temp_w.as_ptr()),
+            PCWSTR::null(),
+            REPLACE_FILE_FLAGS(0),
+            None,
+            None,
+        )
+        .is_ok()
+    }
+}
+
 fn write_piece_table_atomic(path: &Path, text: &PieceTable) -> std::io::Result<()> {
     // Preserve symlinks by writing through the link in place rather than replacing the symlink
     // itself with a newly created regular file via rename.
@@ -139,6 +206,10 @@ fn write_piece_table_atomic(path: &Path, text: &PieceTable) -> std::io::Result<(
                 let _ = fs::remove_file(&temp_path);
                 return Err(err);
             }
+            #[cfg(target_os = "windows")]
+            if atomic_replace_existing(&temp_path, path) {
+                return Ok(());
+            }
             if fs::rename(&temp_path, path).is_ok() {
                 return Ok(());
             }
@@ -168,6 +239,13 @@ pub struct UnsavedFileState {
     pub selected_chars: usize,
 }
 
+#[derive(Clone)]
+struct CleanFileViewState {
+    cursor_range: Option<egui::text::CCursorRange>,
+    folded_lines: BTreeSet<usize>,
+    access_seq: u64,
+}
+
 pub struct Document {
     pub path: PathBuf,
     pub text: PieceTable,
@@ -175,6 +253,8 @@ pub struct Document {
     pub saved_revision: u64,
     pub is_current_dirty: bool,
     pub unsaved_files: PathMap<UnsavedFileState>,
+    recent_view_states: PathMap<CleanFileViewState>,
+    view_state_seq: u64,
     pub text_revision: u64,
     pub file_name: String,
     pub language_ext: String,
@@ -222,6 +302,8 @@ impl Document {
             saved_revision: 0,
             is_current_dirty: false,
             unsaved_files: PathMap::new(),
+            recent_view_states: PathMap::new(),
+            view_state_seq: 0,
             text_revision: 0,
             file_name: "Untitled".to_string(),
             language_ext: "txt".to_string(),
@@ -324,9 +406,17 @@ impl Document {
                 Some("Cannot save Untitled without choosing a destination path.".to_string());
             all_ok = false;
         } else if self.can_save() {
-            self.save_current_file();
-            if self.is_current_dirty {
+            if self.external_conflict.is_some() {
+                self.last_save_error = Some(format!(
+                    "Cannot save {}: file has an unresolved disk conflict.",
+                    self.file_name
+                ));
                 all_ok = false;
+            } else {
+                self.save_current_file();
+                if self.is_current_dirty {
+                    all_ok = false;
+                }
             }
         }
         let pending_paths: Vec<PathBuf> = self.unsaved_files.keys().cloned().collect();
@@ -334,6 +424,25 @@ impl Document {
             let Some(state) = self.unsaved_files.get(&path) else {
                 continue;
             };
+            let current_stamp = read_disk_stamp(&path);
+            let has_disk_conflict = match (&state.disk_stamp, &current_stamp) {
+                (Some(_), None) => true,
+                (Some(prev), Some(curr)) if prev != curr => {
+                    !fs::read_to_string(&path).is_ok_and(|disk_text| state.text.eq_str(&disk_text))
+                }
+                _ => false,
+            };
+            if has_disk_conflict {
+                let name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("file");
+                self.last_save_error = Some(format!(
+                    "Cannot save {name}: modified or deleted on disk. Open it to resolve the conflict."
+                ));
+                all_ok = false;
+                continue;
+            }
             match write_piece_table_atomic(&path, &state.text) {
                 Ok(()) => {
                     self.unsaved_files.remove(&path);
@@ -415,9 +524,13 @@ impl Document {
         let incoming = if let Some(unsaved) = self.unsaved_files.remove(&chosen) {
             IncomingFile::Unsaved(Box::new(unsaved))
         } else {
-            match fs::read_to_string(&chosen) {
-                Ok(content) => IncomingFile::FromDisk(content, read_disk_stamp(&chosen)),
-                Err(err) => {
+            match read_text_file_checked(&chosen) {
+                Ok((content, stamp)) => IncomingFile::FromDisk(content, Some(stamp)),
+                Err(ReadFileFailure::Rejected(msg)) => {
+                    self.last_save_error = Some(msg);
+                    return;
+                }
+                Err(ReadFileFailure::Io(err)) => {
                     self.last_save_error = Some(format!(
                         "Failed to open {}: {err}",
                         chosen
@@ -431,27 +544,57 @@ impl Document {
         };
 
         let editor_id = editor::code_editor_id();
-        if !self.path.as_os_str().is_empty() && self.is_current_dirty {
-            let mut prev_state = ctx.data_mut(|d| d.get_temp::<editor::FastEditorState>(editor_id));
-            if let Some(ref mut st) = prev_state {
-                st.clear_caches();
+        if !self.path.as_os_str().is_empty() {
+            if self.is_current_dirty {
+                self.recent_view_states.remove(&self.path);
+                let mut prev_state =
+                    ctx.data_mut(|d| d.get_temp::<editor::FastEditorState>(editor_id));
+                if let Some(ref mut st) = prev_state {
+                    st.clear_caches();
+                }
+                self.text.drop_cached_text();
+                self.unsaved_files.insert(
+                    self.path.clone(),
+                    UnsavedFileState {
+                        text: std::mem::take(&mut self.text),
+                        saved_snapshot: self.saved_snapshot.take(),
+                        saved_revision: self.saved_revision,
+                        disk_stamp: self.disk_stamp.clone(),
+                        editor_state: prev_state,
+                        folded_lines: self.folding.folded_lines().clone(),
+                        line_count: self.line_count,
+                        cursor_line: self.cursor_line,
+                        cursor_col: self.cursor_col,
+                        selected_chars: self.selected_chars,
+                    },
+                );
+            } else {
+                let cursor_range = ctx
+                    .data(|d| d.get_temp::<editor::FastEditorState>(editor_id))
+                    .and_then(|st| st.cursor.char_range());
+                let folded_lines = self.folding.folded_lines().clone();
+                if self.recent_view_states.len() >= MAX_RECENT_VIEW_STATES
+                    && !self.recent_view_states.contains_key(&self.path)
+                {
+                    if let Some(oldest_path) = self
+                        .recent_view_states
+                        .iter()
+                        .min_by_key(|(_, v)| v.access_seq)
+                        .map(|(p, _)| p.clone())
+                    {
+                        self.recent_view_states.remove(&oldest_path);
+                    }
+                }
+                self.view_state_seq = self.view_state_seq.wrapping_add(1);
+                self.recent_view_states.insert(
+                    self.path.clone(),
+                    CleanFileViewState {
+                        cursor_range,
+                        folded_lines,
+                        access_seq: self.view_state_seq,
+                    },
+                );
             }
-            self.text.drop_cached_text();
-            self.unsaved_files.insert(
-                self.path.clone(),
-                UnsavedFileState {
-                    text: std::mem::take(&mut self.text),
-                    saved_snapshot: self.saved_snapshot.take(),
-                    saved_revision: self.saved_revision,
-                    disk_stamp: self.disk_stamp.clone(),
-                    editor_state: prev_state,
-                    folded_lines: self.folding.folded_lines().clone(),
-                    line_count: self.line_count,
-                    cursor_line: self.cursor_line,
-                    cursor_col: self.cursor_col,
-                    selected_chars: self.selected_chars,
-                },
-            );
         }
 
         self.path = chosen.clone();
@@ -484,6 +627,9 @@ impl Document {
                             .is_ok_and(|disk_text| self.text.eq_str(&disk_text))
                         {
                             self.disk_stamp = current_stamp;
+                            self.saved_snapshot = Some(self.text.snapshot());
+                            self.saved_revision = self.text_revision;
+                            self.is_current_dirty = false;
                         } else {
                             self.disk_stamp = unsaved.disk_stamp;
                             self.external_conflict = Some(ExternalConflict::ModifiedOnDisk);
@@ -508,17 +654,44 @@ impl Document {
                 self.line_count = self.text.line_count();
                 self.saved_revision = self.text_revision;
                 self.is_current_dirty = false;
-                self.cursor_line = 1;
-                self.cursor_col = 1;
-                self.selected_chars = 0;
                 self.disk_stamp = stamp;
                 self.refresh_file_metadata();
 
+                let total_chars = self.text.char_count();
+                let restored_range = if let Some(view) = self.recent_view_states.remove(&chosen) {
+                    if !view.folded_lines.is_empty() {
+                        self.folding.set_folded_lines(view.folded_lines);
+                        self.folding
+                            .ensure_updated_buffer(&self.text, Some(self.text_revision));
+                    }
+                    if let Some(r) = view.cursor_range {
+                        let pri = r.primary.index.0.min(total_chars);
+                        let sec = r.secondary.index.0.min(total_chars);
+                        let (line, col) = self.text.char_to_line_col(pri);
+                        self.folding.unfold_containing(line);
+                        self.cursor_line = line + 1;
+                        self.cursor_col = col + 1;
+                        self.selected_chars = pri.abs_diff(sec);
+                        egui::text::CCursorRange::two(
+                            egui::text::CCursor::new(sec),
+                            egui::text::CCursor::new(pri),
+                        )
+                    } else {
+                        self.cursor_line = 1;
+                        self.cursor_col = 1;
+                        self.selected_chars = 0;
+                        egui::text::CCursorRange::one(egui::text::CCursor::new(0))
+                    }
+                } else {
+                    self.cursor_line = 1;
+                    self.cursor_col = 1;
+                    self.selected_chars = 0;
+                    egui::text::CCursorRange::one(egui::text::CCursor::new(0))
+                };
+
                 ctx.data_mut(|d| {
                     let mut st = editor::FastEditorState::default();
-                    st.cursor.set_char_range(Some(egui::text::CCursorRange::one(
-                        egui::text::CCursor::new(0),
-                    )));
+                    st.cursor.set_char_range(Some(restored_range));
                     st.scroll_to_cursor = true;
                     d.insert_temp(editor_id, st);
                 });
@@ -561,9 +734,9 @@ impl Document {
             return DiskSyncResult::Unchanged;
         }
 
-        let content = match fs::read_to_string(&path) {
-            Ok(c) => c,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+        let (content, stamp) = match read_text_file_checked(&path) {
+            Ok(res) => res,
+            Err(ReadFileFailure::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => {
                 if !self.is_current_dirty {
                     self.close_if_deleted(ctx, &path, false);
                     ctx.request_repaint();
@@ -573,7 +746,7 @@ impl Document {
                 ctx.request_repaint();
                 return DiskSyncResult::Conflict(ExternalConflict::DeletedOnDisk);
             }
-            Err(err) if is_transient_fs_error(&err) => {
+            Err(ReadFileFailure::Io(err)) if is_transient_fs_error(&err) => {
                 return DiskSyncResult::RetryTransientError;
             }
             Err(_) => return DiskSyncResult::Unchanged,
@@ -582,6 +755,12 @@ impl Document {
         if self.text.eq_str(&content) {
             self.disk_stamp = Some(stamp);
             self.external_conflict = None;
+            if self.is_current_dirty {
+                self.saved_snapshot = Some(self.text.snapshot());
+                self.saved_revision = self.text_revision;
+                self.is_current_dirty = false;
+                ctx.request_repaint();
+            }
             return DiskSyncResult::Unchanged;
         }
 
@@ -601,7 +780,12 @@ impl Document {
         content: String,
         stamp: Option<DiskStamp>,
     ) {
-        let prev_full_text: Arc<str> = self.text.with_str(|s| Arc::from(s));
+        let prev_full_text = self.text.to_arc_str();
+        let prev_folded = if self.folding.has_active_folds() {
+            Some(Arc::new(self.folding.folded_lines().clone()))
+        } else {
+            None
+        };
 
         self.text = PieceTable::from_string(content);
         self.saved_snapshot = Some(self.text.snapshot());
@@ -638,7 +822,11 @@ impl Document {
         st.reset_undo_history();
         {
             let mut undoer = st.undoer.lock().unwrap_or_else(|e| e.into_inner());
-            undoer.add_undo(&(prev_range, editor::UndoSnapshot::FullText(prev_full_text)));
+            undoer.add_undo(&editor::UndoEntry {
+                cursor: prev_range,
+                snapshot: editor::UndoSnapshot::FullText(prev_full_text),
+                folded: prev_folded,
+            });
         }
         st.last_undo_snapshot = Some(self.text.undo_snapshot());
 
@@ -656,8 +844,11 @@ impl Document {
     pub fn close_if_deleted(&mut self, ctx: &egui::Context, path: &Path, is_dir: bool) {
         if is_dir {
             self.unsaved_files.retain(|k, _| !path_starts_with(k, path));
+            self.recent_view_states
+                .retain(|k, _| !path_starts_with(k, path));
         } else {
             self.unsaved_files.remove(path);
+            self.recent_view_states.remove(path);
         }
 
         if !self.path.as_os_str().is_empty() {
@@ -720,6 +911,28 @@ impl Document {
                 }
             } else if let Some(state) = self.unsaved_files.remove(old_path) {
                 self.unsaved_files.insert(new_path.to_path_buf(), state);
+            }
+        }
+
+        if !self.recent_view_states.is_empty() {
+            if is_dir {
+                let affected: Vec<PathBuf> = self
+                    .recent_view_states
+                    .keys()
+                    .filter(|k| path_starts_with(k, old_path))
+                    .cloned()
+                    .collect();
+                for k in affected {
+                    if let (Some(rel), Some(state)) = (
+                        path_strip_prefix(&k, old_path),
+                        self.recent_view_states.remove(&k),
+                    ) {
+                        self.recent_view_states.insert(new_path.join(rel), state);
+                    }
+                }
+            } else if let Some(state) = self.recent_view_states.remove(old_path) {
+                self.recent_view_states
+                    .insert(new_path.to_path_buf(), state);
             }
         }
     }
@@ -921,7 +1134,9 @@ impl Document {
         self.folding
             .ensure_updated_buffer(&self.text, Some(self.text_revision));
         let (start_line, _) = self.text.char_to_line_col(match_start_char);
-        let (end_line, _) = self.text.char_to_line_col(match_end_char);
+        let (end_line, _) = self
+            .text
+            .char_to_line_col(match_end_char.saturating_sub(1).max(match_start_char));
         for line in start_line..=end_line {
             self.folding.unfold_containing(line);
         }
@@ -1360,134 +1575,139 @@ impl Document {
 
             let available_size = ui.available_size();
             let is_large = self.text.len() > MAX_HIGHLIGHT_BYTES;
-            egui::ScrollArea::vertical()
-                .id_salt("editor_scroll_area")
-                .auto_shrink([false, false])
-                .animated(false)
-                .show(ui, |ui| {
-                    // Use the line count from the last galley rebuild instead of
-                    // scanning the whole text every frame.
-                    let line_count = self.line_count.max(1);
-                    let digits = line_count.ilog10() as usize + 1;
-                    let gutter_width = (digits.max(GUTTER_MIN_DIGITS) as f32) * GUTTER_DIGIT_WIDTH
-                        + GUTTER_PADDING
-                        + FOLD_GUTTER_WIDTH;
+            // Use the line count from the last galley rebuild instead of
+            // scanning the whole text every frame.
+            let line_count = self.line_count.max(1);
+            let digits = line_count.ilog10() as usize + 1;
+            let digit_width = ui
+                .fonts_mut(|f| f.glyph_width(&font_id, '0'))
+                .max(1.0);
+            let gutter_width = (digits.max(GUTTER_MIN_DIGITS) as f32) * digit_width
+                + GUTTER_PADDING
+                + FOLD_GUTTER_WIDTH;
 
-                    ui.horizontal_top(|ui| {
-                        ui.spacing_mut().item_spacing.x = 0.0;
-                        let (gutter_rect, _) = ui.allocate_exact_size(
-                            egui::vec2(gutter_width, available_size.y),
-                            egui::Sense::hover(),
-                        );
+            ui.horizontal_top(|ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
+                let (gutter_rect, gutter_resp) = ui.allocate_exact_size(
+                    egui::vec2(gutter_width, available_size.y),
+                    egui::Sense::click(),
+                );
+                let gutter_wheel_y = if ui.rect_contains_pointer(gutter_rect) {
+                    ui.input_mut(|i| std::mem::take(&mut i.smooth_scroll_delta.y))
+                } else {
+                    0.0
+                };
 
+                let editor_viewport = egui::vec2(
+                    (available_size.x - gutter_width).max(100.0),
+                    available_size.y,
+                );
+
+                self.folding
+                    .ensure_updated_buffer(&self.text, Some(text_revision));
+
+                let newline = if self.line_ending == "CRLF" { "\r\n" } else { "\n" };
+                let scroll_area = if is_large {
+                    egui::ScrollArea::both()
+                } else {
+                    egui::ScrollArea::vertical().horizontal_scroll_offset(0.0)
+                };
+                let output = scroll_area
+                    .id_salt("editor_scroll_area")
+                    .max_width(editor_viewport.x)
+                    .max_height(editor_viewport.y)
+                    .auto_shrink([false, false])
+                    .animated(false)
+                    .show(ui, |ui| {
+                        if gutter_wheel_y != 0.0 {
+                            ui.scroll_with_delta(egui::vec2(0.0, gutter_wheel_y));
+                        }
                         let editor_min_size = egui::vec2(
-                            (available_size.x - gutter_width).max(100.0),
-                            available_size.y,
+                            ui.available_width().max(100.0),
+                            editor_viewport.y,
                         );
-
-                        self.folding
-                            .ensure_updated_buffer(&self.text, Some(text_revision));
-
-                        let newline = if self.line_ending == "CRLF" { "\r\n" } else { "\n" };
-                        let output = {
-                            let language = self.language_ext.as_str();
-                            let font_id_for_layout = font_id.clone();
-                            let mut layouter = |ui: &egui::Ui, s: &str, wrap_width: f32| {
-                                let layout_job = if s.len() <= MAX_HIGHLIGHT_BYTES {
-                                    let mut job = syntax_highlighting::highlight(
-                                        ui.ctx(),
-                                        ui.style(),
-                                        &theme,
-                                        s,
-                                        language,
-                                    );
-                                    job.wrap.max_width = wrap_width;
-                                    job
-                                } else {
-                                    egui::text::LayoutJob::simple(
-                                        s.to_owned(),
-                                        font_id_for_layout.clone(),
-                                        text_color,
-                                        wrap_width,
-                                    )
-                                };
-                                ui.fonts_mut(|f| f.layout_job(layout_job))
-                            };
-                            let mut show_fast_editor = |ui: &mut egui::Ui| {
-                                FastEditor::new(
-                                    editor::code_editor_id(),
-                                    &mut self.text,
-                                    editor_min_size,
-                                    &mut layouter,
-                                )
-                                .cache_salt(language_salt)
-                                .text_revision(text_revision)
-                                .newline(newline)
-                                .virtualized(is_large)
-                                .fold_state(&mut self.folding)
-                                .show(ui)
-                            };
-                            if is_large {
-                                egui::ScrollArea::horizontal()
-                                    .id_salt("editor_hscroll_area")
-                                    .max_width(editor_min_size.x)
-                                    .auto_shrink([false, false])
-                                    .animated(false)
-                                    .show(ui, |ui| show_fast_editor(ui))
-                                    .inner
+                        let language = self.language_ext.as_str();
+                        let font_id_for_layout = font_id.clone();
+                        let mut layouter = |ui: &egui::Ui, s: &str, wrap_width: f32| {
+                            let layout_job = if s.len() <= MAX_HIGHLIGHT_BYTES {
+                                let mut job = syntax_highlighting::highlight(
+                                    ui.ctx(),
+                                    ui.style(),
+                                    &theme,
+                                    s,
+                                    language,
+                                );
+                                job.wrap.max_width = wrap_width;
+                                job
                             } else {
-                                show_fast_editor(ui)
-                            }
+                                egui::text::LayoutJob::simple(
+                                    s.to_owned(),
+                                    font_id_for_layout.clone(),
+                                    text_color,
+                                    wrap_width,
+                                )
+                            };
+                            ui.fonts_mut(|f| f.layout_job(layout_job))
                         };
-                        if self.focus_editor {
-                            editor::request_editor_focus(ui.ctx(), output.response.id);
-                            self.focus_editor = false;
-                        }
-                        editor_text_changed = output.text_changed;
+                        FastEditor::new(
+                            editor::code_editor_id(),
+                            &mut self.text,
+                            editor_min_size,
+                            &mut layouter,
+                        )
+                        .cache_salt(language_salt)
+                        .text_revision(text_revision)
+                        .newline(newline)
+                        .virtualized(is_large)
+                        .fold_state(&mut self.folding)
+                        .accessible_label(&self.file_name)
+                        .show(ui)
+                    })
+                    .inner;
 
-                        self.rebuild_gutter_cache(ui.ctx(), &output);
-                        self.update_cursor_status(ui.ctx(), &output);
+                if self.focus_editor {
+                    editor::request_editor_focus(ui.ctx(), output.response.id);
+                    self.focus_editor = false;
+                }
+                editor_text_changed = output.text_changed;
 
-                        let bottom_y = gutter_rect.max.y.max(output.response.rect.max.y);
-                        let full_gutter_rect = egui::Rect::from_min_max(
-                            gutter_rect.min,
-                            egui::pos2(gutter_rect.max.x, bottom_y),
-                        );
-                        let gutter_resp = ui.interact(
-                            full_gutter_rect,
-                            egui::Id::unique("editor_gutter"),
-                            egui::Sense::click(),
-                        );
+                self.rebuild_gutter_cache(ui.ctx(), &output);
+                self.update_cursor_status(ui.ctx(), &output);
 
-                        let clip_rect = ui.clip_rect();
-                        let clicked_fold_line = paint_gutter(
-                            ui,
-                            &output.galley,
-                            output.galley_pos,
-                            clip_rect,
-                            gutter_rect,
-                            &gutter_resp,
-                            self.gutter_cache.as_ref().map(|(_, n)| n.as_slice()),
-                            self.cursor_line,
-                            &self.folding,
-                            &font_id,
-                        );
+                let gutter_clip = ui.clip_rect().intersect(gutter_rect);
+                let clicked_fold_line = paint_gutter(
+                    ui,
+                    &output.galley,
+                    output.galley_pos,
+                    gutter_clip,
+                    gutter_rect,
+                    &gutter_resp,
+                    self.gutter_cache.as_ref().map(|(_, n)| n.as_slice()),
+                    self.cursor_line,
+                    &self.folding,
+                    &font_id,
+                );
 
-                        let painter = ui.painter();
-                        painter.line_segment(
-                            [
-                                egui::pos2(gutter_rect.max.x - GUTTER_SEPARATOR_OFFSET, gutter_rect.min.y),
-                                egui::pos2(gutter_rect.max.x - GUTTER_SEPARATOR_OFFSET, bottom_y),
-                            ],
-                            ui.visuals().widgets.noninteractive.bg_stroke,
-                        );
+                let gutter_painter = ui.painter_at(gutter_clip);
+                gutter_painter.line_segment(
+                    [
+                        egui::pos2(
+                            gutter_rect.max.x - GUTTER_SEPARATOR_OFFSET,
+                            gutter_rect.min.y,
+                        ),
+                        egui::pos2(
+                            gutter_rect.max.x - GUTTER_SEPARATOR_OFFSET,
+                            gutter_rect.max.y,
+                        ),
+                    ],
+                    ui.visuals().widgets.noninteractive.bg_stroke,
+                );
 
-                        if let Some(doc_line) = clicked_fold_line {
-                            self.toggle_fold_at(ctx, doc_line);
-                            editor::request_editor_focus(ctx, editor::code_editor_id());
-                        }
-                    });
-                });
+                if let Some(doc_line) = clicked_fold_line {
+                    self.toggle_fold_at(ctx, doc_line);
+                    editor::request_editor_focus(ctx, editor::code_editor_id());
+                }
+            });
         });
 
         if editor_text_changed {
@@ -1526,7 +1746,7 @@ fn paint_gutter(
 ) -> Option<usize> {
     let nums = nums?;
     let rows = &galley.rows;
-    let painter = ui.painter();
+    let painter = ui.painter_at(clip_rect);
     let visuals = ui.visuals();
 
     let num_right_x = gutter_rect.max.x - GUTTER_SEPARATOR_OFFSET - FOLD_GUTTER_WIDTH - GUTTER_TEXT_RIGHT_OFFSET;
